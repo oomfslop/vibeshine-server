@@ -1410,14 +1410,16 @@ namespace nvhttp {
         const auto matches = VDISPLAY::virtualDisplayCatalogMatches(
           virtual_display_stable_guid, desired.width, desired.height, launch_session->requested_resolution_only);
         if (!matches) {
-          launch_session->virtual_display_catalog_error = "Unable to verify the retained virtual display catalog; the existing target was preserved.";
-          return;
+          // The bundled driver on this host predates the catalog query (it
+          // cannot answer it at all). Fall back to replacing the retained
+          // display instead of refusing the launch.
+          BOOST_LOG(warning) << "Unable to verify the retained virtual display catalog; replacing the target instead of preserving it.";
         }
         if (!config::video.dd.use_sunshine_virtual_display_driver && VDISPLAY::hasOwnedSunshineVirtualDisplays()) {
           launch_session->virtual_display_catalog_error = "The retained Sunshine display still belongs to the bundled provider; select that provider before resuming. The target was preserved.";
           return;
         }
-        if (!*matches || launch_session->requested_resolution_only) allow_display_changes = true;
+        if (!matches || !*matches || launch_session->requested_resolution_only) allow_display_changes = true;
       }
       auto reserve_normal_vdd_identity = [&]() {
         if (shared_virtual_display_mode || launch_session->role != remote_session::role_e::game) return true;

@@ -968,6 +968,7 @@ namespace config {
 
     0,  // max_bitrate
     20,  // minimum_fps_target (0 = framerate)
+    false,  // capture_immediate
     true  // wgc_pacing_smoothing
   };
 
@@ -1835,6 +1836,7 @@ namespace config {
     int_between_f(vars, "rtx_hdr_peak_brightness", video.rtx_hdr.peak_brightness, {400, 2000});
 
     string_f(vars, "capture", video.capture);
+    bool_f(vars, "capture_immediate", video.capture_immediate);
     bool_f(vars, "wgc_pacing_smoothing", video.wgc_pacing_smoothing);
     string_f(vars, "encoder", video.encoder);
     const auto configured_encoder = video.encoder;
@@ -2688,6 +2690,7 @@ namespace config {
         "dd_wa_dummy_plug_hdr10",
         "max_bitrate",
         "minimum_fps_target",
+        "capture_immediate",
 
         // Codec / capture negotiation
         "fec_percentage",

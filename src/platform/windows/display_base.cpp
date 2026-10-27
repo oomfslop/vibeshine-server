@@ -442,6 +442,21 @@ namespace platf::dxgi {
 
     DXGI_RATIONAL client_frame_rate_adjusted = adjust_client_frame_rate();
     std::optional<std::chrono::steady_clock::time_point> frame_pacing_group_start;
+
+    // Immediate capture (config::video.capture_immediate): forward every new
+    // frame as soon as the backend delivers it instead of sampling on the
+    // client frame-rate grid. The grid costs, on average, half a client frame
+    // interval for any source that is not phase-locked to it (the desktop,
+    // frame-capped games, a VRR-style virtual display). Frames that arrive
+    // faster than the client interval are coalesced: the loop waits out the
+    // remainder of the interval (minus a scheduling margin) and the blocking
+    // snapshot then returns the newest pending frame.
+    const bool capture_immediate = config::video.capture_immediate;
+    std::optional<std::chrono::steady_clock::time_point> last_immediate_capture;
+    if (capture_immediate) {
+      BOOST_LOG(info) << "Immediate capture enabled: forwarding frames as they arrive (client "
+                      << client_frame_rate_adjusted.Numerator << '/' << client_frame_rate_adjusted.Denominator << " fps cap)";
+    }
     uint32_t frame_pacing_group_frames = 0;
 
     // Phase-preserving re-anchor + bust-mix diagnostics.
@@ -504,8 +519,27 @@ namespace platf::dxgi {
       platf::capture_e status = capture_e::ok;
       std::shared_ptr<img_t> img_out;
 
+      if (capture_immediate) {
+        if (last_immediate_capture && client_frame_rate_adjusted.Numerator != 0) {
+          const auto interval = std::chrono::nanoseconds(1s) * client_frame_rate_adjusted.Denominator / client_frame_rate_adjusted.Numerator;
+          const auto gate = *last_immediate_capture + interval - std::min<std::chrono::nanoseconds>(1ms, interval / 8);
+          if (gate > std::chrono::steady_clock::now()) {
+            sleep_until_capture_target(timer.get(), gate);
+          }
+        }
+
+        status = snapshot(pull_free_image_cb, img_out, 200ms, *cursor);
+        if (status == capture_e::ok && img_out) {
+          last_immediate_capture = std::chrono::steady_clock::now();
+        } else if (status == platf::capture_e::timeout) {
+          // See the comment on the blocking snapshot below: don't monopolize
+          // the device lock while nothing is being drawn.
+          std::this_thread::sleep_for(10ms);
+        }
+      }
+
       // Try to continue frame pacing group, snapshot() is called with zero timeout after waiting for client frame interval
-      if (frame_pacing_group_start) {
+      if (!capture_immediate && frame_pacing_group_start) {
         if (client_frame_rate_adjusted.Numerator == 0) {
           frame_pacing_group_start = std::nullopt;
           frame_pacing_group_frames = 0;
@@ -545,7 +579,7 @@ namespace platf::dxgi {
       }
 
       // Start new frame pacing group if necessary, snapshot() is called with non-zero timeout
-      if (status == capture_e::timeout || (status == capture_e::ok && !frame_pacing_group_start)) {
+      if (!capture_immediate && (status == capture_e::timeout || (status == capture_e::ok && !frame_pacing_group_start))) {
         status = snapshot(pull_free_image_cb, img_out, 200ms, *cursor);
 
         if (status == capture_e::ok && img_out) {
