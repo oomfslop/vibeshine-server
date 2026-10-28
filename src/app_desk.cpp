@@ -290,7 +290,12 @@ namespace app_desk {
         BOOST_LOG(warning) << "Desk: no virtual display driver";
         return {};
       }
-      const auto uuid = VDISPLAY::virtualDisplayUuidFromStableId("vibeshine-desk-" + client_uuid);
+      // A fresh monitor identity every time: Windows "remembers window
+      // locations based on monitor connection" and would otherwise drag
+      // windows that once sat on the desk back onto it when it reappears,
+      // with placements scaled by whatever DPI it had then.
+      const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+      const auto uuid = VDISPLAY::virtualDisplayUuidFromStableId("vibeshine-desk-" + client_uuid + "-" + std::to_string(stamp));
       std::memcpy(&desk.guid, uuid.b8, sizeof(desk.guid));
       VDISPLAY::setWatchdogFeedingEnabled(true);
       auto created = VDISPLAY::createVirtualDisplay(("desk-" + client_uuid).c_str(), "App windows desk", nullptr,
@@ -401,8 +406,16 @@ namespace app_desk {
     RECT rect {};
     if (!find_monitor(it->second.device, &rect)) return false;
     if (it->second.adopted.contains(hwnd)) {
-      // Already on the desk: a plain move, mirroring the client's window
-      // wherever the client put it (partly off its screen included).
+      // Already on the desk: a plain move. Kept on the desk: past its edge
+      // the window would land on the host's own displays (the client shows
+      // the part of it that is on screen either way).
+      RECT frame {};
+      if (app_window_layout::frame_rect(hwnd, frame)) {
+        const LONG w = frame.right - frame.left, h = frame.bottom - frame.top;
+        const LONG dw = rect.right - rect.left, dh = rect.bottom - rect.top;
+        x = static_cast<int>(std::max<LONG>(0, std::min<LONG>(x, std::max<LONG>(0, dw - w))));
+        y = static_cast<int>(std::max<LONG>(0, std::min<LONG>(y, std::max<LONG>(0, dh - h))));
+      }
       move_frame_to(hwnd, rect.left + x, rect.top + y);
       return true;
     }
