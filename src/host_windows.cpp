@@ -13,6 +13,7 @@
   #include <algorithm>
   #include <filesystem>
 
+  #include "platform/windows/app_window_layout.h"
   #include "platform/windows/image_convert.h"
   #include "platform/windows/utf_utils.h"
   #include "tools/playnite_launcher/focus_utils.h"
@@ -249,6 +250,58 @@ namespace host_windows {
     return out;
   }
 
+  layout_t window_layout(std::uint64_t handle, int canvas_w, int canvas_h) {
+    layout_t out;
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    if (!IsWindow(hwnd) || !frame_rect(handle, out.rect)) return out;
+    out.valid = true;
+    app_window_layout::canvas_anchor(canvas_w, canvas_h, out.rect[2], out.rect[3], out.anchor[0], out.anchor[1]);
+    const bool minimized = IsIconic(hwnd);
+    out.state = minimized ? "minimized" : (IsZoomed(hwnd) ? "maximized" : "normal");
+    out.focused = GetForegroundWindow() == hwnd;
+    out.title = window_title(hwnd);
+    if (!minimized) {
+      RECT client {};
+      POINT origin {0, 0};
+      if (GetClientRect(hwnd, &client) && ClientToScreen(hwnd, &origin)) {
+        out.caption = std::max(0L, static_cast<LONG>(origin.y - out.rect[1]));
+      }
+      // Popups are only meaningful where the canvas can show them: clip to the
+      // canvas and drop what falls outside entirely.
+      const int cx0 = out.rect[0] - out.anchor[0], cy0 = out.rect[1] - out.anchor[1];
+      for (const auto &p : app_window_layout::popup_windows(hwnd)) {
+        const int l = std::max<int>(p.rect.left, cx0), t = std::max<int>(p.rect.top, cy0);
+        const int r = std::min<int>(p.rect.right, cx0 + canvas_w), b = std::min<int>(p.rect.bottom, cy0 + canvas_h);
+        if (r > l && b > t) out.popups.push_back({l, t, r - l, b - t});
+      }
+      if (app_window_layout::rounded_corners_os() && !IsZoomed(hwnd)) {
+        const UINT dpi = GetDpiForWindow(hwnd);
+        out.radius = static_cast<int>(8 * (dpi ? dpi : 96) / 96);
+      }
+    }
+    // FNV-1a over the fields the client reacts to.
+    std::uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](std::uint64_t v) {
+      for (int i = 0; i < 8; ++i) {
+        h ^= (v >> (i * 8)) & 0xff;
+        h *= 1099511628211ull;
+      }
+    };
+    for (int v : out.rect) mix(static_cast<std::uint32_t>(v));
+    mix(static_cast<std::uint32_t>(out.anchor[0]));
+    mix(static_cast<std::uint32_t>(out.anchor[1]));
+    for (const auto &p : out.popups) {
+      for (int v : p) mix(static_cast<std::uint32_t>(v));
+    }
+    mix(out.radius);
+    mix(out.caption);
+    mix(out.focused);
+    for (unsigned char c : out.state) mix(c);
+    for (unsigned char c : out.title) mix(c);
+    out.etag = h ? h : 1;
+    return out;
+  }
+
   std::vector<hit_region_t> hit_regions(std::uint64_t handle) {
     std::vector<hit_region_t> out;
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
@@ -466,6 +519,10 @@ namespace host_windows {
 
   std::string hit_test_point(std::uint64_t, int, int) {
     return "none";
+  }
+
+  layout_t window_layout(std::uint64_t, int, int) {
+    return {};
   }
 
   std::vector<window_info_t> list() {

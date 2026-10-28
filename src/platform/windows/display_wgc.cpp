@@ -5,6 +5,7 @@
 
 // standard includes
 #include "src/host_windows.h"
+#include "src/platform/windows/app_window_layout.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -244,12 +245,16 @@ namespace platf::dxgi {
         BOOST_LOG(warning) << "App-window capture: window 0x" << std::hex << _target_hwnd << std::dec << " is gone";
         return -1;
       }
-      offset_x = rect[0] - GetSystemMetrics(SM_XVIRTUALSCREEN);
-      offset_y = rect[1] - GetSystemMetrics(SM_YVIRTUALSCREEN);
-      // The helper copies the window into the top-left of a fixed canvas the
-      // size of the encoder frame, so window resizes never change the capture.
+      // The helper composites the window (and its popups) onto a fixed canvas
+      // the size of the encoder frame, anchored by the shared layout rule, so
+      // window resizes never change the capture. Canvas (0,0) is therefore
+      // the window's origin minus the anchor.
       width = width_before_rotation = std::max(2, config.width);
       height = height_before_rotation = std::max(2, config.height);
+      int ax = 0, ay = 0;
+      app_window_layout::canvas_anchor(width, height, rect[2], rect[3], ax, ay);
+      offset_x = rect[0] - ax - GetSystemMetrics(SM_XVIRTUALSCREEN);
+      offset_y = rect[1] - ay - GetSystemMetrics(SM_YVIRTUALSCREEN);
       display_rotation = DXGI_MODE_ROTATION_IDENTITY;
       pad_output = true;
       BOOST_LOG(info) << "App-window capture: window 0x" << std::hex << _target_hwnd << std::dec << " at " << rect[0] << ',' << rect[1]
@@ -284,8 +289,10 @@ namespace platf::dxgi {
     input_geometry_snapshot_t snapshot;
     snapshot.valid = host_windows::frame_rect(_target_hwnd, rect);
     if (!snapshot.valid) return snapshot;
-    snapshot.offset_x = rect[0] - GetSystemMetrics(SM_XVIRTUALSCREEN);
-    snapshot.offset_y = rect[1] - GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int ax = 0, ay = 0;
+    app_window_layout::canvas_anchor(width, height, rect[2], rect[3], ax, ay);
+    snapshot.offset_x = rect[0] - ax - GetSystemMetrics(SM_XVIRTUALSCREEN);
+    snapshot.offset_y = rect[1] - ay - GetSystemMetrics(SM_YVIRTUALSCREEN);
     snapshot.desktop_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
     snapshot.desktop_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
     snapshot.target.rect_left = rect[0];
@@ -321,8 +328,7 @@ namespace platf::dxgi {
       return capture_e::reinit;
     }
 
-    // App-window sessions: the client draws its own cursor over the window, so never bake the host cursor in.
-    if (!_ipc_session->set_cursor_visible(cursor_visible && !_target_hwnd)) {
+    if (!_ipc_session->set_cursor_visible(cursor_visible)) {
       return _ipc_session->stop_requested() ? capture_e::interrupted : capture_e::reinit;
     }
     _ipc_session->initialize_if_needed();
@@ -481,7 +487,7 @@ namespace platf::dxgi {
     if (!_ipc_session) {
       return capture_e::error;
     }
-    if (!_ipc_session->set_cursor_visible(cursor_visible && !_target_hwnd)) {
+    if (!_ipc_session->set_cursor_visible(cursor_visible)) {
       return _ipc_session->stop_requested() ? capture_e::interrupted : capture_e::reinit;
     }
 

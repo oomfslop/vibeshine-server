@@ -6,6 +6,7 @@
  */
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -64,5 +65,24 @@ namespace host_windows {
   /** Live WM_NCHITTEST for one point (relative to the frame rect): "drag", "min",
    *  "max", "close", "border", "client" or "none". */
   std::string hit_test_point(std::uint64_t handle, int x, int y);
+
+  /** Everything a client needs to show one streamed window as a native
+   *  window: its rect and where that rect sits on the encoder canvas, plus the
+   *  popups (menus, drop-downs, tooltips, owned dialogs) composited with it. */
+  struct layout_t {
+    bool valid = false;
+    int rect[4] {0, 0, 0, 0};  ///< outer rect (restored placement when minimized)
+    int anchor[2] {0, 0};  ///< canvas position of rect's top-left
+    std::vector<std::array<int, 4>> popups;  ///< outer rects in virtual-desktop pixels, bottom-most first
+    int radius = 0;  ///< corner radius in pixels the OS applies to the window and its popups (0 when square)
+    int caption = 0;
+    std::string state;
+    std::string title;
+    bool focused = false;
+    std::uint64_t etag = 0;  ///< changes whenever any field above changes
+  };
+  /** Cheap enough to call every few milliseconds. `canvas_w/h` is the encoder
+   *  frame the client launched the window with. */
+  layout_t window_layout(std::uint64_t handle, int canvas_w, int canvas_h);
 
 }  // namespace host_windows

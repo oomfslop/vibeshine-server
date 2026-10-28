@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -30,6 +31,7 @@
 // local includes
 #include "src/logging.h"
 #include "src/platform/windows/ipc/misc_utils.h"
+#include "src/platform/windows/app_window_layout.h"
 #include "src/platform/windows/ipc/pipes.h"
 #include "src/platform/windows/wgc_capture_policy.h"
 #include "src/utility.h"  // For RAII utilities
@@ -44,6 +46,9 @@
 #include <Windows.Graphics.Capture.Interop.h>
 #include <Windows.h>
 #include <dwmapi.h>
+#ifndef PW_RENDERFULLCONTENT
+  #define PW_RENDERFULLCONTENT 0x00000002
+#endif
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Metadata.h>  // For ApiInformation
@@ -135,7 +140,6 @@ constexpr uint32_t DEFAULT_WGC_IPC_FLAGS =
   platf::dxgi::WGC_IPC_FLAG_DRAIN_TO_LATEST |
   platf::dxgi::WGC_IPC_FLAG_ALLOW_BUFFER_DECREASE;
 static platf::dxgi::config_data_t g_config = {0, 0, 0, L"", {0, 0}, 10000, 60, 1, 2, DEFAULT_WGC_IPC_FLAGS, 120, 0, 0, 0};
-static RECT g_capture_monitor_rect {};  ///< app-window capture: the captured monitor's rect (virtual-desktop px)
 static std::mutex g_config_mutex;
 static std::condition_variable g_config_cv;
 static std::atomic<int32_t> g_activity_admission_fps {120};
@@ -753,9 +757,6 @@ public:
     }
 
     auto activation_factory = winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
-    // App-window capture grabs the window's monitor and cuts the window's
-    // rectangle out of it at copy time, so context menus, drop-downs and
-    // tooltips (separate popup windows) are part of the picture.
     HRESULT hr = activation_factory->CreateForMonitor(_selected_monitor, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item));
     if (FAILED(hr)) {
       BOOST_LOG(error) << "Failed to create GraphicsCaptureItem for monitor: " << hr;
@@ -792,10 +793,6 @@ public:
    */
   HMONITOR get_selected_monitor() const {
     return _selected_monitor;
-  }
-
-  const RECT &monitor_rect() const {
-    return _monitor_info.rcMonitor;
   }
 
   /**
@@ -1395,21 +1392,6 @@ public:
       return;
     }
 
-    if (frame && g_config.target_hwnd && g_capture_monitor_rect.right == g_capture_monitor_rect.left) {
-      const auto content = frame.ContentSize();
-      if (content.Width > 0 && content.Height > 0 &&
-          (content.Width != static_cast<int32_t>(_width) || content.Height != static_cast<int32_t>(_height))) {
-        // The window was resized: recreate the frame pool at the new size.
-        // Scratch textures follow lazily; the shared canvas stays as it is.
-        BOOST_LOG(info) << "App-window content size changed " << _width << 'x' << _height << " -> "
-                        << content.Width << 'x' << content.Height;
-        _width = static_cast<UINT>(content.Width);
-        _height = static_cast<UINT>(content.Height);
-        frame = nullptr;
-        create_or_adjust_frame_pool(_current_buffer_size ? _current_buffer_size : 1);
-        return;
-      }
-    }
     if (!frame) {
       // Frame drop detected - record timestamp for sliding window analysis
       auto now = std::chrono::steady_clock::now();
@@ -1956,46 +1938,7 @@ private:
       D3D11_TEXTURE2D_DESC src {}, dst {};
       frame_tex->GetDesc(&src);
       shared->GetDesc(&dst);
-      RECT win_box {};
-      bool window_cut = false;
-      if (g_config.target_hwnd) {
-        auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(g_config.target_hwnd));
-        RECT frame_rect {};
-        if (IsWindow(hwnd) && !IsIconic(hwnd) &&
-            SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame_rect, sizeof(frame_rect)))) {
-          // Window rect relative to the captured monitor, clamped to it.
-          win_box.left = std::clamp<LONG>(frame_rect.left - g_capture_monitor_rect.left, 0, static_cast<LONG>(src.Width));
-          win_box.top = std::clamp<LONG>(frame_rect.top - g_capture_monitor_rect.top, 0, static_cast<LONG>(src.Height));
-          win_box.right = std::clamp<LONG>(frame_rect.right - g_capture_monitor_rect.left, 0, static_cast<LONG>(src.Width));
-          win_box.bottom = std::clamp<LONG>(frame_rect.bottom - g_capture_monitor_rect.top, 0, static_cast<LONG>(src.Height));
-          window_cut = win_box.right > win_box.left && win_box.bottom > win_box.top;
-        } else {
-          // Minimized or gone: keep the last picture.
-          return;
-        }
-      }
-      if (window_cut) {
-        const UINT cw = std::min<UINT>(win_box.right - win_box.left, dst.Width);
-        const UINT ch = std::min<UINT>(win_box.bottom - win_box.top, dst.Height);
-        if (cw < _last_canvas_copy_w || ch < _last_canvas_copy_h || !_shared_rtv) {
-          if (!_shared_rtv) {
-            winrt::com_ptr<ID3D11Device> device;
-            _deps->d3d_context->GetDevice(device.put());
-            if (device) {
-              device->CreateRenderTargetView(shared.get(), nullptr, _shared_rtv.put());
-            }
-          }
-          if (_shared_rtv) {
-            const float black[4] {0.f, 0.f, 0.f, 1.f};
-            _deps->d3d_context->ClearRenderTargetView(_shared_rtv.get(), black);
-          }
-        }
-        D3D11_BOX box {static_cast<UINT>(win_box.left), static_cast<UINT>(win_box.top), 0,
-                       static_cast<UINT>(win_box.left) + cw, static_cast<UINT>(win_box.top) + ch, 1};
-        _deps->d3d_context->CopySubresourceRegion(shared.get(), 0, 0, 0, 0, frame_tex.get(), 0, &box);
-        _last_canvas_copy_w = cw;
-        _last_canvas_copy_h = ch;
-      } else if (src.Width == dst.Width && src.Height == dst.Height) {
+      if (src.Width == dst.Width && src.Height == dst.Height) {
         _deps->d3d_context->CopyResource(shared.get(), frame_tex.get());
       } else {
         // App-window canvas: window frame into the top-left; clear first when
@@ -2505,6 +2448,635 @@ bool setup_desktop_switch_hook() {
  * @param argv Array of command line argument strings. argv[1] should contain the pipe name GUID.
  * @return 0 on successful completion, 1 on initialization failure.
  */
+// ---------------------------------------------------------------------------
+// App-window sessions: one WGC capture per window that belongs to the streamed
+// application window (the window itself plus its menus, drop-downs, tooltips
+// and owned dialogs), composited onto a fixed canvas the size of the encoder
+// frame. Per-window WGC items are unaffected by whatever overlaps the window
+// on the host, so other apps, the Start menu or the taskbar never bleed in.
+// ---------------------------------------------------------------------------
+class WindowCompositor {
+public:
+  struct capture_t {
+    HWND hwnd = nullptr;
+    bool is_target = false;
+    RECT rect {};  ///< outer rect, sampled by the layout thread
+    GraphicsCaptureItem item = nullptr;
+    Direct3D11CaptureFramePool pool = nullptr;
+    GraphicsCaptureSession session = nullptr;
+    winrt::event_token frame_token {};
+    winrt::event_token closed_token {};
+    winrt::Windows::Graphics::SizeInt32 pool_size {0, 0};
+    winrt::com_ptr<ID3D11Texture2D> latest;  ///< helper-owned copy of the newest frame (guarded by _ctx_mutex)
+    UINT latest_w = 0, latest_h = 0;
+    uint64_t latest_qpc = 0;
+    std::optional<bool> cursor_applied;
+    std::atomic<bool> closed {false};
+    bool gdi = false;  ///< PrintWindow fallback (WGC refused the window)
+    std::chrono::steady_clock::time_point gdi_last {};
+  };
+
+  WindowCompositor(IDirect3DDevice winrt_device, winrt::com_ptr<ID3D11Device> device, winrt::com_ptr<ID3D11DeviceContext> context,
+                   SharedResourceManager &shared, DXGI_FORMAT format, HWND target, UINT canvas_w, UINT canvas_h, int fps):
+      _winrt_device(std::move(winrt_device)),
+      _device(std::move(device)),
+      _context(std::move(context)),
+      _shared(shared),
+      _format(format),
+      _target(target),
+      _canvas_w(canvas_w),
+      _canvas_h(canvas_h),
+      _fps(std::clamp(fps, 10, 240)) {
+  }
+
+  ~WindowCompositor() {
+    stop();
+  }
+
+  bool start() {
+    {
+      std::lock_guard lock(_captures_mutex);
+      auto cap = create_capture(_target, true);
+      if (!cap) {
+        BOOST_LOG(error) << "App-window capture: cannot capture the target window";
+        return false;
+      }
+      _target_capture = cap;
+      _order = {cap};
+    }
+    _stop.store(false, std::memory_order_release);
+    _layout_thread = std::thread([this] {
+      layout_thread_proc();
+    });
+    _composite_thread = std::thread([this] {
+      composite_thread_proc();
+    });
+    BOOST_LOG(info) << "App-window capture: window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(_target) << std::dec
+                    << " on a " << _canvas_w << 'x' << _canvas_h << " canvas, popups composited";
+    return true;
+  }
+
+  void stop() {
+    if (_stop.exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
+    {
+      std::lock_guard lock(_dirty_mutex);
+      _dirty = true;
+    }
+    _dirty_cv.notify_all();
+    if (_layout_thread.joinable()) {
+      _layout_thread.join();
+    }
+    if (_composite_thread.joinable()) {
+      _composite_thread.join();
+    }
+    std::lock_guard lock(_captures_mutex);
+    for (auto &cap : _order) {
+      destroy_capture(*cap);
+    }
+    _order.clear();
+    _target_capture.reset();
+  }
+
+  /** Apply the main process' cursor inclusion request to every capture (main thread, ~1 kHz). */
+  void update_cursor_capture() {
+    const bool visible = g_cursor_visible.load(std::memory_order_acquire);
+    std::lock_guard lock(_captures_mutex);
+    for (auto &cap : _order) {
+      if (!cap->session || cap->cursor_applied == visible) {
+        continue;
+      }
+      cap->cursor_applied = visible;
+      try {
+        if (auto session2 = cap->session.try_as<winrt::Windows::Graphics::Capture::IGraphicsCaptureSession2>()) {
+          session2.IsCursorCaptureEnabled(visible);
+        }
+      } catch (...) {
+      }
+    }
+  }
+
+private:
+  static DirectXPixelFormat pixel_format_for(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_R16G16B16A16_FLOAT ? DirectXPixelFormat::R16G16B16A16Float : DirectXPixelFormat::B8G8R8A8UIntNormalized;
+  }
+
+  static void init_thread_apartment() {
+    try {
+      winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (...) {
+    }
+  }
+
+  void mark_dirty() {
+    {
+      std::lock_guard lock(_dirty_mutex);
+      _dirty = true;
+    }
+    _dirty_cv.notify_one();
+  }
+
+  bool ensure_latest_texture(capture_t &cap, UINT w, UINT h) {
+    if (cap.latest && cap.latest_w == w && cap.latest_h == h) {
+      return true;
+    }
+    cap.latest = nullptr;
+    D3D11_TEXTURE2D_DESC desc {};
+    desc.Width = w;
+    desc.Height = h;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = _format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(_device->CreateTexture2D(&desc, nullptr, cap.latest.put()))) {
+      BOOST_LOG(error) << "App-window capture: failed to create a " << w << 'x' << h << " frame texture";
+      cap.latest = nullptr;
+      return false;
+    }
+    cap.latest_w = w;
+    cap.latest_h = h;
+    return true;
+  }
+
+  /** Called on WGC's free-threaded callback thread. */
+  void on_frame(const std::shared_ptr<capture_t> &cap, Direct3D11CaptureFramePool const &sender) {
+    if (_stop.load(std::memory_order_acquire)) {
+      return;
+    }
+    try {
+      Direct3D11CaptureFrame frame = nullptr;
+      while (auto next = sender.TryGetNextFrame()) {
+        frame = std::move(next);
+      }
+      if (!frame) {
+        return;
+      }
+      const auto content = frame.ContentSize();
+      if (content.Width <= 0 || content.Height <= 0) {
+        return;
+      }
+      if (content.Width != cap->pool_size.Width || content.Height != cap->pool_size.Height) {
+        // Resized: the pool follows, the next frame lands at the new size.
+        cap->pool_size = content;
+        frame = nullptr;
+        sender.Recreate(_winrt_device, pixel_format_for(_format), 2, content);
+        return;
+      }
+      auto surface = frame.Surface();
+      winrt::com_ptr<IDirect3DDxgiInterfaceAccess> access;
+      if (FAILED(winrt::get_unknown(surface)->QueryInterface(__uuidof(IDirect3DDxgiInterfaceAccess), access.put_void()))) {
+        return;
+      }
+      winrt::com_ptr<ID3D11Texture2D> frame_tex;
+      if (FAILED(access->GetInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<::IUnknown **>(frame_tex.put_void())))) {
+        return;
+      }
+      static const int64_t qpc_frequency = [] {
+        LARGE_INTEGER frequency {};
+        QueryPerformanceFrequency(&frequency);
+        return static_cast<int64_t>(frequency.QuadPart);
+      }();
+      const uint64_t qpc = platf::dxgi::wgc_policy::system_relative_time_to_qpc(frame.SystemRelativeTime().count(), qpc_frequency);
+      {
+        std::lock_guard ctx_lock(_ctx_mutex);
+        if (ensure_latest_texture(*cap, static_cast<UINT>(content.Width), static_cast<UINT>(content.Height))) {
+          D3D11_BOX box {0, 0, 0, static_cast<UINT>(content.Width), static_cast<UINT>(content.Height), 1};
+          _context->CopySubresourceRegion(cap->latest.get(), 0, 0, 0, 0, frame_tex.get(), 0, &box);
+          cap->latest_qpc = qpc;
+        }
+      }
+      frame = nullptr;
+      mark_dirty();
+    } catch (const winrt::hresult_error &ex) {
+      BOOST_LOG(debug) << "App-window capture: frame callback failed: " << ex.code() << " - " << winrt::to_string(ex.message());
+    } catch (...) {
+    }
+  }
+
+  /** Caller holds _captures_mutex. */
+  std::shared_ptr<capture_t> create_capture(HWND hwnd, bool is_target) {
+    auto cap = std::make_shared<capture_t>();
+    cap->hwnd = hwnd;
+    cap->is_target = is_target;
+    app_window_layout::frame_rect(hwnd, cap->rect);
+    try {
+      auto factory = winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+      GraphicsCaptureItem item = nullptr;
+      const HRESULT hr = factory->CreateForWindow(hwnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item));
+      if (FAILED(hr) || !item) {
+        throw winrt::hresult_error(FAILED(hr) ? hr : E_FAIL);
+      }
+      const auto size = item.Size();
+      if (size.Width <= 0 || size.Height <= 0) {
+        throw winrt::hresult_error(E_INVALIDARG);
+      }
+      cap->item = item;
+      cap->pool_size = size;
+      cap->pool = Direct3D11CaptureFramePool::CreateFreeThreaded(_winrt_device, pixel_format_for(_format), 2, size);
+      std::weak_ptr<capture_t> weak = cap;
+      cap->frame_token = cap->pool.FrameArrived([this, weak](Direct3D11CaptureFramePool const &sender, winrt::Windows::Foundation::IInspectable const &) {
+        if (auto c = weak.lock()) {
+          on_frame(c, sender);
+        }
+      });
+      cap->closed_token = item.Closed([weak, is_target](GraphicsCaptureItem const &, winrt::Windows::Foundation::IInspectable const &) {
+        if (auto c = weak.lock()) {
+          c->closed.store(true, std::memory_order_release);
+        }
+        if (is_target) {
+          BOOST_LOG(warning) << "App-window capture: the window's capture item closed";
+          g_capture_item_closed.store(true, std::memory_order_release);
+        }
+      });
+      cap->session = cap->pool.CreateCaptureSession(item);
+      try {
+        if (auto session3 = cap->session.try_as<winrt::Windows::Graphics::Capture::IGraphicsCaptureSession3>()) {
+          session3.IsBorderRequired(false);
+        }
+      } catch (...) {
+      }
+      try {
+        if (auto session2 = cap->session.try_as<winrt::Windows::Graphics::Capture::IGraphicsCaptureSession2>()) {
+          const bool visible = g_cursor_visible.load(std::memory_order_acquire);
+          session2.IsCursorCaptureEnabled(visible);
+          cap->cursor_applied = visible;
+        }
+      } catch (...) {
+      }
+      cap->session.StartCapture();
+      return cap;
+    } catch (const winrt::hresult_error &ex) {
+      destroy_capture(*cap);
+      if (is_target || _format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+        BOOST_LOG(error) << "App-window capture: CreateForWindow(0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec
+                         << ") failed: " << ex.code() << " - " << winrt::to_string(ex.message());
+        return nullptr;
+      }
+      // Popups WGC will not capture (rare) are printed through GDI instead.
+      BOOST_LOG(info) << "App-window capture: popup 0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec
+                      << " refused by WGC (" << ex.code() << "), using PrintWindow";
+      cap->gdi = true;
+      return cap;
+    }
+  }
+
+  void destroy_capture(capture_t &cap) noexcept {
+    try {
+      if (cap.pool && cap.frame_token.value != 0) {
+        cap.pool.FrameArrived(cap.frame_token);
+      }
+      if (cap.item && cap.closed_token.value != 0) {
+        cap.item.Closed(cap.closed_token);
+      }
+      if (cap.session) {
+        cap.session.Close();
+      }
+      if (cap.pool) {
+        cap.pool.Close();
+      }
+    } catch (...) {
+    }
+    cap.frame_token = {};
+    cap.closed_token = {};
+    cap.session = nullptr;
+    cap.pool = nullptr;
+    cap.item = nullptr;
+  }
+
+  /** PrintWindow a GDI-fallback popup into its frame texture (layout thread). */
+  void refresh_gdi_capture(capture_t &cap) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - cap.gdi_last < std::chrono::milliseconds(33)) {
+      return;
+    }
+    cap.gdi_last = now;
+    const int w = cap.rect.right - cap.rect.left, h = cap.rect.bottom - cap.rect.top;
+    if (w <= 0 || h <= 0) {
+      return;
+    }
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    BITMAPINFO bmi {};
+    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;  // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void *bits = nullptr;
+    HBITMAP dib = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    bool ok = false;
+    if (dib && bits) {
+      HGDIOBJ old = SelectObject(mem, dib);
+      ok = PrintWindow(cap.hwnd, mem, PW_RENDERFULLCONTENT) != 0;
+      GdiFlush();
+      if (ok) {
+        std::lock_guard ctx_lock(_ctx_mutex);
+        if (ensure_latest_texture(cap, static_cast<UINT>(w), static_cast<UINT>(h))) {
+          _context->UpdateSubresource(cap.latest.get(), 0, nullptr, bits, static_cast<UINT>(w) * 4, 0);
+          LARGE_INTEGER qpc {};
+          QueryPerformanceCounter(&qpc);
+          cap.latest_qpc = static_cast<uint64_t>(qpc.QuadPart);
+        }
+      }
+      SelectObject(mem, old);
+    }
+    if (dib) {
+      DeleteObject(dib);
+    }
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+    if (ok) {
+      mark_dirty();
+    }
+  }
+
+  /** Follows the window and its popups (which ones exist, where they are). */
+  void layout_thread_proc() {
+    init_thread_apartment();
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    std::vector<std::pair<HWND, RECT>> last_layout;
+    while (!_stop.load(std::memory_order_acquire)) {
+      if (!IsWindow(_target)) {
+        BOOST_LOG(warning) << "App-window capture: the window is gone";
+        g_capture_item_closed.store(true, std::memory_order_release);
+        break;
+      }
+      if (IsIconic(_target)) {
+        // Minimized: keep the last picture, nothing to follow.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        continue;
+      }
+      auto popups = app_window_layout::popup_windows(_target);
+      std::vector<std::pair<HWND, RECT>> layout;
+      std::vector<std::shared_ptr<capture_t>> gdi_refresh;
+      {
+        std::lock_guard lock(_captures_mutex);
+        RECT target_rect {};
+        if (app_window_layout::frame_rect(_target, target_rect)) {
+          _target_capture->rect = target_rect;
+        }
+        layout.emplace_back(_target, _target_capture->rect);
+        std::vector<std::shared_ptr<capture_t>> order;
+        order.push_back(_target_capture);
+        for (const auto &p : popups) {
+          std::shared_ptr<capture_t> cap;
+          for (auto &existing : _order) {
+            if (!existing->is_target && existing->hwnd == p.hwnd && !existing->closed.load(std::memory_order_acquire)) {
+              cap = existing;
+              break;
+            }
+          }
+          if (!cap) {
+            const auto failed = _failed.find(p.hwnd);
+            if (failed != _failed.end() && std::chrono::steady_clock::now() - failed->second < std::chrono::seconds(1)) {
+              continue;
+            }
+            cap = create_capture(p.hwnd, false);
+            if (!cap) {
+              _failed[p.hwnd] = std::chrono::steady_clock::now();
+              continue;
+            }
+            _failed.erase(p.hwnd);
+          }
+          cap->rect = p.rect;
+          order.push_back(cap);
+          layout.emplace_back(p.hwnd, p.rect);
+          if (cap->gdi) {
+            gdi_refresh.push_back(cap);
+          }
+        }
+        // Whatever is no longer part of the picture goes away.
+        for (auto &old : _order) {
+          if (old->is_target) {
+            continue;
+          }
+          bool kept = false;
+          for (auto &cap : order) {
+            if (cap == old) {
+              kept = true;
+              break;
+            }
+          }
+          if (!kept) {
+            destroy_capture(*old);
+          }
+        }
+        _order = std::move(order);
+      }
+      bool changed = layout.size() != last_layout.size();
+      for (size_t i = 0; !changed && i < layout.size(); ++i) {
+        changed = layout[i].first != last_layout[i].first || !EqualRect(&layout[i].second, &last_layout[i].second);
+      }
+      if (changed) {
+        last_layout = std::move(layout);
+        mark_dirty();
+      }
+      for (auto &cap : gdi_refresh) {
+        refresh_gdi_capture(*cap);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    }
+  }
+
+  void composite_thread_proc() {
+    init_thread_apartment();
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    DWORD task_idx = 0;
+    if (HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Games", &task_idx)) {
+      AvSetMmThreadPriority(mmcss, AVRT_PRIORITY_HIGH);
+    }
+    const auto min_gap = std::chrono::microseconds(1000000 / (2 * _fps));
+    auto last = std::chrono::steady_clock::now() - min_gap;
+    while (!_stop.load(std::memory_order_acquire)) {
+      {
+        std::unique_lock lock(_dirty_mutex);
+        _dirty_cv.wait(lock, [this] {
+          return _dirty || _stop.load(std::memory_order_acquire);
+        });
+        _dirty = false;
+      }
+      if (_stop.load(std::memory_order_acquire)) {
+        break;
+      }
+      // Several windows repaint for one vsync; publish at most two canvases per frame interval.
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last < min_gap) {
+        std::this_thread::sleep_for(min_gap - (now - last));
+      }
+      try {
+        composite();
+      } catch (const winrt::hresult_error &ex) {
+        BOOST_LOG(error) << "App-window composite failed: " << ex.code() << " - " << winrt::to_string(ex.message());
+      } catch (...) {
+        BOOST_LOG(error) << "App-window composite failed";
+      }
+      last = std::chrono::steady_clock::now();
+    }
+  }
+
+  void composite() {
+    std::vector<std::shared_ptr<capture_t>> order;
+    RECT target_rect {};
+    {
+      std::lock_guard lock(_captures_mutex);
+      order = _order;
+      target_rect = _target_capture->rect;
+    }
+    if (IsIconic(_target)) {
+      return;
+    }
+    int ax = 0, ay = 0;
+    app_window_layout::canvas_anchor(static_cast<int>(_canvas_w), static_cast<int>(_canvas_h),
+                                     target_rect.right - target_rect.left, target_rect.bottom - target_rect.top, ax, ay);
+
+    std::unique_lock ctx_lock(_ctx_mutex);
+    auto &keyed = _shared.get_keyed_mutex();
+    const HRESULT hr = keyed->AcquireSync(0, 200);
+    if (hr == WAIT_TIMEOUT) {
+      mark_dirty();  // try again
+      return;
+    }
+    if (hr != S_OK && hr != WAIT_ABANDONED) {
+      BOOST_LOG(error) << "App-window composite: failed to acquire the shared mutex: " << std::format("0x{:08X}", static_cast<uint32_t>(hr));
+      return;
+    }
+    auto release = util::fail_guard([&]() {
+      keyed->ReleaseSync(0);
+    });
+    auto &canvas = _shared.get_shared_texture();
+    if (!_canvas_rtv && FAILED(_device->CreateRenderTargetView(canvas.get(), nullptr, _canvas_rtv.put()))) {
+      BOOST_LOG(error) << "App-window composite: cannot create the canvas render target view";
+      return;
+    }
+    const float black[4] {0.f, 0.f, 0.f, 1.f};
+    _context->ClearRenderTargetView(_canvas_rtv.get(), black);
+    uint64_t qpc = 0;
+    for (auto &cap : order) {
+      if (!cap->latest || cap->latest_w == 0 || cap->latest_h == 0) {
+        continue;
+      }
+      // Canvas position of this window: the anchor plus its offset from the target.
+      LONG dx = ax + (cap->rect.left - target_rect.left);
+      LONG dy = ay + (cap->rect.top - target_rect.top);
+      D3D11_BOX box {0, 0, 0, cap->latest_w, cap->latest_h, 1};
+      if (dx < 0) {
+        box.left = static_cast<UINT>(-dx);
+        dx = 0;
+      }
+      if (dy < 0) {
+        box.top = static_cast<UINT>(-dy);
+        dy = 0;
+      }
+      if (box.left >= box.right || box.top >= box.bottom || dx >= static_cast<LONG>(_canvas_w) || dy >= static_cast<LONG>(_canvas_h)) {
+        continue;
+      }
+      box.right = std::min<UINT>(box.right, box.left + (_canvas_w - static_cast<UINT>(dx)));
+      box.bottom = std::min<UINT>(box.bottom, box.top + (_canvas_h - static_cast<UINT>(dy)));
+      _context->CopySubresourceRegion(canvas.get(), 0, static_cast<UINT>(dx), static_cast<UINT>(dy), 0, cap->latest.get(), 0, &box);
+      qpc = std::max(qpc, cap->latest_qpc);
+    }
+    if (qpc == 0) {
+      LARGE_INTEGER now {};
+      QueryPerformanceCounter(&now);
+      qpc = static_cast<uint64_t>(now.QuadPart);
+    }
+    _shared.publish_frame_metadata(qpc);
+    release.disable();
+    keyed->ReleaseSync(0);
+    ctx_lock.unlock();
+    _shared.signal_frame_ready();
+  }
+
+  IDirect3DDevice _winrt_device;
+  winrt::com_ptr<ID3D11Device> _device;
+  winrt::com_ptr<ID3D11DeviceContext> _context;
+  SharedResourceManager &_shared;
+  DXGI_FORMAT _format;
+  HWND _target;
+  UINT _canvas_w, _canvas_h;
+  int _fps;
+
+  std::mutex _ctx_mutex;  ///< serializes every use of the immediate context
+  winrt::com_ptr<ID3D11RenderTargetView> _canvas_rtv;
+
+  std::mutex _captures_mutex;
+  std::shared_ptr<capture_t> _target_capture;
+  std::vector<std::shared_ptr<capture_t>> _order;  ///< composition order, target first
+  std::map<HWND, std::chrono::steady_clock::time_point> _failed;
+
+  std::mutex _dirty_mutex;
+  std::condition_variable _dirty_cv;
+  bool _dirty = false;
+  std::atomic<bool> _stop {true};
+  std::thread _layout_thread;
+  std::thread _composite_thread;
+};
+
+/**
+ * @brief Runs an app-window session: handshake, compositor, message loop.
+ */
+int run_window_session(std::shared_ptr<AsyncNamedPipe> pipe_shared, D3D11DeviceManager &d3d11_manager) {
+  const bool force_sdr_capture = g_config_received && ((g_config.flags & platf::dxgi::WGC_IPC_FLAG_FORCE_SDR_CAPTURE_FORMAT) != 0);
+  const auto capture_surface_format = platf::dxgi::wgc_policy::select_capture_surface_format(
+    g_config_received,
+    force_sdr_capture,
+    g_config.dynamic_range,
+    g_config.advanced_color_capture
+  );
+  const DXGI_FORMAT capture_format =
+    capture_surface_format == platf::dxgi::wgc_policy::capture_surface_format::rgba16_float ?
+      DXGI_FORMAT_R16G16B16A16_FLOAT :
+      DXGI_FORMAT_B8G8R8A8_UNORM;
+
+  SharedResourceManager shared_resource_manager;
+  if (!shared_resource_manager.initialize_all(d3d11_manager.get_device(), g_config.canvas_width, g_config.canvas_height, capture_format)) {
+    return 1;
+  }
+  platf::dxgi::shared_handle_data_t handle_data = shared_resource_manager.get_shared_handle_data();
+  std::span<const uint8_t> handle_message(reinterpret_cast<const uint8_t *>(&handle_data), sizeof(handle_data));
+  {
+    int waited_ms = 0;
+    while (!pipe_shared->is_connected() && waited_ms < 5000) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      waited_ms += 50;
+    }
+    if (!pipe_shared->is_connected()) {
+      BOOST_LOG(error) << "Timed out waiting for main process to connect (5000ms)";
+      return 1;
+    }
+  }
+  pipe_shared->send(handle_message);
+
+  auto target = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(g_config.target_hwnd));
+  WindowCompositor compositor {d3d11_manager.get_winrt_device(), d3d11_manager.get_device(), d3d11_manager.get_context(),
+                               shared_resource_manager, capture_format, target, g_config.canvas_width, g_config.canvas_height,
+                               g_config.target_fps > 0 ? g_config.target_fps : 60};
+  if (!compositor.start()) {
+    return 1;
+  }
+  setup_desktop_switch_hook();
+
+  bool shutdown_requested = false;
+  while (pipe_shared->is_connected() && !shutdown_requested && !g_capture_item_closed.load(std::memory_order_acquire)) {
+    if (!process_window_messages(shutdown_requested)) {
+      break;
+    }
+    poll_pending_secure_desktop_transition();
+    compositor.update_cursor_capture();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  compositor.stop();
+  BOOST_LOG(info) << (g_capture_item_closed.load(std::memory_order_acquire) ? "App-window capture ended, shutting down..." : "Main process disconnected, shutting down...");
+  pipe_shared->stop();
+  boost::log::core::get()->flush();
+  BOOST_LOG(info) << "WGC Helper process terminated";
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
   // Set up default config and log level
   // Use session-mode logs so rare startup deadlocks don't get overwritten by the next helper run.
@@ -2562,6 +3134,12 @@ int main(int argc, char *argv[]) {
   if (!d3d11_manager.initialize_all(g_config.adapter_luid)) {
     BOOST_LOG(error) << "D3D11 device initialization failed, exiting...";
     return 1;
+  }
+
+  // App-window sessions have their own capture path: one WGC item per window
+  // of the streamed application, composited onto a fixed canvas.
+  if (g_config.target_hwnd && g_config.canvas_width > 0 && g_config.canvas_height > 0) {
+    return run_window_session(pipe_shared, d3d11_manager);
   }
 
   // Monitor management
@@ -2641,18 +3219,7 @@ int main(int argc, char *argv[]) {
 
   // Create shared resource manager for texture, keyed mutex, and metadata
   SharedResourceManager shared_resource_manager;
-  // App-window capture: the shared texture is a fixed canvas (the encoder
-  // frame size); the window is copied into its top-left at whatever size it
-  // currently has, so resizes never restart the capture.
-  const bool window_canvas = g_config.target_hwnd && g_config.canvas_width > 0 && g_config.canvas_height > 0;
-  const UINT shared_w = window_canvas ? g_config.canvas_width : display_manager.get_width();
-  const UINT shared_h = window_canvas ? g_config.canvas_height : display_manager.get_height();
-  if (window_canvas) {
-    g_capture_monitor_rect = display_manager.monitor_rect();
-    BOOST_LOG(info) << "App-window capture: monitor " << display_manager.get_width() << 'x' << display_manager.get_height()
-                    << " cut to the window, on a " << shared_w << 'x' << shared_h << " canvas";
-  }
-  if (!shared_resource_manager.initialize_all(d3d11_manager.get_device(), shared_w, shared_h, capture_format)) {
+  if (!shared_resource_manager.initialize_all(d3d11_manager.get_device(), display_manager.get_width(), display_manager.get_height(), capture_format)) {
     return 1;
   }
 

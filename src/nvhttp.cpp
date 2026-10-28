@@ -4081,6 +4081,55 @@ namespace nvhttp {
     write_json(response, out);
   }
 
+  /**
+   * @brief Long-poll of one window's layout (rect, canvas anchor, popups).
+   * With `etag` and `wait` the reply is held back (up to one second) until
+   * something changes, so a client sees a menu open within a few milliseconds
+   * without hammering the host with requests.
+   */
+  void get_host_window_layout(resp_https_t response, req_https_t request) {
+    if (!windows_request_allowed(response, request, "layout")) return;
+    const auto args = request->parse_query_string();
+    const auto handle = parse_window_handle(get_arg(args, "hwnd", ""));
+    if (!handle || !host_windows::exists(handle)) {
+      write_json(response, {{"gone", true}}, SimpleWeb::StatusCode::client_error_not_found);
+      return;
+    }
+    int cw = 0, ch = 0, wait_ms = 0;
+    std::uint64_t etag = 0;
+    try {
+      cw = std::stoi(get_arg(args, "cw", "0"));
+      ch = std::stoi(get_arg(args, "ch", "0"));
+      wait_ms = std::clamp(std::stoi(get_arg(args, "wait", "0")), 0, 1000);
+      etag = std::stoull(get_arg(args, "etag", "0"));
+    } catch (...) {
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+    host_windows::layout_t layout;
+    for (;;) {
+      layout = host_windows::window_layout(handle, cw, ch);
+      if (!layout.valid || layout.etag != etag || std::chrono::steady_clock::now() >= deadline) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    }
+    if (!layout.valid) {
+      write_json(response, {{"gone", true}}, SimpleWeb::StatusCode::client_error_not_found);
+      return;
+    }
+    nlohmann::json out {
+      {"rect", {layout.rect[0], layout.rect[1], layout.rect[2], layout.rect[3]}},
+      {"anchor", {layout.anchor[0], layout.anchor[1]}},
+      {"popups", nlohmann::json::array()},
+      {"radius", layout.radius},
+      {"caption", layout.caption},
+      {"state", layout.state},
+      {"title", layout.title},
+      {"focused", layout.focused},
+      {"etag", std::to_string(layout.etag)},
+    };
+    for (const auto &p : layout.popups) out["popups"].push_back({p[0], p[1], p[2], p[3]});
+    write_json(response, out);
+  }
+
   void post_host_window_action(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
     if (!windows_request_allowed(response, request, "action")) return;
@@ -6557,6 +6606,10 @@ launch_session->exact_target_hold.reset();
     // work, and on a single FIFO worker that made the host undiscoverable until restart.
     thread_pool_util::ThreadPool discovery_route_pool;
     discovery_route_pool.start(1);
+    // App-window layout long-polls park a worker for up to a second each; keep
+    // them off the single-worker pools (one poll per streamed window).
+    thread_pool_util::ThreadPool layout_route_pool;
+    layout_route_pool.start(8);
     hardware_metrics::service_t metrics_service {[] {
       return platf::create_host_stats_provider();
     }};
@@ -6766,6 +6819,9 @@ launch_session->exact_target_hold.reset();
     };
     https_server.resource["^/actions/window-hittest$"]["GET"] = [run_blocking_nvhttp](auto response, auto request) {
       run_blocking_nvhttp(response, "window-hittest", [response, request] { get_host_window_hittest(response, request); });
+    };
+    https_server.resource["^/actions/window-layout$"]["GET"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
+      run_on_blocking_pool(layout_route_pool, [response, request] { get_host_window_layout(response, request); });
     };
     https_server.resource["^/actions/window$"]["POST"] = [run_blocking_nvhttp](auto response, auto request) {
       run_blocking_nvhttp(response, "window", [response, request] { post_host_window_action(response, request); });
