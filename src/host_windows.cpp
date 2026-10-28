@@ -353,21 +353,41 @@ namespace host_windows {
   }
 
   bool remap_canvas_point(int origin_x, int origin_y, int cx, int cy, int &hx, int &hy) {
-    std::lock_guard lock(g_slots_mutex);
-    for (const auto &[target, origin] : g_session_origins) {
-      if (origin.x != origin_x || origin.y != origin_y) continue;
-      auto it = g_slots.find(target);
-      if (it == g_slots.end()) return false;
-      for (auto sl = it->second.rbegin(); sl != it->second.rend(); ++sl) {
-        if (cx >= sl->canvas[0] && cy >= sl->canvas[1] && cx < sl->canvas[0] + sl->canvas[2] && cy < sl->canvas[1] + sl->canvas[3]) {
-          hx = sl->host[0] + (cx - sl->canvas[0]);
-          hy = sl->host[1] + (cy - sl->canvas[1]);
-          return true;
+    HWND intended = nullptr;
+    std::vector<HWND> family;  // the window and its popups: the only windows we reorder
+    {
+      std::lock_guard lock(g_slots_mutex);
+      for (const auto &[target, origin] : g_session_origins) {
+        if (origin.x != origin_x || origin.y != origin_y) continue;
+        intended = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(target));
+        family.push_back(intended);
+        hx = origin.x + cx;
+        hy = origin.y + cy;
+        if (auto it = g_slots.find(target); it != g_slots.end()) {
+          for (auto sl = it->second.rbegin(); sl != it->second.rend(); ++sl) {
+            family.push_back(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(sl->handle)));
+            if (intended == reinterpret_cast<HWND>(static_cast<std::uintptr_t>(target)) &&
+                cx >= sl->canvas[0] && cy >= sl->canvas[1] && cx < sl->canvas[0] + sl->canvas[2] && cy < sl->canvas[1] + sl->canvas[3]) {
+              intended = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(sl->handle));
+              hx = sl->host[0] + (cx - sl->canvas[0]);
+              hy = sl->host[1] + (cy - sl->canvas[1]);
+            }
+          }
         }
+        break;
       }
-      return false;
     }
-    return false;
+    if (!intended) return false;
+    // On the host the window and its dialogs overlap freely (their positions
+    // mean nothing to the client), so make sure the window the client aimed
+    // at is the one on top at that point; only ever reorder within the family.
+    if (HWND under = WindowFromPoint(POINT {hx, hy})) {
+      under = GetAncestor(under, GA_ROOT);
+      if (under && under != intended && std::find(family.begin(), family.end(), under) != family.end() && IsWindow(intended)) {
+        SetWindowPos(intended, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+      }
+    }
+    return true;
   }
 
   namespace {
