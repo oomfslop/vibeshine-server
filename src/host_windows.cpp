@@ -373,8 +373,24 @@ namespace host_windows {
         bool ok = SetForegroundWindow(focus) != 0;
         BringWindowToTop(focus);
         if (!ok || GetForegroundWindow() != focus) {
+          // The foreground lock: only the process with the last input may
+          // set the foreground. A synthetic Alt tap makes that us (the
+          // standard workaround; Alt alone does nothing once focus moves).
+          INPUT alt[2] {};
+          alt[0].type = alt[1].type = INPUT_KEYBOARD;
+          alt[0].ki.wVk = alt[1].ki.wVk = VK_MENU;
+          alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
+          SendInput(2, alt, sizeof(INPUT));
+          ok = SetForegroundWindow(focus) != 0;
+          BringWindowToTop(focus);
+        }
+        if (!ok || GetForegroundWindow() != focus) {
           SwitchToThisWindow(focus, TRUE);
           ok = GetForegroundWindow() == focus;
+        }
+        if (!ok) {
+          BOOST_LOG(info) << "App windows: could not focus 0x" << std::hex << reinterpret_cast<std::uintptr_t>(focus) << std::dec
+                          << " (foreground is 0x" << std::hex << reinterpret_cast<std::uintptr_t>(GetForegroundWindow()) << std::dec << ')';
         }
         return ok;
       }
