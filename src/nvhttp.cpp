@@ -4144,6 +4144,17 @@ namespace nvhttp {
       write_json(response, {{"status", true}});
       return;
     }
+    if (op == "order") {
+      std::vector<std::uint64_t> top_first;
+      std::stringstream list(get_arg(args, "hwnds", ""));
+      std::string item;
+      while (std::getline(list, item, ',')) {
+        if (auto h = parse_window_handle(item)) top_first.push_back(h);
+      }
+      const bool ok = app_desk::order(uuid, top_first);
+      write_json(response, {{"status", ok}}, ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_not_found);
+      return;
+    }
     if (op == "get") {
       const auto desk = app_desk::get(uuid);
       if (!desk) {

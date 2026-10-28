@@ -482,6 +482,28 @@ namespace app_desk {
     return true;
   }
 
+  bool order(const std::string &client_uuid, const std::vector<std::uint64_t> &top_first) {
+    RECT desk {};
+    {
+      std::lock_guard lock(g_mutex);
+      auto it = g_desks.find(client_uuid);
+      if (it == g_desks.end() || !it->second.open || !find_monitor(it->second.device, &desk)) return false;
+    }
+    HWND above = HWND_TOP;
+    int placed = 0;
+    for (auto handle : top_first) {
+      auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+      RECT r {};
+      if (!IsWindow(hwnd) || !GetWindowRect(hwnd, &r)) continue;
+      RECT x {};
+      if (!IntersectRect(&x, &r, &desk)) continue;  // only windows on the desk
+      SetWindowPos(hwnd, above, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+      above = hwnd;
+      ++placed;
+    }
+    return placed > 0;
+  }
+
   bool release(const std::string &client_uuid, std::uint64_t handle) {
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
     std::lock_guard lock(g_mutex);
@@ -675,6 +697,10 @@ namespace app_desk {
   }
 
   void close(const std::string &) {}
+
+  bool order(const std::string &, const std::vector<std::uint64_t> &) {
+    return false;
+  }
 
   void session_started(const std::string &) {}
 
