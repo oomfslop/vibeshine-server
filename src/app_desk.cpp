@@ -193,6 +193,19 @@ namespace app_desk {
       }).detach();
     }
 
+    /** Windows puts a taskbar on every display, the desk included; nothing of
+     *  the desk but its windows must ever be in the picture. */
+    void hide_desk_taskbar(HMONITOR desk) {
+      if (!desk) return;
+      for (HWND tray = FindWindowExW(nullptr, nullptr, L"Shell_SecondaryTrayWnd", nullptr); tray;
+           tray = FindWindowExW(nullptr, tray, L"Shell_SecondaryTrayWnd", nullptr)) {
+        if (MonitorFromWindow(tray, MONITOR_DEFAULTTONULL) == desk && IsWindowVisible(tray)) {
+          ShowWindow(tray, SW_HIDE);
+          BOOST_LOG(info) << "Desk: hid the taskbar on the desk";
+        }
+      }
+    }
+
     std::string window_title(HWND hwnd) {
       const int length = GetWindowTextLengthW(hwnd);
       if (length <= 0) return {};
@@ -363,6 +376,7 @@ namespace app_desk {
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    hide_desk_taskbar(find_monitor(desk.device));
     BOOST_LOG(info) << "Desk: open " << desk.info.display << ' ' << desk.info.rect[2] << 'x' << desk.info.rect[3] << '@' << fps << " at " << desk.info.dpi << " dpi"
                     << (custom ? " (exact mode)" : " (catalog mode)");
     return desk.info;
@@ -453,11 +467,18 @@ namespace app_desk {
     layout_t out;
     RECT desk {};
     std::vector<HWND> adopted;
+    HMONITOR desk_monitor = nullptr;
     {
       std::lock_guard lock(g_mutex);
       auto it = g_desks.find(client_uuid);
-      if (it == g_desks.end() || !it->second.open || !find_monitor(it->second.device, &desk)) return out;
+      if (it == g_desks.end() || !it->second.open || !(desk_monitor = find_monitor(it->second.device, &desk))) return out;
       for (const auto &[hwnd, origin] : it->second.adopted) adopted.push_back(hwnd);
+    }
+    // Explorer shows it again now and then (display changes, restarts)
+    static std::chrono::steady_clock::time_point last_tray_check {};
+    if (std::chrono::steady_clock::now() - last_tray_check > std::chrono::seconds(2)) {
+      last_tray_check = std::chrono::steady_clock::now();
+      hide_desk_taskbar(desk_monitor);
     }
     out.valid = true;
     struct raw_t {
