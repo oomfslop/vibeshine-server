@@ -133,7 +133,7 @@ const int INITIAL_LOG_LEVEL = 2;
 constexpr uint32_t DEFAULT_WGC_IPC_FLAGS =
   platf::dxgi::WGC_IPC_FLAG_DRAIN_TO_LATEST |
   platf::dxgi::WGC_IPC_FLAG_ALLOW_BUFFER_DECREASE;
-static platf::dxgi::config_data_t g_config = {0, 0, 0, L"", {0, 0}, 10000, 60, 1, 2, DEFAULT_WGC_IPC_FLAGS, 120, 0};
+static platf::dxgi::config_data_t g_config = {0, 0, 0, L"", {0, 0}, 10000, 60, 1, 2, DEFAULT_WGC_IPC_FLAGS, 120, 0, 0, 0};
 static std::mutex g_config_mutex;
 static std::condition_variable g_config_cv;
 static std::atomic<int32_t> g_activity_admission_fps {120};
@@ -1149,6 +1149,8 @@ private:
   bool _delivery_stop = false;
   std::mutex _d3d_context_mutex;
   std::array<scratch_texture_t, 3> _scratch_textures;
+  winrt::com_ptr<ID3D11RenderTargetView> _shared_rtv;  ///< app-window canvas clears
+  UINT _last_canvas_copy_w = 0, _last_canvas_copy_h = 0;
   std::atomic<uint64_t> _delivery_backpressure_waits {0};
   std::atomic<uint64_t> _delivery_replaced_frames {0};
   std::atomic<uint64_t> _scratch_dropped_frames {0};
@@ -1395,12 +1397,16 @@ public:
 
     if (frame && g_config.target_hwnd) {
       const auto content = frame.ContentSize();
-      if (content.Width != static_cast<int32_t>(_width) || content.Height != static_cast<int32_t>(_height)) {
-        // The window was resized: the pool and shared texture are fixed-size,
-        // so restart the capture at the new size (the host reinitialises).
+      if (content.Width > 0 && content.Height > 0 &&
+          (content.Width != static_cast<int32_t>(_width) || content.Height != static_cast<int32_t>(_height))) {
+        // The window was resized: recreate the frame pool at the new size.
+        // Scratch textures follow lazily; the shared canvas stays as it is.
         BOOST_LOG(info) << "App-window content size changed " << _width << 'x' << _height << " -> "
-                        << content.Width << 'x' << content.Height << "; restarting capture";
-        g_capture_item_closed.store(true, std::memory_order_release);
+                        << content.Width << 'x' << content.Height;
+        _width = static_cast<UINT>(content.Width);
+        _height = static_cast<UINT>(content.Height);
+        frame = nullptr;
+        create_or_adjust_frame_pool(_current_buffer_size ? _current_buffer_size : 1);
         return;
       }
     }
@@ -1671,7 +1677,13 @@ private:
 
     auto &scratch = _scratch_textures[index];
     if (scratch.texture) {
-      return true;
+      D3D11_TEXTURE2D_DESC have {};
+      scratch.texture->GetDesc(&have);
+      if (have.Width == _width && have.Height == _height) {
+        return true;
+      }
+      // Window capture resized: drop the stale scratch texture.
+      scratch.texture = nullptr;
     }
 
     winrt::com_ptr<ID3D11Device> device;
@@ -1939,7 +1951,35 @@ private:
     // Copy frame data while holding the keyed mutex. The main process acquires
     // the same mutex before snapshotting this shared texture into a pool-owned frame.
     const auto copy_start = std::chrono::steady_clock::now();
-    _deps->d3d_context->CopyResource(_deps->resource_manager.get_shared_texture().get(), frame_tex.get());
+    {
+      auto &shared = _deps->resource_manager.get_shared_texture();
+      D3D11_TEXTURE2D_DESC src {}, dst {};
+      frame_tex->GetDesc(&src);
+      shared->GetDesc(&dst);
+      if (src.Width == dst.Width && src.Height == dst.Height) {
+        _deps->d3d_context->CopyResource(shared.get(), frame_tex.get());
+      } else {
+        // App-window canvas: window frame into the top-left; clear first when
+        // the window got smaller so stale pixels don't linger beyond its edge.
+        if (src.Width < _last_canvas_copy_w || src.Height < _last_canvas_copy_h || !_shared_rtv) {
+          if (!_shared_rtv) {
+            winrt::com_ptr<ID3D11Device> device;
+            _deps->d3d_context->GetDevice(device.put());
+            if (device) {
+              device->CreateRenderTargetView(shared.get(), nullptr, _shared_rtv.put());
+            }
+          }
+          if (_shared_rtv) {
+            const float black[4] {0.f, 0.f, 0.f, 1.f};
+            _deps->d3d_context->ClearRenderTargetView(_shared_rtv.get(), black);
+          }
+        }
+        D3D11_BOX box {0, 0, 0, std::min(src.Width, dst.Width), std::min(src.Height, dst.Height), 1};
+        _deps->d3d_context->CopySubresourceRegion(shared.get(), 0, 0, 0, 0, frame_tex.get(), 0, &box);
+        _last_canvas_copy_w = src.Width;
+        _last_canvas_copy_h = src.Height;
+      }
+    }
     const auto copy_submit = std::chrono::steady_clock::now() - copy_start;
 
     // Publish the metadata while still holding the shared keyed mutex so the
@@ -2562,7 +2602,17 @@ int main(int argc, char *argv[]) {
 
   // Create shared resource manager for texture, keyed mutex, and metadata
   SharedResourceManager shared_resource_manager;
-  if (!shared_resource_manager.initialize_all(d3d11_manager.get_device(), display_manager.get_width(), display_manager.get_height(), capture_format)) {
+  // App-window capture: the shared texture is a fixed canvas (the encoder
+  // frame size); the window is copied into its top-left at whatever size it
+  // currently has, so resizes never restart the capture.
+  const bool window_canvas = g_config.target_hwnd && g_config.canvas_width > 0 && g_config.canvas_height > 0;
+  const UINT shared_w = window_canvas ? g_config.canvas_width : display_manager.get_width();
+  const UINT shared_h = window_canvas ? g_config.canvas_height : display_manager.get_height();
+  if (window_canvas) {
+    BOOST_LOG(info) << "App-window capture: window " << display_manager.get_width() << 'x' << display_manager.get_height()
+                    << " on a " << shared_w << 'x' << shared_h << " canvas";
+  }
+  if (!shared_resource_manager.initialize_all(d3d11_manager.get_device(), shared_w, shared_h, capture_format)) {
     return 1;
   }
 

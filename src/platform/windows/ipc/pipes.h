@@ -97,6 +97,8 @@ namespace platf::dxgi {
     uint32_t flags;
     int32_t activity_admission_fps;
     uint64_t target_hwnd;  ///< non-zero: capture this window (CreateForWindow) instead of display_name
+    uint32_t canvas_width;  ///< window capture: fixed shared-texture size the window is copied into (top-left)
+    uint32_t canvas_height;
   };
 
   constexpr uint32_t WGC_ACTIVITY_ADMISSION_MESSAGE_MAGIC = 0x57474341;  // "WGCA"

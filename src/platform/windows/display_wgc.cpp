@@ -246,12 +246,14 @@ namespace platf::dxgi {
       }
       offset_x = rect[0] - GetSystemMetrics(SM_XVIRTUALSCREEN);
       offset_y = rect[1] - GetSystemMetrics(SM_YVIRTUALSCREEN);
-      width = width_before_rotation = rect[2];
-      height = height_before_rotation = rect[3];
+      // The helper copies the window into the top-left of a fixed canvas the
+      // size of the encoder frame, so window resizes never change the capture.
+      width = width_before_rotation = std::max(2, config.width);
+      height = height_before_rotation = std::max(2, config.height);
       display_rotation = DXGI_MODE_ROTATION_IDENTITY;
       pad_output = true;
       BOOST_LOG(info) << "App-window capture: window 0x" << std::hex << _target_hwnd << std::dec << " at " << rect[0] << ',' << rect[1]
-                      << " size " << width << 'x' << height << " on " << display_name;
+                      << " (" << rect[2] << 'x' << rect[3] << ") on a " << width << 'x' << height << " canvas, " << display_name;
     }
 
     capture_format = DXGI_FORMAT_UNKNOWN;  // Start with unknown format (prevents race condition/crash on first frame)

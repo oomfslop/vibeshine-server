@@ -364,6 +364,8 @@ namespace platf::dxgi {
     config_data.max_frame_buffer_size = wgc_max_frame_buffer_size(_config);
     config_data.activity_admission_fps = _activity_admission_fps.load(std::memory_order_relaxed);
     config_data.target_hwnd = _target_hwnd;
+    config_data.canvas_width = _target_hwnd ? static_cast<uint32_t>(std::max(0, _config.width)) : 0;
+    config_data.canvas_height = _target_hwnd ? static_cast<uint32_t>(std::max(0, _config.height)) : 0;
 
     // Convert display_name (std::string) to wchar_t[32]
     if (!_display_name.empty()) {

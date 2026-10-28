@@ -4029,6 +4029,7 @@ namespace nvhttp {
         {"focused", w.focused},
         {"icon", w.icon_key},
         {"monitor", w.monitor},
+        {"monitor_rect", {w.monitor_rect[0], w.monitor_rect[1], w.monitor_rect[2], w.monitor_rect[3]}},
         {"dpi", w.dpi},
       });
     }

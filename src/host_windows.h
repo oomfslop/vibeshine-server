@@ -26,6 +26,7 @@ namespace host_windows {
     bool focused = false;
     std::string icon_key;  ///< stable cache key for the window icon ("" when none)
     std::string monitor;  ///< GDI device name of the monitor holding most of the window
+    int monitor_rect[4] {0, 0, 0, 0};  ///< that monitor's rect (virtual-desktop pixels)
     int dpi = 96;
   };
 

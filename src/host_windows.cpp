@@ -232,6 +232,10 @@ namespace host_windows {
             info.monitor = utf_utils::to_utf8(mi.szDevice);
           } catch (...) {
           }
+          info.monitor_rect[0] = mi.rcMonitor.left;
+          info.monitor_rect[1] = mi.rcMonitor.top;
+          info.monitor_rect[2] = mi.rcMonitor.right - mi.rcMonitor.left;
+          info.monitor_rect[3] = mi.rcMonitor.bottom - mi.rcMonitor.top;
         }
         if (const UINT dpi = GetDpiForWindow(hwnd)) info.dpi = static_cast<int>(dpi);
       }
