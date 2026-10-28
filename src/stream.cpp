@@ -812,6 +812,16 @@ namespace stream {
     broadcast_controls.request_idr_for_all_sessions();
   }
 
+  namespace {
+    std::atomic<std::int64_t> g_video_epoch_ns {0};
+  }
+
+  std::uint32_t video_clock_now() {
+    using rtp_tick = std::chrono::duration<std::uint32_t, std::ratio<1, 90000>>;
+    const auto epoch = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(g_video_epoch_ns.load(std::memory_order_relaxed)));
+    return std::chrono::round<rtp_tick>(std::chrono::steady_clock::now() - epoch).count();
+  }
+
   int set_bitrate_for_sessions(const std::string &client_uuid, int bitrate_kbps) {
     return broadcast_controls.set_bitrate_for_sessions(client_uuid, bitrate_kbps);
   }
@@ -2004,6 +2014,7 @@ namespace stream {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
     auto video_epoch = std::chrono::steady_clock::now();
+    g_video_epoch_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(video_epoch.time_since_epoch()).count(), std::memory_order_relaxed);
 
     // Video traffic is sent on this thread
     platf::set_thread_name("stream::videoBroadcast");

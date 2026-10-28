@@ -182,4 +182,9 @@ namespace stream {
    * @return Number of sessions updated.
    */
   int set_bitrate_for_sessions(const std::string &client_uuid, int bitrate_kbps);
+
+  /** Now, on the clock of the video frames' RTP timestamps (90 kHz since the
+   *  broadcast epoch): lets a client match window layouts to the frames that
+   *  show them. */
+  std::uint32_t video_clock_now();
 }  // namespace stream

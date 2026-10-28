@@ -4186,10 +4186,12 @@ namespace nvhttp {
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
     app_desk::layout_t layout;
+    std::uint32_t taken = 0;
     for (;;) {
+      taken = stream::video_clock_now();  // when this snapshot was true, on the frames' clock
       layout = app_desk::layout(uuid);
       if (!layout.valid || layout.etag != etag || std::chrono::steady_clock::now() >= deadline) break;
-      std::this_thread::sleep_for(std::chrono::milliseconds(8));
+      std::this_thread::sleep_for(std::chrono::milliseconds(4));
     }
     if (!layout.valid) {
       write_json(response, {{"gone", true}}, SimpleWeb::StatusCode::client_error_not_found);
@@ -4198,6 +4200,7 @@ namespace nvhttp {
     nlohmann::json out {
       {"windows", nlohmann::json::array()},
       {"etag", std::to_string(layout.etag)},
+      {"ts", taken},
     };
     for (const auto &w : layout.windows) {
       char handle[32], owner[32];
