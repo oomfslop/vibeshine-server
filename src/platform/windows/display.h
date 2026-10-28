@@ -527,11 +527,6 @@ namespace platf::dxgi {
      * @return 0 on success, negative on failure.
      */
     int dummy_img(platf::img_t *img_base) override;
-    /** App-window capture: capture this window instead of the display named in init(). */
-    void set_window_target(std::uint64_t hwnd) {
-      _target_hwnd = hwnd;
-    }
-    std::optional<input_geometry_snapshot_t> input_geometry_snapshot() const override;
 
   protected:
     /**
@@ -554,7 +549,6 @@ namespace platf::dxgi {
     std::unique_ptr<class ipc_session_t> _ipc_session;
     ::video::config_t _config;
     std::string _display_name;
-    std::uint64_t _target_hwnd = 0;  ///< App-window capture target (0 = display).
     bool _session_initialized_logged = false;
     bool _frame_locked = false;
     std::shared_ptr<platf::img_t> _last_cached_frame;

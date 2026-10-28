@@ -43,10 +43,6 @@ extern "C" {
 #include "control_peer_timeout.h"
 #include "deferred_stream_start_policy.h"
 #include "display_helper_integration.h"
-#include "host_windows.h"
-#ifdef _WIN32
-  #include "platform/windows/app_window_layout.h"
-#endif
 #include "globals.h"
 #include "hardware_metrics_session.h"
 #include "host_stats.h"
@@ -614,8 +610,6 @@ namespace stream {
     bool secondary_game_client = false;
     remote_session::role_e remote_role {remote_session::role_e::game};
     bool app_window {};  ///< app-window session: lives independently of the configured application
-    std::shared_ptr<void> app_window_display;  ///< keeps the window on a display fast enough for the session fps
-    std::shared_ptr<void> app_window_pin;  ///< keeps the window where it is on the host
     bool hide_cursor {};  ///< this session asked for the host cursor to be left out
     std::uint64_t remote_role_generation {};
     std::string monitor_profile_uuid;
@@ -3549,8 +3543,6 @@ namespace stream {
 
       // Release input before any potentially hung capture joins.
       input::reset(session.input);
-      session.app_window_pin.reset();
-      session.app_window_display.reset();
       if (session.hide_cursor) {
         session.hide_cursor = false;
         video::add_cursor_hide_request(-1);
@@ -3944,7 +3936,7 @@ namespace stream {
       session->client_display_refresh_millihz = launch_session.client_display_refresh_millihz;
       session->secondary_game_client = launch_session.secondary_game_client;
       session->remote_role = launch_session.role;
-      session->app_window = launch_session.window_handle != 0 || !launch_session.desk_display.empty();
+      session->app_window = !launch_session.desk_display.empty();
       // A desk has a producer of its own and hides the cursor there; only
       // shared-display sessions need the process-wide request.
       session->hide_cursor = launch_session.hide_cursor && launch_session.desk_display.empty();
@@ -4007,15 +3999,6 @@ namespace stream {
         session->config.monitor.capture_output = launch_session.desk_display;
         session->config.monitor.hide_cursor = true;
         session->audio_disabled = true;
-      } else if (launch_session.window_handle) {
-        // App-window session: private WGC capture of one window, no audio.
-        session->config.monitor.capture_source = video::capture_source_e::window;
-        session->config.monitor.capture_output = "hwnd:" + std::to_string(launch_session.window_handle);
-        session->audio_disabled = true;
-        // Per-window capture runs at the window's monitor refresh rate.
-        session->app_window_display = host_windows::lease_fast_display(launch_session.window_handle, session->config.monitor.framerate);
-        session->app_window_pin = host_windows::pin_position(launch_session.window_handle, session->config.monitor.width,
-                                                             app_window_layout::color_height(session->config.monitor.height));
       }
       BOOST_LOG(info) << "Session capture source: role=" << static_cast<int>(launch_session.role)
                       << " source=" << static_cast<int>(session->config.monitor.capture_source)

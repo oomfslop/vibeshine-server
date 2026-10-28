@@ -109,8 +109,6 @@ namespace rtsp_stream {
     // and adaptive-headroom checks. The renderer may still fall back later.
     bool client_vrr_requested = false;
     bool requested_resolution_only = false;
-    // App-window streaming: capture only this top-level window (HWND); 0 = normal session.
-    std::uint64_t window_handle = 0;
     bool hide_cursor = false;  ///< client draws its own cursor: leave the host cursor out of the capture
     std::string desk_display;  ///< desk session: capture this display (the client's desk) instead of a window
     std::string virtual_display_catalog_error;

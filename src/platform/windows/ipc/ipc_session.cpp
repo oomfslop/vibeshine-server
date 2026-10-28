@@ -18,8 +18,6 @@
 
 // local includes
 #include "config.h"
-#include "src/host_windows.h"
-#include <cstring>
 #include "ipc_session.h"
 #include "misc_utils.h"
 #include "src/logging.h"
@@ -202,8 +200,7 @@ namespace platf::dxgi {
     }
   }
 
-  int ipc_session_t::init(const ::video::config_t &config, std::string_view display_name, ID3D11Device *device, bool advanced_color_capture, std::uint64_t target_hwnd) {
-    _target_hwnd = target_hwnd;
+  int ipc_session_t::init(const ::video::config_t &config, std::string_view display_name, ID3D11Device *device, bool advanced_color_capture) {
     _process_helper = std::make_unique<ProcessHandler>();
     _config = config;
     _display_name = display_name;
@@ -300,29 +297,6 @@ namespace platf::dxgi {
     auto on_message = [this](std::span<const uint8_t> msg) {
       if (msg.size() == 1) {
         handle_desktop_switch_message(msg);
-      } else if (msg.size() == sizeof(popup_slots_t) && _target_hwnd) {
-        popup_slots_t slots {};
-        std::memcpy(&slots, msg.data(), sizeof(slots));
-        if (slots.magic == WGC_POPUP_SLOTS_MESSAGE_MAGIC && slots.count <= WGC_POPUP_SLOTS_MAX) {
-          std::vector<host_windows::popup_slot_t> out;
-          out.reserve(slots.count);
-          for (uint32_t i = 0; i < slots.count; ++i) {
-            const auto &sl = slots.slots[i];
-            host_windows::popup_slot_t o;
-            o.handle = sl.hwnd;
-            o.host[0] = sl.host_x;
-            o.host[1] = sl.host_y;
-            o.host[2] = sl.w;
-            o.host[3] = sl.h;
-            o.canvas[0] = sl.canvas_x;
-            o.canvas[1] = sl.canvas_y;
-            o.canvas[2] = sl.w;
-            o.canvas[3] = sl.h;
-            o.dialog = sl.dialog != 0;
-            out.push_back(o);
-          }
-          host_windows::set_popup_slots(_target_hwnd, std::move(out));
-        }
       }
     };
 
@@ -388,9 +362,6 @@ namespace platf::dxgi {
     config_data.initial_frame_buffer_size = wgc_initial_frame_buffer_size();
     config_data.max_frame_buffer_size = wgc_max_frame_buffer_size(_config);
     config_data.activity_admission_fps = _activity_admission_fps.load(std::memory_order_relaxed);
-    config_data.target_hwnd = _target_hwnd;
-    config_data.canvas_width = _target_hwnd ? static_cast<uint32_t>(std::max(0, _config.width)) : 0;
-    config_data.canvas_height = _target_hwnd ? static_cast<uint32_t>(std::max(0, _config.height)) : 0;
 
     // Convert display_name (std::string) to wchar_t[32]
     if (!_display_name.empty()) {

@@ -3313,12 +3313,7 @@ namespace nvhttp {
         0;
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
     launch_session->client_vrr_requested = util::from_view(get_arg(args, "clientVrrRequested", "0"));
-    try {
-      launch_session->window_handle = std::stoull(get_arg(args, "windowHandle", "0"), nullptr, 0);
-      launch_session->hide_cursor = get_arg(args, "hideCursor", "0") == "1";
-    } catch (...) {
-      launch_session->window_handle = 0;
-    }
+    launch_session->hide_cursor = get_arg(args, "hideCursor", "0") == "1";
     // Resume requests usually omit appid. Resolve the running application's
     // preference as well, before display preparation and HDR request overrides.
     auto color_app_ctx = launch_app_ctx;
@@ -4061,85 +4056,17 @@ namespace nvhttp {
     const auto args = request->parse_query_string();
     const auto handle = parse_window_handle(get_arg(args, "hwnd", ""));
     if (!handle || !host_windows::exists(handle)) {
-      write_json(response, {{"regions", nlohmann::json::array()}}, SimpleWeb::StatusCode::client_error_not_found);
+      write_json(response, {{"hit", "none"}}, SimpleWeb::StatusCode::client_error_not_found);
       return;
     }
-    if (args.find("x") != args.end() && args.find("y") != args.end()) {
-      // Point mode: what the app says is under this frame-relative pixel.
-      int x = 0, y = 0;
-      try {
-        x = std::stoi(get_arg(args, "x", "0"));
-        y = std::stoi(get_arg(args, "y", "0"));
-      } catch (...) {
-      }
-      write_json(response, {{"hit", host_windows::hit_test_point(handle, x, y)}});
-      return;
-    }
-    nlohmann::json out;
-    out["regions"] = nlohmann::json::array();
-    for (const auto &r : host_windows::hit_regions(handle)) {
-      out["regions"].push_back({{"kind", r.kind}, {"rect", {r.rect[0], r.rect[1], r.rect[2], r.rect[3]}}});
-    }
-    write_json(response, out);
-  }
-
-  /**
-   * @brief Long-poll of one window's layout (rect, canvas anchor, popups).
-   * With `etag` and `wait` the reply is held back (up to one second) until
-   * something changes, so a client sees a menu open within a few milliseconds
-   * without hammering the host with requests.
-   */
-  void get_host_window_layout(resp_https_t response, req_https_t request) {
-    if (!windows_request_allowed(response, request, "layout")) return;
-    const auto args = request->parse_query_string();
-    const auto handle = parse_window_handle(get_arg(args, "hwnd", ""));
-    if (!handle || !host_windows::exists(handle)) {
-      write_json(response, {{"gone", true}}, SimpleWeb::StatusCode::client_error_not_found);
-      return;
-    }
-    int cw = 0, ch = 0, wait_ms = 0;
-    std::uint64_t etag = 0;
+    // What the app says is under this frame-relative pixel.
+    int x = 0, y = 0;
     try {
-      cw = std::stoi(get_arg(args, "cw", "0"));
-      ch = std::stoi(get_arg(args, "ch", "0"));
-      wait_ms = std::clamp(std::stoi(get_arg(args, "wait", "0")), 0, 1000);
-      etag = std::stoull(get_arg(args, "etag", "0"));
+      x = std::stoi(get_arg(args, "x", "0"));
+      y = std::stoi(get_arg(args, "y", "0"));
     } catch (...) {
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
-    host_windows::layout_t layout;
-    for (;;) {
-      layout = host_windows::window_layout(handle, cw, ch);
-      if (!layout.valid || layout.etag != etag || std::chrono::steady_clock::now() >= deadline) break;
-      std::this_thread::sleep_for(std::chrono::milliseconds(8));
-    }
-    if (!layout.valid) {
-      write_json(response, {{"gone", true}}, SimpleWeb::StatusCode::client_error_not_found);
-      return;
-    }
-    nlohmann::json out {
-      {"rect", {layout.rect[0], layout.rect[1], layout.rect[2], layout.rect[3]}},
-      {"anchor", {layout.anchor[0], layout.anchor[1]}},
-      {"popups", nlohmann::json::array()},
-      {"radius", layout.radius},
-      {"dpi", layout.dpi},
-      {"caption", layout.caption},
-      {"state", layout.state},
-      {"title", layout.title},
-      {"focused", layout.focused},
-      {"etag", std::to_string(layout.etag)},
-    };
-    for (const auto &c : layout.popups) {
-      char handle[32];
-      snprintf(handle, sizeof(handle), "0x%llx", static_cast<unsigned long long>(c.handle));
-      out["popups"].push_back({{"hwnd", handle},
-                               {"rect", {c.rect[0], c.rect[1], c.rect[2], c.rect[3]}},
-                               {"canvas", {c.canvas[0], c.canvas[1], c.canvas[2], c.canvas[3]}},
-                               {"dialog", c.dialog},
-                               {"title", c.title},
-                               {"caption", c.caption}});
-    }
-    write_json(response, out);
+    write_json(response, {{"hit", host_windows::hit_test_point(handle, x, y)}});
   }
 
   void post_host_window_action(resp_https_t response, req_https_t request) {
@@ -4706,40 +4633,26 @@ namespace nvhttp {
   void resume(bool &host_audio, resp_https_t response, req_https_t request, int current_appid, bool normal_app_transition = true, bool launched_from_applist = false, std::uint64_t trace_id = 0);
   void cancel(resp_https_t response, req_https_t request);
 
-  // App-window streaming: a session that captures one host window. It never
-  // starts or stops an application, never touches display configuration and
-  // never joins the shared desktop producer, so any number of them can run
-  // next to each other and next to a normal session.
+  // App-window streaming: a session that captures the client's desk (its
+  // private display). It never starts or stops an application, never touches
+  // display configuration and never joins the shared desktop producer, so any
+  // number of them can run next to each other and next to a normal session.
   bool try_launch_window_session(pt::ptree &tree, const args_t &args, req_https_t request, const resolved_client_identity_t &identity, std::uint64_t trace_id) {
-    std::uint64_t window_handle = 0;
-    try {
-      window_handle = std::stoull(get_arg(args, "windowHandle", "0"), nullptr, 0);
-    } catch (...) {
-    }
-    const bool desk = get_arg(args, "desk", "0") == "1";
-    if (!window_handle && !desk) return false;
+    if (get_arg(args, "desk", "0") != "1") return false;
     tree.put("root.resume", 0);
     if (!identity.allow_windows || !host_windows::supported()) {
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "App-window streaming is not enabled for this device");
       return true;
     }
-    std::optional<app_desk::desk_t> desk_info;
-    if (desk) {
-      desk_info = app_desk::get(identity.uuid);
-      if (!desk_info) {
-        tree.put("root.<xmlattr>.status_code", 404);
-        tree.put("root.<xmlattr>.status_message", "Open the desk (POST /actions/desk?op=open) before streaming it");
-        return true;
-      }
-    } else if (!host_windows::exists(window_handle)) {
+    const auto desk_info = app_desk::get(identity.uuid);
+    if (!desk_info) {
       tree.put("root.<xmlattr>.status_code", 404);
-      tree.put("root.<xmlattr>.status_message", "The requested window no longer exists");
+      tree.put("root.<xmlattr>.status_message", "Open the desk (POST /actions/desk?op=open) before streaming it");
       return true;
     }
     auto launch_session = make_launch_session(false, args, request, false, &identity, false, dispatch::include_request_identity_log_fields(trace_id));
-    launch_session->window_handle = window_handle;
-    if (desk_info) launch_session->desk_display = desk_info->display;
+    launch_session->desk_display = desk_info->display;
     launch_session->role = remote_session::role_e::game;
     launch_session->role_generation = launch_session->id;
     launch_session->host_audio = false;
@@ -4754,13 +4667,8 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "RTSP pending session admission was rejected");
       return true;
     }
-    if (desk_info) {
-      BOOST_LOG(info) << "Desk session admitted for client [" << identity.name << "] display " << desk_info->display
-                      << " (" << launch_session->width << 'x' << launch_session->height << '@' << launch_session->fps << ")";
-    } else {
-      BOOST_LOG(info) << "App-window session admitted for client [" << identity.name << "] window 0x" << std::hex << window_handle << std::dec
-                      << " (" << launch_session->width << 'x' << launch_session->height << '@' << launch_session->fps << ")";
-    }
+    BOOST_LOG(info) << "Desk session admitted for client [" << identity.name << "] display " << desk_info->display
+                    << " (" << launch_session->width << 'x' << launch_session->height << '@' << launch_session->fps << ")";
     tree.put("root.<xmlattr>.status_code", 200);
     tree.put("root.sessionUrl0", std::format("{}{}:{}", launch_session->rtsp_url_scheme, net::addr_to_url_escaped_string(request->local_endpoint().address()), static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))));
     tree.put("root.gamesession", 1);
@@ -6969,9 +6877,6 @@ launch_session->exact_target_hold.reset();
     // host window must not make launches answer "busy" or hold other requests.
     https_server.resource["^/actions/window-hittest$"]["GET"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
       run_on_blocking_pool(layout_route_pool, [response, request] { get_host_window_hittest(response, request); });
-    };
-    https_server.resource["^/actions/window-layout$"]["GET"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
-      run_on_blocking_pool(layout_route_pool, [response, request] { get_host_window_layout(response, request); });
     };
     https_server.resource["^/actions/window$"]["POST"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
       run_on_blocking_pool(layout_route_pool, [response, request] { post_host_window_action(response, request); });

@@ -21,7 +21,6 @@
 
 // local includes
 #include "keylayout.h"
-#include "src/host_windows.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/globals.h"
@@ -635,18 +634,8 @@ namespace platf {
     // Windows client_to_touchport() returns monitor-local coordinates. Add the
     // capture offset, already relative to the virtual desktop origin, once before
     // normalizing to the complete desktop used by MOUSEEVENTF_VIRTUALDESK.
-    // App-window sessions: a point in a popup's canvas slot belongs to that
-    // popup wherever it is on the host.
-    float px = x + touch_port.offset_x, py = y + touch_port.offset_y;
-    {
-      int hx = 0, hy = 0;
-      if (host_windows::remap_canvas_point(touch_port.offset_x, touch_port.offset_y, (int) std::lround(x), (int) std::lround(y), hx, hy)) {
-        px = (float) hx;
-        py = (float) hy;
-      }
-    }
-    auto scaled_x = std::lround(px * ((float) target_touch_port.width / (float) touch_port.width));
-    auto scaled_y = std::lround(py * ((float) target_touch_port.height / (float) touch_port.height));
+    auto scaled_x = std::lround((x + touch_port.offset_x) * ((float) target_touch_port.width / (float) touch_port.width));
+    auto scaled_y = std::lround((y + touch_port.offset_y) * ((float) target_touch_port.height / (float) touch_port.height));
 
     mi.dx = scaled_x;
     mi.dy = scaled_y;
@@ -683,12 +672,6 @@ namespace platf {
 
   void button_mouse(input_t &input, int button, bool release) {
     INPUT i {};
-
-    if (!release) {
-      // App-window sessions: the aimed-at window (parent or popup) must be
-      // the one under the pointer on the host before the press lands.
-      host_windows::raise_aimed_window();
-    }
 
     i.type = INPUT_MOUSE;
     auto &mi = i.mi;

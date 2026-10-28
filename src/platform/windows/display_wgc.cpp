@@ -4,8 +4,6 @@
  */
 
 // standard includes
-#include "src/host_windows.h"
-#include "src/platform/windows/app_window_layout.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -238,30 +236,6 @@ namespace platf::dxgi {
       return -1;
     }
 
-    if (_target_hwnd) {
-      // App-window capture: the capture surface is the window, not the output.
-      int rect[4];
-      if (!host_windows::frame_rect(_target_hwnd, rect)) {
-        BOOST_LOG(warning) << "App-window capture: window 0x" << std::hex << _target_hwnd << std::dec << " is gone";
-        return -1;
-      }
-      // The helper composites the window (and its popups) onto a fixed canvas
-      // the size of the encoder frame, anchored by the shared layout rule, so
-      // window resizes never change the capture. Canvas (0,0) is therefore
-      // the window's origin minus the anchor.
-      width = width_before_rotation = std::max(2, config.width);
-      height = height_before_rotation = std::max(2, config.height);
-      int ax = 0, ay = 0;
-      app_window_layout::canvas_anchor(width, app_window_layout::color_height(height), rect[2], rect[3], ax, ay);
-      (void) host_windows::pinned_position(_target_hwnd, rect[0], rect[1]);
-      offset_x = rect[0] - ax - GetSystemMetrics(SM_XVIRTUALSCREEN);
-      offset_y = rect[1] - ay - GetSystemMetrics(SM_YVIRTUALSCREEN);
-      display_rotation = DXGI_MODE_ROTATION_IDENTITY;
-      pad_output = true;
-      BOOST_LOG(info) << "App-window capture: window 0x" << std::hex << _target_hwnd << std::dec << " at " << rect[0] << ',' << rect[1]
-                      << " (" << rect[2] << 'x' << rect[3] << ") on a " << width << 'x' << height << " canvas, " << display_name;
-    }
-
     capture_format = DXGI_FORMAT_UNKNOWN;  // Start with unknown format (prevents race condition/crash on first frame)
     _present_stamper = std::make_shared<present_timing::capture_stamper_t>(captured_output_desc.DeviceName);
     present_timing::set_active_stamper(_present_stamper);
@@ -270,7 +244,7 @@ namespace platf::dxgi {
 
     // Create session
     _ipc_session = std::make_unique<ipc_session_t>();
-    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture, _target_hwnd)) {
+    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture)) {
       return -1;
     }
     game_refresh_target = make_wgc_activity_admission_target(
@@ -281,34 +255,6 @@ namespace platf::dxgi {
     );
 
     return 0;
-  }
-
-  std::optional<input_geometry_snapshot_t> display_wgc_ipc_vram_t::input_geometry_snapshot() const {
-    if (!_target_hwnd) return display_base_t::input_geometry_snapshot();
-    // Live window rect so absolute mouse input follows the window when it moves.
-    int rect[4];
-    input_geometry_snapshot_t snapshot;
-    snapshot.valid = host_windows::frame_rect(_target_hwnd, rect);
-    if (!snapshot.valid) return snapshot;
-    int ax = 0, ay = 0;
-    app_window_layout::canvas_anchor(width, app_window_layout::color_height(height), rect[2], rect[3], ax, ay);
-    // The pinned origin, so a host-side move can never feed back into the cursor.
-    (void) host_windows::pinned_position(_target_hwnd, rect[0], rect[1]);
-    snapshot.offset_x = rect[0] - ax - GetSystemMetrics(SM_XVIRTUALSCREEN);
-    snapshot.offset_y = rect[1] - ay - GetSystemMetrics(SM_YVIRTUALSCREEN);
-    snapshot.desktop_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    snapshot.desktop_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    snapshot.target.rect_left = rect[0];
-    snapshot.target.rect_top = rect[1];
-    snapshot.target.rect_right = rect[0] + rect[2];
-    snapshot.target.rect_bottom = rect[1] + rect[3];
-    snapshot.target.monitor = static_cast<std::uintptr_t>(_target_hwnd);
-    // Sequence derived from the rect so publication only happens on change.
-    snapshot.geometry_sequence = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(rect[0])) << 48) ^
-                                 (static_cast<std::uint64_t>(static_cast<std::uint32_t>(rect[1])) << 32) ^
-                                 (static_cast<std::uint64_t>(static_cast<std::uint32_t>(rect[2])) << 16) ^
-                                 static_cast<std::uint64_t>(static_cast<std::uint32_t>(rect[3]));
-    return snapshot;
   }
 
   capture_e display_wgc_ipc_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
@@ -331,8 +277,7 @@ namespace platf::dxgi {
       return capture_e::reinit;
     }
 
-    // App-window sessions: the client always draws its own cursor.
-    if (!_ipc_session->set_cursor_visible(cursor_visible && !_target_hwnd)) {
+    if (!_ipc_session->set_cursor_visible(cursor_visible)) {
       return _ipc_session->stop_requested() ? capture_e::interrupted : capture_e::reinit;
     }
     _ipc_session->initialize_if_needed();
@@ -491,7 +436,7 @@ namespace platf::dxgi {
     if (!_ipc_session) {
       return capture_e::error;
     }
-    if (!_ipc_session->set_cursor_visible(cursor_visible && !_target_hwnd)) {
+    if (!_ipc_session->set_cursor_visible(cursor_visible)) {
       return _ipc_session->stop_requested() ? capture_e::interrupted : capture_e::reinit;
     }
 

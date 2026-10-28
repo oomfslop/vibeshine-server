@@ -3071,20 +3071,6 @@ namespace video {
       }
 
       if (capture_config.capture_target_valid && !capture_config.capture_target_valid()) return;
-      if (capture_config.capture_source == capture_source_e::window) {
-        // App-window capture: the "display" is the window itself.
-        disp = capture_config.capture_output ? platf::display(encoder.platform_formats->dev_type, *capture_config.capture_output, capture_config) : nullptr;
-        if (disp) {
-          disp->recovery_capture_instance = capture_recovery::observations().begin_capture();
-          break;
-        }
-        if (display_retry_failures++ > 20) {
-          BOOST_LOG(warning) << "App-window capture target is gone; ending capture.";
-          return;
-        }
-        wait_before_display_retry(display_retry_failures);
-        continue;
-      }
       const auto required_output = capture_config.capture_source == capture_source_e::exact_output ? capture_config.capture_output : std::nullopt;
       const bool log_display_retry = policy::should_log_display_retry(display_retry_failures);
       refresh_displays(encoder.platform_formats->dev_type, display_names, display_p, required_output, log_display_retry);
@@ -3488,20 +3474,6 @@ namespace video {
 
               // Refresh display names since a display removal might have caused the reinitialization
               if (capture_ctxs.front().config.capture_target_valid && !capture_ctxs.front().config.capture_target_valid()) return;
-              if (capture_ctxs.front().config.capture_source == capture_source_e::window) {
-                // App-window capture reinit (window resized or the helper restarted).
-                const auto &window_output = capture_ctxs.front().config.capture_output;
-                for (int attempt = 0; attempt < 20 && !disp; ++attempt) {
-                  disp = window_output ? platf::display(encoder.platform_formats->dev_type, *window_output, producer_config) : nullptr;
-                  if (!disp) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-                if (!disp) {
-                  BOOST_LOG(warning) << "App-window capture target is gone; ending capture.";
-                  return;
-                }
-                disp->recovery_capture_instance = capture_recovery::observations().begin_capture();
-                break;  // leave the reselection loop; the normal path publishes display_wp
-              }
               const auto required_output = capture_ctxs.front().config.capture_source == capture_source_e::exact_output ? capture_ctxs.front().config.capture_output : std::nullopt;
               refresh_displays(
                 encoder.platform_formats->dev_type,

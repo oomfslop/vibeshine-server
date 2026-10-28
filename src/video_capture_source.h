@@ -14,7 +14,6 @@ namespace video {
     active_output,
     exact_output,
     synthetic_black,
-    window,  ///< one top-level window; capture_output = "hwnd:<decimal>"
   };
 
   struct capture_pacing_context_t {

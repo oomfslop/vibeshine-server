@@ -1632,32 +1632,6 @@ namespace platf {
       };
     }
 
-    if (display_name.starts_with("hwnd:")) {
-      // App-window capture: WGC window capture on the monitor that holds the window.
-      std::uint64_t hwnd = 0;
-      try {
-        hwnd = std::stoull(display_name.substr(5), nullptr, 0);
-      } catch (...) {
-      }
-      if (!hwnd || hwdevice_type != mem_type_e::dxgi) return nullptr;
-      std::string monitor_name;
-      if (HMONITOR mon = MonitorFromWindow(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(hwnd)), MONITOR_DEFAULTTONEAREST)) {
-        MONITORINFOEXW mi {};
-        mi.cbSize = sizeof(mi);
-        if (GetMonitorInfoW(mon, &mi)) {
-          try {
-            monitor_name = utf_utils::to_utf8(mi.szDevice);
-          } catch (...) {
-          }
-        }
-      }
-      if (monitor_name.empty()) return nullptr;
-      auto disp = std::make_shared<dxgi::display_wgc_ipc_vram_t>();
-      disp->set_window_target(hwnd);
-      if (!disp->init(config, monitor_name, required_adapter_luid)) return disp;
-      return nullptr;
-    }
-
     const auto &capture_mode = config::video.capture;
     const bool user_requested_ddx = capture_mode == "ddx";
     const bool default_to_wgc = dxgi::should_use_wgc_default();
