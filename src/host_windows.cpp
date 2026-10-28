@@ -921,13 +921,21 @@ namespace host_windows {
         // No AttachThreadInput here: it blocks for as long as the foreground
         // window's thread is busy (a drag in progress) and this runs on a
         // request worker. SwitchToThisWindow is the fallback the shell uses.
-        AllowSetForegroundWindow(ASFW_ANY);
-        bool ok = SetForegroundWindow(hwnd) != 0;
-        if (!ok || GetForegroundWindow() != hwnd) {
-          SwitchToThisWindow(hwnd, TRUE);
-          ok = GetForegroundWindow() == hwnd;
+        // A window disabled by its modal dialog cannot take focus; activating
+        // it would only shuffle the z-order and leave the dialog behind it.
+        // Activate the enabled popup of the chain instead (what Windows does
+        // on a click).
+        HWND focus = hwnd;
+        if (!IsWindowEnabled(hwnd)) {
+          if (HWND popup = GetLastActivePopup(hwnd); popup && popup != hwnd && IsWindowEnabled(popup)) focus = popup;
         }
-        BringWindowToTop(hwnd);
+        AllowSetForegroundWindow(ASFW_ANY);
+        bool ok = SetForegroundWindow(focus) != 0;
+        BringWindowToTop(focus);
+        if (!ok || GetForegroundWindow() != focus) {
+          SwitchToThisWindow(focus, TRUE);
+          ok = GetForegroundWindow() == focus;
+        }
         return ok;
       }
       case op_e::move: {
