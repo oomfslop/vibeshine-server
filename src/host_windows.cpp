@@ -339,6 +339,12 @@ namespace host_windows {
     std::mutex g_slots_mutex;
     std::map<std::uint64_t, std::vector<popup_slot_t>> g_slots;  ///< target hwnd -> slots
     std::map<std::uint64_t, POINT> g_session_origins;  ///< target hwnd -> pinned origin (for input remapping)
+    struct aim_t {
+      HWND intended = nullptr;
+      POINT point {};
+      std::vector<HWND> family;
+    };
+    aim_t g_aim;  ///< what the last mapped pointer position aimed at
   }  // namespace
 
   void set_popup_slots(std::uint64_t target, std::vector<popup_slot_t> slots) {
@@ -378,16 +384,31 @@ namespace host_windows {
       }
     }
     if (!intended) return false;
+    // Remember what the pointer aims at; the button path reorders (once per
+    // press), never the move path, which runs at the mouse rate.
+    {
+      std::lock_guard lock(g_slots_mutex);
+      g_aim = {intended, {hx, hy}, std::move(family)};
+    }
+    return true;
+  }
+
+  void raise_aimed_window() {
+    aim_t aim;
+    {
+      std::lock_guard lock(g_slots_mutex);
+      aim = g_aim;
+    }
+    if (!aim.intended || !IsWindow(aim.intended)) return;
     // On the host the window and its dialogs overlap freely (their positions
     // mean nothing to the client), so make sure the window the client aimed
     // at is the one on top at that point; only ever reorder within the family.
-    if (HWND under = WindowFromPoint(POINT {hx, hy})) {
+    if (HWND under = WindowFromPoint(aim.point)) {
       under = GetAncestor(under, GA_ROOT);
-      if (under && under != intended && std::find(family.begin(), family.end(), under) != family.end() && IsWindow(intended)) {
-        SetWindowPos(intended, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+      if (under && under != aim.intended && std::find(aim.family.begin(), aim.family.end(), under) != aim.family.end()) {
+        SetWindowPos(aim.intended, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
       }
     }
-    return true;
   }
 
   namespace {
@@ -1043,6 +1064,8 @@ namespace host_windows {
   bool remap_canvas_point(int, int, int, int, int &, int &) {
     return false;
   }
+
+  void raise_aimed_window() {}
 
   std::vector<window_info_t> list() {
     return {};

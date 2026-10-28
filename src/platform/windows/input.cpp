@@ -684,6 +684,12 @@ namespace platf {
   void button_mouse(input_t &input, int button, bool release) {
     INPUT i {};
 
+    if (!release) {
+      // App-window sessions: the aimed-at window (parent or popup) must be
+      // the one under the pointer on the host before the press lands.
+      host_windows::raise_aimed_window();
+    }
+
     i.type = INPUT_MOUSE;
     auto &mi = i.mi;
 

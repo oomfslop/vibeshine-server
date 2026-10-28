@@ -116,6 +116,9 @@ namespace host_windows {
   /** Maps a canvas point of the session whose window is pinned at (origin_x, origin_y)
    *  to a host point: inside a popup's slot it lands in that popup. */
   bool remap_canvas_point(int origin_x, int origin_y, int cx, int cy, int &hx, int &hy);
+  /** Before a button press: if another window of the same family covers the
+   *  window the last mapped point aimed at, bring the aimed-at one on top. */
+  void raise_aimed_window();
 
   /** Keep the window where it is for the session (and its owned dialogs on
    *  the canvas_w x canvas_h canvas around it): input is mapped from the
