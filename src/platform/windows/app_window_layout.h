@@ -124,21 +124,19 @@ namespace app_window_layout {
   };
 
   /**
-   * @brief A caption-less popup that lies entirely inside its parent and
-   *        covers a good part of it is a piece of the app's own UI (Media
-   *        Player Legacy's skin parts, docked tool panes), not a menu: it is
-   *        drawn in place over the parent, where it also sits on the host.
+   * @brief Where a popup is shown follows from whether the user can move it.
+   *        A window without a caption cannot be moved by the user: the app
+   *        placed it, so it belongs where the app put it. Lying inside its
+   *        parent, it is composited in place over the parent (menus, tooltips,
+   *        drop-downs, skin parts alike). Sticking out of the parent, it gets
+   *        a window of its own at the same offset; a captioned (dialog)
+   *        window is the user's to move and always gets a window of its own.
    */
   inline bool is_inline_part(const RECT &parent, const popup_t &p) {
     if (p.dialog) {
       return false;
     }
-    if (p.rect.left < parent.left || p.rect.top < parent.top || p.rect.right > parent.right || p.rect.bottom > parent.bottom) {
-      return false;
-    }
-    const LONGLONG area = static_cast<LONGLONG>(p.rect.right - p.rect.left) * (p.rect.bottom - p.rect.top);
-    const LONGLONG parent_area = static_cast<LONGLONG>(parent.right - parent.left) * (parent.bottom - parent.top);
-    return parent_area > 0 && area * 4 >= parent_area;
+    return p.rect.left >= parent.left && p.rect.top >= parent.top && p.rect.right <= parent.right && p.rect.bottom <= parent.bottom;
   }
 
   /**
