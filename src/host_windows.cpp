@@ -400,6 +400,9 @@ namespace host_windows {
       aim = g_aim;
     }
     if (!aim.intended || !IsWindow(aim.intended)) return;
+    // A window disabled by its modal dialog must stay below that dialog: the
+    // click will be ignored anyway, and raising it would only hide the dialog.
+    if (!IsWindowEnabled(aim.intended)) return;
     // On the host the window and its dialogs overlap freely (their positions
     // mean nothing to the client), so make sure the window the client aimed
     // at is the one on top at that point; only ever reorder within the family.
