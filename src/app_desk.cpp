@@ -206,6 +206,46 @@ namespace app_desk {
       }
     }
 
+    /** Where a window goes when the desk lets go of it: where it was before
+     *  it came to the desk, or, for one that never was anywhere else (it
+     *  opened on the desk), the same place on the primary display. */
+    POINT home_for(const RECT &frame, const RECT &desk) {
+      RECT x {};
+      if (!IntersectRect(&x, &frame, &desk)) return {frame.left, frame.top};
+      MONITORINFO mi {};
+      mi.cbSize = sizeof(mi);
+      GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+      const RECT &work = mi.rcWork;
+      const LONG w = frame.right - frame.left, h = frame.bottom - frame.top;
+      const LONG px = work.left + std::clamp<LONG>(frame.left - desk.left, 0, std::max<LONG>(0, (work.right - work.left) - w));
+      const LONG py = work.top + std::clamp<LONG>(frame.top - desk.top, 0, std::max<LONG>(0, (work.bottom - work.top) - h));
+      return {px, py};
+    }
+
+    /** Visible top-level windows on the desk (the desk's own taskbar aside). */
+    std::vector<HWND> windows_on(const RECT &desk) {
+      struct ctx_t {
+        RECT desk;
+        std::vector<HWND> out;
+      } ctx {desk, {}};
+      EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto *c = reinterpret_cast<ctx_t *>(lp);
+        if (!IsWindowVisible(hwnd) || app_window_layout::is_cloaked(hwnd)) return TRUE;
+        wchar_t cls[64] {};
+        GetClassNameW(hwnd, cls, 64);
+        if (wcscmp(cls, L"Shell_SecondaryTrayWnd") == 0 || wcscmp(cls, L"Shell_TrayWnd") == 0) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == GetCurrentProcessId()) return TRUE;
+        RECT r {}, x {};
+        if (!app_window_layout::frame_rect(hwnd, r) || !IntersectRect(&x, &r, &c->desk)) return TRUE;
+        c->out.push_back(hwnd);
+        return TRUE;
+      },
+                  reinterpret_cast<LPARAM>(&ctx));
+      return ctx.out;
+    }
+
     std::string window_title(HWND hwnd) {
       const int length = GetWindowTextLengthW(hwnd);
       if (length <= 0) return {};
@@ -435,6 +475,20 @@ namespace app_desk {
       if (app_window_layout::frame_rect(hwnd, frame)) settle_dpi_change(hwnd, GetDpiForWindow(hwnd), frame);
       move_frame_to(hwnd, origin.x, origin.y);
     }
+    // Everything else still on the desk (dialogs and windows that opened
+    // there) goes to the primary display: nothing stays on a display nobody sees
+    RECT desk {};
+    if (find_monitor(it->second.device, &desk)) {
+      for (HWND hwnd : windows_on(desk)) {
+        if (it->second.adopted.contains(hwnd)) continue;
+        RECT frame {};
+        if (!app_window_layout::frame_rect(hwnd, frame)) continue;
+        const POINT home = home_for(frame, desk);
+        settle_dpi_change(hwnd, GetDpiForWindow(hwnd), frame);
+        move_frame_to(hwnd, home.x, home.y);
+        BOOST_LOG(info) << "Desk: moved 0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec << " to the primary display";
+      }
+    }
     it->second.adopted.clear();
     it->second.open = false;
     it->second.idle_since = std::chrono::steady_clock::now();
@@ -471,7 +525,9 @@ namespace app_desk {
     if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
     RECT frame {};
     if (!app_window_layout::frame_rect(hwnd, frame)) return false;
-    it->second.adopted[hwnd] = {frame.left, frame.top};
+    // A window first seen on the desk itself (it opened there, or is parked
+    // past its edge mid-drag) has no home elsewhere: the primary display
+    it->second.adopted[hwnd] = home_for(frame, rect);
     settle_dpi_change(hwnd, GetDpiForWindow(hwnd), frame);
     // First time: keep it inside the desk.
     const LONG w = frame.right - frame.left, h = frame.bottom - frame.top;
