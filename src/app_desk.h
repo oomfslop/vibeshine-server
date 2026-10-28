@@ -47,6 +47,9 @@ namespace app_desk {
    *  place is remembered and restored by release/close. */
   bool adopt(const std::string &client_uuid, std::uint64_t hwnd, int x, int y);
   bool release(const std::string &client_uuid, std::uint64_t hwnd);
+  /** Out of the way while the client drags it: just past the desk's right
+   *  edge, beyond what any client window shows. Adopt puts it back. */
+  bool park(const std::string &client_uuid, std::uint64_t hwnd);
   /** Stack the desk's windows in this order, top-most first, without
    *  activating any (the client's window order is the truth). */
   bool order(const std::string &client_uuid, const std::vector<std::uint64_t> &top_first);

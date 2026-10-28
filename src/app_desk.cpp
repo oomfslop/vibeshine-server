@@ -504,6 +504,20 @@ namespace app_desk {
     return placed > 0;
   }
 
+  bool park(const std::string &client_uuid, std::uint64_t handle) {
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    RECT desk {}, frame {};
+    {
+      std::lock_guard lock(g_mutex);
+      auto it = g_desks.find(client_uuid);
+      if (it == g_desks.end() || !it->second.open || !find_monitor(it->second.device, &desk)) return false;
+    }
+    if (!IsWindow(hwnd) || !app_window_layout::frame_rect(hwnd, frame)) return false;
+    // 8 px stay on the desk so Windows keeps it on this display
+    move_frame_to(hwnd, desk.right - 8, std::clamp<LONG>(frame.top, desk.top, desk.bottom - 8));
+    return true;
+  }
+
   bool release(const std::string &client_uuid, std::uint64_t handle) {
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
     std::lock_guard lock(g_mutex);
@@ -697,6 +711,10 @@ namespace app_desk {
   }
 
   void close(const std::string &) {}
+
+  bool park(const std::string &, std::uint64_t) {
+    return false;
+  }
 
   bool order(const std::string &, const std::vector<std::uint64_t> &) {
     return false;

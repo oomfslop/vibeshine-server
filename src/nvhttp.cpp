@@ -4082,10 +4082,12 @@ namespace nvhttp {
       }
     };
     const auto op_name = get_arg(args, "op", "");
-    if (handle && (op_name == "adopt" || op_name == "release")) {
+    if (handle && (op_name == "adopt" || op_name == "release" || op_name == "park")) {
       // Desk ops: move the window onto / off the client's desk.
       const auto uuid = resolve_client_identity_from_request(request).uuid;
-      const bool ok = op_name == "adopt" ? app_desk::adopt(uuid, handle, num("x"), num("y")) : app_desk::release(uuid, handle);
+      const bool ok = op_name == "adopt"   ? app_desk::adopt(uuid, handle, num("x"), num("y")) :
+                      op_name == "release" ? app_desk::release(uuid, handle) :
+                                             app_desk::park(uuid, handle);
       write_json(response, {{"status", ok}}, ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_not_found);
       return;
     }
