@@ -43,6 +43,7 @@ extern "C" {
 #include "control_peer_timeout.h"
 #include "deferred_stream_start_policy.h"
 #include "display_helper_integration.h"
+#include "host_windows.h"
 #include "globals.h"
 #include "hardware_metrics_session.h"
 #include "host_stats.h"
@@ -610,6 +611,7 @@ namespace stream {
     bool secondary_game_client = false;
     remote_session::role_e remote_role {remote_session::role_e::game};
     bool app_window {};  ///< app-window session: lives independently of the configured application
+    std::shared_ptr<void> app_window_display;  ///< keeps the window on a display fast enough for the session fps
     std::uint64_t remote_role_generation {};
     std::string monitor_profile_uuid;
     bool input_only {};
@@ -3542,6 +3544,7 @@ namespace stream {
 
       // Release input before any potentially hung capture joins.
       input::reset(session.input);
+      session.app_window_display.reset();
 
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
       // GPU scheduling enabled. If this happens, we will terminate ourselves and the service can restart.
@@ -3988,6 +3991,8 @@ namespace stream {
         session->config.monitor.capture_source = video::capture_source_e::window;
         session->config.monitor.capture_output = "hwnd:" + std::to_string(launch_session.window_handle);
         session->audio_disabled = true;
+        // Per-window capture runs at the window's monitor refresh rate.
+        session->app_window_display = host_windows::lease_fast_display(launch_session.window_handle, session->config.monitor.framerate);
       }
       BOOST_LOG(info) << "Session capture source: role=" << static_cast<int>(launch_session.role)
                       << " source=" << static_cast<int>(session->config.monitor.capture_source)

@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2760,6 +2761,7 @@ float4 ps(VSOut i) : SV_Target {
         }
       }
       frame = nullptr;
+      _frames_in.fetch_add(1, std::memory_order_relaxed);
       mark_dirty();
     } catch (const winrt::hresult_error &ex) {
       BOOST_LOG(debug) << "App-window capture: frame callback failed: " << ex.code() << " - " << winrt::to_string(ex.message());
@@ -2806,6 +2808,14 @@ float4 ps(VSOut i) : SV_Target {
       try {
         if (auto session3 = cap->session.try_as<winrt::Windows::Graphics::Capture::IGraphicsCaptureSession3>()) {
           session3.IsBorderRequired(false);
+        }
+      } catch (...) {
+      }
+      // WGC paces frame delivery at ~60 Hz unless told otherwise.
+      try {
+        if (g_config.min_update_interval_100ns > 0 &&
+            winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"MinUpdateInterval")) {
+          cap->session.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan {g_config.min_update_interval_100ns});
         }
       } catch (...) {
       }
@@ -3002,6 +3012,8 @@ float4 ps(VSOut i) : SV_Target {
     }
     const auto min_gap = std::chrono::microseconds(1000000 / (2 * _fps));
     auto last = std::chrono::steady_clock::now() - min_gap;
+    auto stats_since = last;
+    unsigned composites = 0;
     while (!_stop.load(std::memory_order_acquire)) {
       {
         std::unique_lock lock(_dirty_mutex);
@@ -3020,12 +3032,20 @@ float4 ps(VSOut i) : SV_Target {
       }
       try {
         composite();
+        ++composites;
       } catch (const winrt::hresult_error &ex) {
         BOOST_LOG(error) << "App-window composite failed: " << ex.code() << " - " << winrt::to_string(ex.message());
       } catch (...) {
         BOOST_LOG(error) << "App-window composite failed";
       }
       last = std::chrono::steady_clock::now();
+      if (last - stats_since >= std::chrono::seconds(2)) {
+        const double secs = std::chrono::duration<double>(last - stats_since).count();
+        BOOST_LOG(info) << "App-window composite rate: " << std::fixed << std::setprecision(1) << (composites / secs) << " canvases/s, "
+                        << (_frames_in.exchange(0) / secs) << " window frames/s";
+        composites = 0;
+        stats_since = last;
+      }
     }
   }
 
@@ -3157,6 +3177,7 @@ float4 ps(VSOut i) : SV_Target {
   std::mutex _dirty_mutex;
   std::condition_variable _dirty_cv;
   bool _dirty = false;
+  std::atomic<unsigned> _frames_in {0};
   std::atomic<bool> _stop {true};
   std::thread _layout_thread;
   std::thread _composite_thread;

@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -84,5 +85,14 @@ namespace host_windows {
   /** Cheap enough to call every few milliseconds. `canvas_w/h` is the encoder
    *  frame the client launched the window with. */
   layout_t window_layout(std::uint64_t handle, int canvas_w, int canvas_h);
+
+  /** WGC delivers one frame per composition of the window's monitor, so a
+   *  window on a 60 Hz display can never stream faster. This moves the window
+   *  onto a display that refreshes at least `fps` times per second, creating
+   *  a dedicated Sunshine virtual display (at the window's own DPI) when the
+   *  host has none, and returns a token that moves the window back and drops
+   *  the display again once the last session using it lets go. Returns an
+   *  empty token when the window's display is already fast enough. */
+  std::shared_ptr<void> lease_fast_display(std::uint64_t handle, int fps);
 
 }  // namespace host_windows

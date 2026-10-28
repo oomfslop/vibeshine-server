@@ -15,6 +15,10 @@
 
   #include "platform/windows/app_window_layout.h"
   #include "platform/windows/image_convert.h"
+  #include "platform/windows/virtual_display.h"
+  #include <mutex>
+  #include <thread>
+  #include <chrono>
   #include "platform/windows/utf_utils.h"
   #include "tools/playnite_launcher/focus_utils.h"
 #endif
@@ -302,6 +306,197 @@ namespace host_windows {
     return out;
   }
 
+
+  namespace {
+    int monitor_refresh_hz(HMONITOR mon) {
+      MONITORINFOEXW mi {};
+      mi.cbSize = sizeof(mi);
+      if (!mon || !GetMonitorInfoW(mon, &mi)) return 0;
+      DEVMODEW mode {};
+      mode.dmSize = sizeof(mode);
+      if (!EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &mode)) return 0;
+      return static_cast<int>(mode.dmDisplayFrequency);
+    }
+
+    struct fast_display_state_t {
+      std::mutex mutex;
+      int leases = 0;
+      bool created = false;  ///< we created the virtual display below
+      GUID guid {};
+      std::wstring device;  ///< GDI device name of the fast display ("\\.\\DISPLAYn")
+    };
+    fast_display_state_t &fast_display_state() {
+      static fast_display_state_t state;
+      return state;
+    }
+
+    /** Attach a (detached) display to the desktop at the given mode, or
+     *  switch an attached one to that mode: right of everything else. */
+    void attach_display(const std::wstring &device, UINT w, UINT h, int fps) {
+      DEVMODEW current {};
+      current.dmSize = sizeof(current);
+      const bool attached = EnumDisplaySettingsW(device.c_str(), ENUM_CURRENT_SETTINGS, &current) && current.dmPelsWidth > 0;
+      DEVMODEW want {};
+      want.dmSize = sizeof(want);
+      want.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+      want.dmPelsWidth = w;
+      want.dmPelsHeight = h;
+      want.dmDisplayFrequency = static_cast<DWORD>(fps);
+      if (!attached) {
+        want.dmFields |= DM_POSITION;
+        want.dmPosition.x = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        want.dmPosition.y = 0;
+      }
+      const LONG set = ChangeDisplaySettingsExW(device.c_str(), &want, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+      const LONG commit = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+      BOOST_LOG(info) << "App windows: " << (attached ? "retuned" : "attached") << " display " << utf_utils::to_utf8(device)
+                      << " to " << w << 'x' << h << '@' << fps << " (set=" << set << ", commit=" << commit << ')';
+    }
+
+    void log_monitors(const char *when) {
+      EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR mon, HDC, LPRECT, LPARAM lp) -> BOOL {
+        MONITORINFOEXW mi {};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(mon, &mi)) {
+          BOOST_LOG(info) << "App windows: monitor " << utf_utils::to_utf8(mi.szDevice) << ' ' << (mi.rcMonitor.right - mi.rcMonitor.left) << 'x'
+                          << (mi.rcMonitor.bottom - mi.rcMonitor.top) << " @" << monitor_refresh_hz(mon) << " Hz at " << mi.rcMonitor.left << ',' << mi.rcMonitor.top
+                          << " (" << reinterpret_cast<const char *>(lp) << ')';
+        }
+        return TRUE;
+      },
+                          reinterpret_cast<LPARAM>(const_cast<char *>(when)));
+    }
+
+    /** Any monitor that refreshes at least `fps`; prefers our own virtual display. */
+    HMONITOR find_fast_monitor(int fps, const std::wstring &prefer_device) {
+      struct ctx_t {
+        int fps;
+        const std::wstring &prefer;
+        HMONITOR best = nullptr;
+        HMONITOR preferred = nullptr;
+      } ctx {fps, prefer_device};
+      EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR mon, HDC, LPRECT, LPARAM lp) -> BOOL {
+        auto *c = reinterpret_cast<ctx_t *>(lp);
+        MONITORINFOEXW mi {};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(mon, &mi)) return TRUE;
+        if (monitor_refresh_hz(mon) + 1 >= c->fps) {
+          if (!c->prefer.empty() && c->prefer == mi.szDevice) c->preferred = mon;
+          if (!c->best) c->best = mon;
+        }
+        return TRUE;
+      },
+                          reinterpret_cast<LPARAM>(&ctx));
+      return ctx.preferred ? ctx.preferred : ctx.best;
+    }
+
+    struct fast_display_lease_t {
+      HWND hwnd = nullptr;
+      RECT original {};  ///< raw window rect before the move
+      bool moved = false;
+      ~fast_display_lease_t() {
+        if (moved && IsWindow(hwnd)) {
+          SetWindowPos(hwnd, nullptr, original.left, original.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        auto &st = fast_display_state();
+        std::lock_guard lock(st.mutex);
+        if (--st.leases <= 0) {
+          st.leases = 0;
+          if (st.created) {
+            if (VDISPLAY::removeVirtualDisplay(st.guid)) {
+              BOOST_LOG(info) << "App windows: removed the fast virtual display";
+            } else {
+              BOOST_LOG(warning) << "App windows: failed to remove the fast virtual display";
+            }
+            st.created = false;
+            st.device.clear();
+          }
+        }
+      }
+    };
+  }  // namespace
+
+  std::shared_ptr<void> lease_fast_display(std::uint64_t handle, int fps) {
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    if (!IsWindow(hwnd) || fps <= 0) return {};
+    HMONITOR current = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    const int current_hz = monitor_refresh_hz(current);
+    if (current_hz + 1 >= fps) return {};  // already fast enough
+    auto &st = fast_display_state();
+    std::lock_guard lock(st.mutex);
+    HMONITOR target = find_fast_monitor(fps, st.device);
+    if (!target) {
+      // Create one the size of the window's monitor, at the window's DPI.
+      MONITORINFOEXW mi {};
+      mi.cbSize = sizeof(mi);
+      GetMonitorInfoW(current, &mi);
+      const UINT w = std::max<LONG>(640, mi.rcMonitor.right - mi.rcMonitor.left);
+      const UINT h = std::max<LONG>(480, mi.rcMonitor.bottom - mi.rcMonitor.top);
+      const UINT dpi = GetDpiForWindow(hwnd);
+      if (!VDISPLAY::ensure_driver_is_ready()) {
+        BOOST_LOG(warning) << "App windows: no virtual display driver; the window stays on its " << current_hz << " Hz display";
+        return {};
+      }
+      const auto uuid = VDISPLAY::virtualDisplayUuidFromStableId("vibeshine-app-windows");
+      std::memcpy(&st.guid, uuid.b8, sizeof(st.guid));
+      VDISPLAY::setWatchdogFeedingEnabled(true);
+      auto created = VDISPLAY::createVirtualDisplay("app-windows", "App windows", nullptr, w, h, static_cast<uint32_t>(fps), st.guid,
+                                                    0, false, 1, std::nullopt, false, true, true, false);
+      if (!created) {
+        BOOST_LOG(warning) << "App windows: could not create a " << fps << " Hz virtual display; the window stays on its " << current_hz << " Hz display";
+        return {};
+      }
+      st.created = true;
+      if (created->display_name) st.device = *created->display_name;
+      if (created->monitor_device_path && dpi) {
+        (void) VDISPLAY::set_display_scale_percent(*created->monitor_device_path, dpi * 100 / 96);
+      }
+      // The monitor shows up a moment later; if Windows leaves it detached
+      // (nothing applied a topology), attach it ourselves.
+      for (int i = 0; i < 160 && !target; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        target = find_fast_monitor(fps, st.device);
+        if (!target && (i == 20 || i == 80) && !st.device.empty()) {
+          log_monitors("before attach");
+          attach_display(st.device, w, h, fps);
+        }
+      }
+      if (!target) {
+        log_monitors("gave up");
+        BOOST_LOG(warning) << "App windows: the virtual display did not come up; the window stays where it is";
+        VDISPLAY::removeVirtualDisplay(st.guid);
+        st.created = false;
+        st.device.clear();
+        return {};
+      }
+      BOOST_LOG(info) << "App windows: created a " << w << 'x' << h << '@' << fps << " virtual display for window sessions";
+    }
+    auto lease = std::make_shared<fast_display_lease_t>();
+    lease->hwnd = hwnd;
+    ++st.leases;
+    MONITORINFOEXW tmi {};
+    tmi.cbSize = sizeof(tmi);
+    GetMonitorInfoW(target, &tmi);
+    if (st.device.empty()) st.device = tmi.szDevice;
+    if (target != current && GetWindowRect(hwnd, &lease->original)) {
+      // Keep the window's offset from its monitor's origin, clamped so it
+      // stays inside the fast display's work area.
+      MONITORINFOEXW cmi {};
+      cmi.cbSize = sizeof(cmi);
+      GetMonitorInfoW(current, &cmi);
+      const LONG ww = lease->original.right - lease->original.left, wh = lease->original.bottom - lease->original.top;
+      LONG x = tmi.rcWork.left + (lease->original.left - cmi.rcMonitor.left);
+      LONG y = tmi.rcWork.top + (lease->original.top - cmi.rcMonitor.top);
+      x = std::max(tmi.rcWork.left, std::min(x, tmi.rcWork.right - ww));
+      y = std::max(tmi.rcWork.top, std::min(y, tmi.rcWork.bottom - wh));
+      if (SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)) {
+        lease->moved = true;
+        BOOST_LOG(info) << "App windows: moved window 0x" << std::hex << handle << std::dec << " to the " << monitor_refresh_hz(target) << " Hz display for a " << fps << " fps session";
+      }
+    }
+    return lease;
+  }
+
   std::vector<hit_region_t> hit_regions(std::uint64_t handle) {
     std::vector<hit_region_t> out;
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
@@ -542,6 +737,10 @@ namespace host_windows {
   }
 
   layout_t window_layout(std::uint64_t, int, int) {
+    return {};
+  }
+
+  std::shared_ptr<void> lease_fast_display(std::uint64_t, int) {
     return {};
   }
 
