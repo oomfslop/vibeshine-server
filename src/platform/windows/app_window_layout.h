@@ -124,6 +124,24 @@ namespace app_window_layout {
   };
 
   /**
+   * @brief A caption-less popup that lies entirely inside its parent and
+   *        covers a good part of it is a piece of the app's own UI (Media
+   *        Player Legacy's skin parts, docked tool panes), not a menu: it is
+   *        drawn in place over the parent, where it also sits on the host.
+   */
+  inline bool is_inline_part(const RECT &parent, const popup_t &p) {
+    if (p.dialog) {
+      return false;
+    }
+    if (p.rect.left < parent.left || p.rect.top < parent.top || p.rect.right > parent.right || p.rect.bottom > parent.bottom) {
+      return false;
+    }
+    const LONGLONG area = static_cast<LONGLONG>(p.rect.right - p.rect.left) * (p.rect.bottom - p.rect.top);
+    const LONGLONG parent_area = static_cast<LONGLONG>(parent.right - parent.left) * (parent.bottom - parent.top);
+    return parent_area > 0 && area * 4 >= parent_area;
+  }
+
+  /**
    * @brief Visible popups of `target`, bottom-most first (composition order).
    */
   inline std::vector<popup_t> popup_windows(HWND target) {

@@ -2478,6 +2478,7 @@ public:
     std::atomic<bool> closed {false};
     bool gdi = false;  ///< PrintWindow fallback (WGC refused the window)
     bool dialog = false;  ///< owned window with a caption
+    bool inline_part = false;  ///< drawn in place over the parent, no slot
     std::chrono::steady_clock::time_point gdi_last {};
   };
 
@@ -3047,8 +3048,11 @@ float4 ps(VSOut i) : SV_Target {
           }
           cap->rect = p.rect;
           cap->dialog = p.dialog;
+          cap->inline_part = app_window_layout::is_inline_part(_target_capture->rect, p);
           RECT slot {};
-          if (!assign_slot(p.hwnd, p.rect.right - p.rect.left, p.rect.bottom - p.rect.top, slot)) {
+          if (cap->inline_part) {
+            _slots.erase(p.hwnd);
+          } else if (!assign_slot(p.hwnd, p.rect.right - p.rect.left, p.rect.bottom - p.rect.top, slot)) {
             continue;  // no room in the popup band right now
           }
           order.push_back(cap);
@@ -3206,7 +3210,11 @@ float4 ps(VSOut i) : SV_Target {
       // every popup has a slot of its own in the popup band.
       LONG dx = 0, dy = 0;
       LONG band_bottom = _bands.window_h;
-      if (!cap->is_target) {
+      if (cap->inline_part) {
+        // A piece of the app's UI: in place over the parent
+        dx = cap->rect.left - target_rect.left;
+        dy = cap->rect.top - target_rect.top;
+      } else if (!cap->is_target) {
         auto it = slots.find(cap->hwnd);
         if (it == slots.end()) continue;
         dx = it->second.left;
