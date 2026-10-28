@@ -3044,4 +3044,85 @@ namespace platf {
   std::string resolve_render_device() {
     return {};
   }
+
+  namespace {
+    std::string ensure_crlf(const std::string &utf8) {
+      std::string result;
+      result.reserve(utf8.size() + utf8.size() / 8);
+      for (size_t i = 0; i < utf8.size(); ++i) {
+        if (utf8[i] == '\n' && (i == 0 || utf8[i - 1] != '\r')) {
+          result += '\r';
+        }
+        result += utf8[i];
+      }
+      return result;
+    }
+
+    // Retry briefly: another process may hold the clipboard open.
+    bool open_clipboard_with_retry() {
+      for (int attempt = 0; attempt < 10; ++attempt) {
+        if (OpenClipboard(nullptr)) return true;
+        Sleep(10);
+      }
+      return false;
+    }
+  }  // namespace
+
+  std::string get_clipboard() {
+    if (!open_clipboard_with_retry()) {
+      BOOST_LOG(warning) << "Clipboard: OpenClipboard failed: " << GetLastError();
+      return {};
+    }
+    auto close_guard = util::fail_guard([]() {
+      CloseClipboard();
+    });
+    HANDLE data = GetClipboardData(CF_UNICODETEXT);
+    if (!data) {
+      return {};
+    }
+    auto *text = static_cast<wchar_t *>(GlobalLock(data));
+    if (!text) {
+      BOOST_LOG(warning) << "Clipboard: GlobalLock failed: " << GetLastError();
+      return {};
+    }
+    std::wstring value(text);
+    GlobalUnlock(data);
+    return utf_utils::to_utf8(value);
+  }
+
+  bool set_clipboard(const std::string &content) {
+    const std::wstring value = utf_utils::from_utf8(ensure_crlf(content));
+    if (!open_clipboard_with_retry()) {
+      BOOST_LOG(warning) << "Clipboard: OpenClipboard failed: " << GetLastError();
+      return false;
+    }
+    auto close_guard = util::fail_guard([]() {
+      CloseClipboard();
+    });
+    if (!EmptyClipboard()) {
+      BOOST_LOG(warning) << "Clipboard: EmptyClipboard failed: " << GetLastError();
+      return false;
+    }
+    const size_t bytes = (value.size() + 1) * sizeof(wchar_t);
+    HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!global) {
+      BOOST_LOG(warning) << "Clipboard: GlobalAlloc failed: " << GetLastError();
+      return false;
+    }
+    void *dest = GlobalLock(global);
+    if (!dest) {
+      BOOST_LOG(warning) << "Clipboard: GlobalLock failed: " << GetLastError();
+      GlobalFree(global);
+      return false;
+    }
+    std::memcpy(dest, value.c_str(), bytes);
+    GlobalUnlock(global);
+    if (!SetClipboardData(CF_UNICODETEXT, global)) {
+      BOOST_LOG(warning) << "Clipboard: SetClipboardData failed: " << GetLastError();
+      GlobalFree(global);
+      return false;
+    }
+    // Ownership of `global` passed to the system.
+    return true;
+  }
 }  // namespace platf

@@ -2072,6 +2072,7 @@ namespace nvhttp {
     bool requested_resolution_only = false;
     bool enabled = true;
     bool allow_sleep = false;
+    bool allow_clipboard = false;
     bool prefer_10bit_sdr = false;
     std::optional<std::int64_t> last_seen;
     std::unordered_map<std::string, std::string> config_overrides;
@@ -2123,7 +2124,7 @@ namespace nvhttp {
     std::vector<tls_identity::client_record_view_t> views;
     views.reserve(client.named_devices.size());
     for (const auto &record : client.named_devices) {
-      views.push_back({record.uuid, record.name, record.cert, record.enabled, record.allow_sleep});
+      views.push_back({record.uuid, record.name, record.cert, record.enabled, record.allow_sleep, record.allow_clipboard});
     }
     return views;
   }
@@ -2199,6 +2200,7 @@ namespace nvhttp {
       named_cert_node.put("uuid"s, named_cert.uuid);
       named_cert_node.put("enabled"s, named_cert.enabled);
       named_cert_node.put("allow_sleep"s, named_cert.allow_sleep);
+      named_cert_node.put("allow_clipboard"s, named_cert.allow_clipboard);
       named_cert_node.put("requested_resolution_only"s, named_cert.requested_resolution_only);
       if (!named_cert.hdr_profile.empty()) {
         named_cert_node.put("hdr_profile"s, named_cert.hdr_profile);
@@ -2384,6 +2386,7 @@ namespace nvhttp {
               named_cert.always_use_virtual_display = element.get<bool>("always_use_virtual_display", false);
               named_cert.enabled = element.get<bool>("enabled", true);
               named_cert.allow_sleep = element.get<bool>("allow_sleep", false);
+              named_cert.allow_clipboard = element.get<bool>("allow_clipboard", false);
               named_cert.requested_resolution_only = element.get<bool>("requested_resolution_only", false);
               named_cert.prefer_10bit_sdr = element.get<bool>("prefer_10bit_sdr", false);
               if (auto last_seen = element.get_optional<std::int64_t>("last_seen")) {
@@ -3876,6 +3879,81 @@ namespace nvhttp {
     return true;
   }
 
+  // Client permission bits as advertised by Apollo in serverinfo "Permission".
+  // Vibeshine has no per-permission model: every enabled paired client gets
+  // the Apollo defaults for input and app actions, and the clipboard bits
+  // follow the per-device clipboard grant.
+  namespace apollo_permission_e {
+    constexpr std::uint32_t input_controller = 1u << 8;
+    constexpr std::uint32_t input_touch = 1u << 9;
+    constexpr std::uint32_t input_pen = 1u << 10;
+    constexpr std::uint32_t input_mouse = 1u << 11;
+    constexpr std::uint32_t input_keyboard = 1u << 12;
+    constexpr std::uint32_t clipboard_set = 1u << 16;
+    constexpr std::uint32_t clipboard_read = 1u << 17;
+    constexpr std::uint32_t list_apps = 1u << 24;
+    constexpr std::uint32_t view_streams = 1u << 25;
+    constexpr std::uint32_t launch_apps = 1u << 26;
+    constexpr std::uint32_t paired_default = input_controller | input_touch | input_pen | input_mouse | input_keyboard |
+                                             list_apps | view_streams | launch_apps;
+  }  // namespace apollo_permission_e
+
+  // Apollo clipboard sync: GET returns the host clipboard as UTF-8 text, POST
+  // replaces it with the request body. Both require the per-device clipboard
+  // grant and an active stream from the same client.
+  namespace {
+    bool clipboard_request_allowed(resp_https_t &response, req_https_t &request, const char *action) {
+      const auto identity = resolve_client_identity_from_request(request);
+      if (identity.uuid.empty()) {
+        response->write(SimpleWeb::StatusCode::client_error_unauthorized);
+        response->close_connection_after_response = true;
+        return false;
+      }
+      if (!identity.allow_clipboard) {
+        BOOST_LOG(info) << "Clipboard " << action << " denied for client [" << identity.name
+                        << "]: enable \"Allow clipboard sync\" for this device in the web UI.";
+        response->write(SimpleWeb::StatusCode::client_error_unauthorized);
+        response->close_connection_after_response = true;
+        return false;
+      }
+      const auto args = request->parse_query_string();
+      if (get_arg(args, "type", "text") != "text"sv) {
+        response->write(SimpleWeb::StatusCode::client_error_bad_request);
+        response->close_connection_after_response = true;
+        return false;
+      }
+      const auto connected = rtsp_stream::get_all_session_client_uuids();
+      if (std::find(connected.begin(), connected.end(), identity.uuid) == connected.end()) {
+        BOOST_LOG(debug) << "Client [" << identity.name << "] asked for clipboard " << action << " without an active stream";
+        response->write(SimpleWeb::StatusCode::client_error_forbidden);
+        response->close_connection_after_response = true;
+        return false;
+      }
+      return true;
+    }
+  }  // namespace
+
+  void get_clipboard(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    if (!clipboard_request_allowed(response, request, "read")) return;
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "text/plain; charset=utf-8");
+    headers.emplace("Cache-Control", "no-store");
+    response->write(SimpleWeb::StatusCode::success_ok, platf::get_clipboard(), headers);
+  }
+
+  void set_clipboard(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    if (!clipboard_request_allowed(response, request, "write")) return;
+    if (!platf::set_clipboard(request->content.string())) {
+      BOOST_LOG(warning) << "Setting the host clipboard failed";
+      response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
+      response->close_connection_after_response = true;
+      return;
+    }
+    response->write(SimpleWeb::StatusCode::success_ok);
+  }
+
   template<class T>
   void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
@@ -3883,10 +3961,21 @@ namespace nvhttp {
     int pair_status = 0;
     bool metrics_supported = false;
     bool sleep_allowed = false;
+    // Apollo-compatible client permission mask (see apollo_permission_e).
+    // Artemis/Sloplight read it from the "Permission" element to decide
+    // which host features (clipboard sync, server commands) to offer.
+    std::uint32_t apollo_permissions = 0;
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
-      pair_status = !resolve_client_identity_from_request(request).uuid.empty();
+      const auto identity = resolve_client_identity_from_request(request);
+      pair_status = !identity.uuid.empty();
       metrics_supported = hardware_metrics::advertised(hardware_metrics_access(request));
-      sleep_allowed = resolve_client_identity_from_request(request).allow_sleep;
+      sleep_allowed = identity.allow_sleep;
+      if (pair_status) {
+        apollo_permissions = apollo_permission_e::paired_default;
+        if (identity.allow_clipboard) {
+          apollo_permissions |= apollo_permission_e::clipboard_set | apollo_permission_e::clipboard_read;
+        }
+      }
     }
 
     auto local_endpoint = request->local_endpoint();
@@ -3898,6 +3987,7 @@ namespace nvhttp {
 
     tree.put("root.appversion", VERSION);
     tree.put("root.GfeVersion", GFE_VERSION);
+    tree.put("root.Permission", std::to_string(apollo_permissions));
     tree.put("root.uniqueid", http::unique_id);
     tree.put("root.HttpsPort", net::map_port(PORT_HTTPS));
     tree.put("root.HardwareMetricsVersion", metrics_supported ? 1 : 0);
@@ -4108,6 +4198,7 @@ namespace nvhttp {
       named_cert_node["uuid"] = named_cert.uuid;
       named_cert_node["enabled"] = named_cert.enabled;
       named_cert_node["allow_sleep"] = named_cert.allow_sleep;
+      named_cert_node["allow_clipboard"] = named_cert.allow_clipboard;
       named_cert_node["hdr_profile"] = named_cert.hdr_profile;
       named_cert_node["display_mode"] = named_cert.display_mode;
       named_cert_node["output_name_override"] = named_cert.output_name_override;
@@ -6461,6 +6552,12 @@ launch_session->exact_target_hold.reset();
       });
     };
     https_server.resource["^/api/abr/capabilities$"]["GET"] = getAbrCapabilities;
+    https_server.resource["^/actions/clipboard$"]["GET"] = [run_blocking_nvhttp](auto response, auto request) {
+      run_blocking_nvhttp(response, "clipboard", [response, request] { get_clipboard(response, request); });
+    };
+    https_server.resource["^/actions/clipboard$"]["POST"] = [run_blocking_nvhttp](auto response, auto request) {
+      run_blocking_nvhttp(response, "clipboard", [response, request] { set_clipboard(response, request); });
+    };
     https_server.resource["^/power-actions/v1$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
       run_discovery_nvhttp([response, request] { get_power_action_capabilities(response, request); });
     };
@@ -6786,6 +6883,24 @@ launch_session->exact_target_hold.reset();
       // A failed grant cannot expand authority. A failed revocation remains
       // denied in this process and is reported as an unsuccessful save.
       if (!saved && allowed) client.allow_sleep = previous;
+      return saved;
+    }
+    return false;
+  }
+
+  bool set_client_clipboard_allowed(std::string_view uuid, bool allowed) {
+    const bool fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
+    if (!fresh_state && !authorization_state_ready.load(std::memory_order_acquire)) return false;
+    if (!fresh_state) statefile::migrate_recent_state_keys();
+    std::lock_guard state_lock(statefile::state_mutex());
+    std::lock_guard client_lock(client_mutex);
+    for (auto &client : client_root.named_devices) {
+      if (client.uuid != uuid) continue;
+      const bool previous = client.allow_clipboard;
+      client.allow_clipboard = allowed;
+      const bool saved = fresh_state || save_state_snapshot_locked(client_root);
+      // Same rule as the sleep grant: a failed grant cannot expand authority.
+      if (!saved && allowed) client.allow_clipboard = previous;
       return saved;
     }
     return false;

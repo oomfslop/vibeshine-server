@@ -1043,6 +1043,11 @@ namespace platf {
   /** Resolve the render device path used for hardware encoding. */
   std::string resolve_render_device();
 
+  /** Host clipboard text as UTF-8 (empty when unavailable). */
+  std::string get_clipboard();
+  /** Replace the host clipboard with UTF-8 text; false on failure. */
+  bool set_clipboard(const std::string &content);
+
   bool has_elevated_privileges(bool all_caps);
   [[nodiscard]] bool drop_effective_elevated_privileges(bool all_caps);
   [[nodiscard]] bool drop_elevated_privileges(bool all_caps);

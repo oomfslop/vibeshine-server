@@ -1672,6 +1672,15 @@ namespace platf {
 #endif
   }
 
+  std::string get_clipboard() {
+    // Not implemented on this platform yet.
+    return {};
+  }
+
+  bool set_clipboard(const std::string &) {
+    return false;
+  }
+
   std::string resolve_render_device() {
     if (!config::video.adapter_name.empty()) {
       return config::video.adapter_name;

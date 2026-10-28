@@ -32,6 +32,7 @@ interface PairedDevice {
   uuid: string;
   enabled: boolean;
   allow_sleep?: boolean;
+  allow_clipboard?: boolean;
   connected: boolean;
   last_seen?: number | string | null;
   hdr_profile?: string | null;
@@ -56,6 +57,7 @@ interface MutationResponse {
   status?: boolean;
   enabled_updated?: boolean;
   allow_sleep_updated?: boolean;
+  allow_clipboard_updated?: boolean;
 }
 
 interface PendingAction {
@@ -173,6 +175,7 @@ function normalizeDevice(device: unknown, index: number): PairedDevice {
     name: stringValue(raw.name),
     enabled: booleanValue(raw.enabled, true),
     allow_sleep: raw.allow_sleep === true,
+    allow_clipboard: raw.allow_clipboard === true,
     connected: booleanValue(raw.connected, false),
     last_seen:
       typeof raw.last_seen === 'number' || typeof raw.last_seen === 'string' ? raw.last_seen : null,
@@ -355,6 +358,7 @@ function draftFromDevice(device: PairedDevice): ClientDeviceDraft {
   return {
     name: device.name,
     allowSleep: device.allow_sleep === true,
+    allowClipboard: device.allow_clipboard === true,
     enabled: device.enabled,
     displayMode: device.display_mode ?? '',
     displayOverrideEnabled,
@@ -568,6 +572,7 @@ function updatePayload(device: PairedDevice, draft: ClientDeviceDraft): Record<s
     uuid: device.uuid,
     name: draft.name.trim(),
     allow_sleep: draft.allowSleep,
+    allow_clipboard: draft.allowClipboard,
     enabled: draft.enabled,
     display_mode: draft.displayMode.trim(),
     output_name_override: outputName,
@@ -594,6 +599,7 @@ function updatePayload(device: PairedDevice, draft: ClientDeviceDraft): Record<s
 const draftScalarKeys = [
   'name',
   'allowSleep',
+  'allowClipboard',
   'enabled',
   'displayMode',
   'displayOverrideEnabled',
@@ -692,7 +698,8 @@ async function saveDevice(device: PairedDevice): Promise<void> {
     if (
       response.status !== true ||
       response.enabled_updated === false ||
-      response.allow_sleep_updated !== true
+      response.allow_sleep_updated !== true ||
+      response.allow_clipboard_updated !== true
     ) {
       throw new Error(t('ui.devices.error.partial_update'));
     }

@@ -27,12 +27,14 @@ namespace nvhttp::tls_identity {
     std::string_view certificate;
     bool enabled = false;
     bool allow_sleep = false;
+    bool allow_clipboard = false;
   };
 
   struct identity_t {
     std::string uuid;
     std::string name;
     bool allow_sleep = false;
+    bool allow_clipboard = false;
   };
 
   struct authentication_result_t {

@@ -622,6 +622,15 @@ namespace platf {
   std::string resolve_render_device() {
     return {};
   }
+
+  std::string get_clipboard() {
+    // Not implemented on this platform yet.
+    return {};
+  }
+
+  bool set_clipboard(const std::string &) {
+    return false;
+  }
 }  // namespace platf
 
 namespace dyn {
