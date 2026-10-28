@@ -61,5 +61,8 @@ namespace host_windows {
   /** Probe WM_NCHITTEST over the top of the window to find the caption/drag
    *  areas and the caption buttons, including apps that draw their own title bar. */
   std::vector<hit_region_t> hit_regions(std::uint64_t handle);
+  /** Live WM_NCHITTEST for one point (relative to the frame rect): "drag", "min",
+   *  "max", "close", "border", "client" or "none". */
+  std::string hit_test_point(std::uint64_t handle, int x, int y);
 
 }  // namespace host_windows

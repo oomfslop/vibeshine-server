@@ -333,6 +333,39 @@ namespace host_windows {
     return out;
   }
 
+  std::string hit_test_point(std::uint64_t handle, int x, int y) {
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    int frame[4];
+    if (!IsWindow(hwnd) || IsIconic(hwnd) || !frame_rect(handle, frame)) return "none";
+    const LPARAM pt = MAKELPARAM(static_cast<WORD>(frame[0] + x), static_cast<WORD>(frame[1] + y));
+    DWORD_PTR result = HTNOWHERE;
+    if (!SendMessageTimeoutW(hwnd, WM_NCHITTEST, 0, pt, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &result)) return "none";
+    switch (static_cast<LRESULT>(result)) {
+      case HTCAPTION:
+      case HTSYSMENU:
+        return "drag";
+      case HTMINBUTTON:
+        return "min";
+      case HTMAXBUTTON:
+        return "max";
+      case HTCLOSE:
+        return "close";
+      case HTCLIENT:
+        return "client";
+      case HTLEFT:
+      case HTRIGHT:
+      case HTTOP:
+      case HTTOPLEFT:
+      case HTTOPRIGHT:
+      case HTBOTTOM:
+      case HTBOTTOMLEFT:
+      case HTBOTTOMRIGHT:
+        return "border";
+      default:
+        return "none";
+    }
+  }
+
   std::string icon_png(std::uint64_t handle) {
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
     if (!IsWindow(hwnd)) return {};
@@ -429,6 +462,10 @@ namespace host_windows {
 
   std::vector<hit_region_t> hit_regions(std::uint64_t) {
     return {};
+  }
+
+  std::string hit_test_point(std::uint64_t, int, int) {
+    return "none";
   }
 
   std::vector<window_info_t> list() {

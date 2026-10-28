@@ -4062,6 +4062,17 @@ namespace nvhttp {
       write_json(response, {{"regions", nlohmann::json::array()}}, SimpleWeb::StatusCode::client_error_not_found);
       return;
     }
+    if (args.find("x") != args.end() && args.find("y") != args.end()) {
+      // Point mode: what the app says is under this frame-relative pixel.
+      int x = 0, y = 0;
+      try {
+        x = std::stoi(get_arg(args, "x", "0"));
+        y = std::stoi(get_arg(args, "y", "0"));
+      } catch (...) {
+      }
+      write_json(response, {{"hit", host_windows::hit_test_point(handle, x, y)}});
+      return;
+    }
     nlohmann::json out;
     out["regions"] = nlohmann::json::array();
     for (const auto &r : host_windows::hit_regions(handle)) {

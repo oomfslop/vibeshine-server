@@ -321,7 +321,8 @@ namespace platf::dxgi {
       return capture_e::reinit;
     }
 
-    if (!_ipc_session->set_cursor_visible(cursor_visible)) {
+    // App-window sessions: the client draws its own cursor over the window, so never bake the host cursor in.
+    if (!_ipc_session->set_cursor_visible(cursor_visible && !_target_hwnd)) {
       return _ipc_session->stop_requested() ? capture_e::interrupted : capture_e::reinit;
     }
     _ipc_session->initialize_if_needed();
@@ -480,7 +481,7 @@ namespace platf::dxgi {
     if (!_ipc_session) {
       return capture_e::error;
     }
-    if (!_ipc_session->set_cursor_visible(cursor_visible)) {
+    if (!_ipc_session->set_cursor_visible(cursor_visible && !_target_hwnd)) {
       return _ipc_session->stop_requested() ? capture_e::interrupted : capture_e::reinit;
     }
 
