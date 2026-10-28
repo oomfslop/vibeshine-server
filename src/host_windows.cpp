@@ -148,6 +148,20 @@ namespace host_windows {
   bool frame_rect(std::uint64_t handle, int out[4]) {
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
     if (!IsWindow(hwnd)) return false;
+    if (IsIconic(hwnd)) {
+      // A minimized window sits at -32000,-32000; keep the capture geometry
+      // of its restored placement so the session survives minimize/restore.
+      WINDOWPLACEMENT placement {};
+      placement.length = sizeof(placement);
+      if (GetWindowPlacement(hwnd, &placement)) {
+        const auto &r = placement.rcNormalPosition;
+        out[0] = r.left;
+        out[1] = r.top;
+        out[2] = r.right - r.left;
+        out[3] = r.bottom - r.top;
+        return out[2] > 0 && out[3] > 0;
+      }
+    }
     RECT frame {};
     if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) && !GetWindowRect(hwnd, &frame)) return false;
     out[0] = frame.left;
@@ -227,6 +241,90 @@ namespace host_windows {
                 reinterpret_cast<LPARAM>(&out));
     for (auto &w : out) {
       w.focused = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)) == foreground;
+    }
+    return out;
+  }
+
+  std::vector<hit_region_t> hit_regions(std::uint64_t handle) {
+    std::vector<hit_region_t> out;
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    int frame[4];
+    if (!IsWindow(hwnd) || IsIconic(hwnd) || !frame_rect(handle, frame)) return out;
+    auto kind_of = [](LRESULT hit) -> const char * {
+      switch (hit) {
+        case HTCAPTION:
+        case HTSYSMENU:
+          return "drag";
+        case HTMINBUTTON:
+          return "min";
+        case HTMAXBUTTON:
+          return "max";
+        case HTCLOSE:
+          return "close";
+        default:
+          return nullptr;
+      }
+    };
+    constexpr int step = 8;
+    const int probe_h = std::min(frame[3], 64);
+    struct run_t {
+      const char *kind;
+      int x, w;
+    };
+    std::vector<std::pair<int, std::vector<run_t>>> rows;
+    for (int y = step / 2; y < probe_h; y += step) {
+      std::vector<run_t> runs;
+      const char *cur = nullptr;
+      int cur_x = 0;
+      for (int x = step / 2; x <= frame[2]; x += step) {
+        const char *k = nullptr;
+        if (x < frame[2]) {
+          const LPARAM pt = MAKELPARAM(static_cast<WORD>(frame[0] + x), static_cast<WORD>(frame[1] + y));
+          DWORD_PTR result = HTNOWHERE;
+          if (SendMessageTimeoutW(hwnd, WM_NCHITTEST, 0, pt, SMTO_ABORTIFHUNG | SMTO_BLOCK, 50, &result)) {
+            k = kind_of(static_cast<LRESULT>(result));
+          }
+        }
+        if (k != cur) {
+          if (cur) runs.push_back({cur, cur_x - step / 2, x - cur_x});
+          cur = k;
+          cur_x = x;
+        }
+      }
+      rows.push_back({y - step / 2, std::move(runs)});
+    }
+    // Merge vertically: a run that repeats on the next row grows down.
+    std::vector<hit_region_t> open;
+    for (const auto &[y, runs] : rows) {
+      std::vector<hit_region_t> next;
+      for (const auto &r : runs) {
+        bool merged = false;
+        for (auto &o : open) {
+          if (o.rect[3] > 0 && o.kind == r.kind && o.rect[0] == r.x && o.rect[2] == r.w && o.rect[1] + o.rect[3] == y) {
+            o.rect[3] += step;
+            next.push_back(o);
+            o.rect[3] = -1;  // consumed
+            merged = true;
+            break;
+          }
+        }
+        if (!merged) {
+          hit_region_t h;
+          h.kind = r.kind;
+          h.rect[0] = r.x;
+          h.rect[1] = y;
+          h.rect[2] = r.w;
+          h.rect[3] = step;
+          next.push_back(h);
+        }
+      }
+      for (auto &o : open) {
+        if (o.rect[3] > 0) out.push_back(o);
+      }
+      open = std::move(next);
+    }
+    for (auto &o : open) {
+      if (o.rect[3] > 0) out.push_back(o);
     }
     return out;
   }
@@ -323,6 +421,10 @@ namespace host_windows {
 
   bool window_rect(std::uint64_t, int[4]) {
     return false;
+  }
+
+  std::vector<hit_region_t> hit_regions(std::uint64_t) {
+    return {};
   }
 
   std::vector<window_info_t> list() {

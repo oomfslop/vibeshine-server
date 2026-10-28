@@ -697,6 +697,9 @@ namespace platf {
     int offset_x, offset_y;
     int env_width, env_height;
     int env_logical_width, env_logical_height;
+    // App-window capture: place the capture 1:1 at the top-left of the encoder
+    // frame (padding the rest) instead of scaling it to fit. The client crops.
+    bool pad_output = false;
 
     int width, height;
     int logical_width, logical_height;

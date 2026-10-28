@@ -52,4 +52,13 @@ namespace host_windows {
   bool action(std::uint64_t handle, op_e op, int x = 0, int y = 0, int w = 0, int h = 0);
   bool parse_op(const std::string &name, op_e &out);
 
+  /** A region of the window's non-client hit-test map (rect relative to the frame rect). */
+  struct hit_region_t {
+    std::string kind;  ///< "drag", "min", "max", "close"
+    int rect[4] {0, 0, 0, 0};
+  };
+  /** Probe WM_NCHITTEST over the top of the window to find the caption/drag
+   *  areas and the caption buttons, including apps that draw their own title bar. */
+  std::vector<hit_region_t> hit_regions(std::uint64_t handle);
+
 }  // namespace host_windows

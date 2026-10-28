@@ -485,6 +485,7 @@ namespace platf::dxgi {
       detached_display_width = display_base->width;
       detached_display_height = display_base->height;
       detached_display_rotation = display_base->display_rotation;
+      detached_pad_output = display_base->pad_output;
       display = std::move(display_base);
       return true;
     }
@@ -494,6 +495,7 @@ namespace platf::dxgi {
         detached_display_width = display->width;
         detached_display_height = display->height;
         detached_display_rotation = display->display_rotation;
+        detached_pad_output = display->pad_output;
       }
       return std::move(display);
     }
@@ -1181,6 +1183,7 @@ namespace platf::dxgi {
       const auto display_width = display ? display->width : detached_display_width;
       const auto display_height = display ? display->height : detached_display_height;
       const auto display_rotation = display ? display->display_rotation : detached_display_rotation;
+      const bool pad_output = display ? display->pad_output : detached_pad_output;
       if (display_width <= 0 || display_height <= 0) {
         BOOST_LOG(error) << "Missing source display geometry for D3D11 encoder initialization";
         return -1;
@@ -1307,12 +1310,16 @@ namespace platf::dxgi {
 
       // Ensure aspect ratio is maintained
       auto scalar = std::fminf(out_width / in_width, out_height / in_height);
+      if (pad_output && scalar >= 1.0f) {
+        // App-window capture fits in the frame: keep it 1:1, top-left.
+        scalar = 1.0f;
+      }
       auto out_width_f = in_width * scalar;
       auto out_height_f = in_height * scalar;
 
       // result is always positive
-      auto offsetX = (out_width - out_width_f) / 2;
-      auto offsetY = (out_height - out_height_f) / 2;
+      auto offsetX = pad_output && scalar == 1.0f ? 0.0f : (out_width - out_width_f) / 2;
+      auto offsetY = pad_output && scalar == 1.0f ? 0.0f : (out_height - out_height_f) / 2;
 
       out_Y_or_YUV_viewports[0] = {offsetX, offsetY, out_width_f, out_height_f, 0.0f, 1.0f};  // Y plane
       out_Y_or_YUV_viewports[1] = out_Y_or_YUV_viewports[0];  // U plane
@@ -1852,6 +1859,7 @@ namespace platf::dxgi {
     // cross-device shared-resource dependency.
     std::shared_ptr<display_base_t> display;
     int detached_display_width = 0;
+    bool detached_pad_output = false;
     int detached_display_height = 0;
     DXGI_MODE_ROTATION detached_display_rotation = DXGI_MODE_ROTATION_UNSPECIFIED;
 

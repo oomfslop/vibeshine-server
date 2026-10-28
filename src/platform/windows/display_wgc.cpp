@@ -249,6 +249,7 @@ namespace platf::dxgi {
       width = width_before_rotation = rect[2];
       height = height_before_rotation = rect[3];
       display_rotation = DXGI_MODE_ROTATION_IDENTITY;
+      pad_output = true;
       BOOST_LOG(info) << "App-window capture: window 0x" << std::hex << _target_hwnd << std::dec << " at " << rect[0] << ',' << rect[1]
                       << " size " << width << 'x' << height << " on " << display_name;
     }

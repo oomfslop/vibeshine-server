@@ -5552,6 +5552,11 @@ namespace video {
     float ht = config.height;
 
     auto scalar = std::fminf(wt / wd, ht / hd);
+    // App-window capture is padded, not scaled, when it fits the frame.
+    const bool padded = display->pad_output && scalar >= 1.0f;
+    if (padded) {
+      scalar = 1.0f;
+    }
 
     // we initialize scalar_tpcoords and logical dimensions to default values in case they are not set (non-KMS)
     float scalar_tpcoords = 1.0f;
@@ -5569,8 +5574,8 @@ namespace video {
     auto w2 = scalar * wd;
     auto h2 = scalar * hd;
 
-    auto offsetX = (config.width - w2) * 0.5f;
-    auto offsetY = (config.height - h2) * 0.5f;
+    auto offsetX = padded ? 0.0f : (config.width - w2) * 0.5f;
+    auto offsetY = padded ? 0.0f : (config.height - h2) * 0.5f;
 
     input::touch_port_t result {
       {

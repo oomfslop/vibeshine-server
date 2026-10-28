@@ -4052,6 +4052,23 @@ namespace nvhttp {
     response->write(SimpleWeb::StatusCode::success_ok, png, headers);
   }
 
+  void get_host_window_hittest(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    if (!windows_request_allowed(response, request, "hit-test")) return;
+    const auto args = request->parse_query_string();
+    const auto handle = parse_window_handle(get_arg(args, "hwnd", ""));
+    if (!handle || !host_windows::exists(handle)) {
+      write_json(response, {{"regions", nlohmann::json::array()}}, SimpleWeb::StatusCode::client_error_not_found);
+      return;
+    }
+    nlohmann::json out;
+    out["regions"] = nlohmann::json::array();
+    for (const auto &r : host_windows::hit_regions(handle)) {
+      out["regions"].push_back({{"kind", r.kind}, {"rect", {r.rect[0], r.rect[1], r.rect[2], r.rect[3]}}});
+    }
+    write_json(response, out);
+  }
+
   void post_host_window_action(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
     if (!windows_request_allowed(response, request, "action")) return;
@@ -6734,6 +6751,9 @@ launch_session->exact_target_hold.reset();
     };
     https_server.resource["^/actions/window-icon$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
       run_discovery_nvhttp([response, request] { get_host_window_icon(response, request); });
+    };
+    https_server.resource["^/actions/window-hittest$"]["GET"] = [run_blocking_nvhttp](auto response, auto request) {
+      run_blocking_nvhttp(response, "window-hittest", [response, request] { get_host_window_hittest(response, request); });
     };
     https_server.resource["^/actions/window$"]["POST"] = [run_blocking_nvhttp](auto response, auto request) {
       run_blocking_nvhttp(response, "window", [response, request] { post_host_window_action(response, request); });
