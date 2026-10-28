@@ -279,7 +279,9 @@ namespace host_windows {
         const int l = std::max<int>(p.rect.left, cx0), t = std::max<int>(p.rect.top, cy0);
         const int r = std::min<int>(p.rect.right, cx0 + canvas_w), b = std::min<int>(p.rect.bottom, cy0 + canvas_h);
         if (r <= l || b <= t) continue;
-        if (p.dialog) {
+        RECT parent {out.rect[0], out.rect[1], out.rect[0] + out.rect[2], out.rect[1] + out.rect[3]}, overlap {};
+        const bool over_parent = IntersectRect(&overlap, &p.rect, &parent) != 0;
+        if (p.dialog && !over_parent) {
           layout_t::child_t child;
           child.handle = reinterpret_cast<std::uintptr_t>(p.hwnd);
           child.rect[0] = l;
@@ -347,6 +349,7 @@ namespace host_windows {
       std::mutex mutex;
       int leases = 0;
       bool created = false;  ///< we created the virtual display below
+      unsigned idle_generation = 0;  ///< bumps whenever the last lease goes away
       GUID guid {};
       std::wstring device;  ///< GDI device name of the fast display ("\\.\\DISPLAYn")
     };
@@ -428,14 +431,23 @@ namespace host_windows {
         if (--st.leases <= 0) {
           st.leases = 0;
           if (st.created) {
-            st.created = false;
-            st.device.clear();
-            // Driver round-trips take a while; the session teardown that
-            // releases us holds the stream lifecycle lock, so do it elsewhere.
-            const GUID guid = st.guid;
-            std::thread([guid] {
+            // Creating the display costs seconds and window sessions come and
+            // go in bursts: keep it for a while and only then remove it (off
+            // this thread: the teardown holds the stream lifecycle lock).
+            const auto generation = ++st.idle_generation;
+            std::thread([generation] {
+              std::this_thread::sleep_for(std::chrono::minutes(10));
+              auto &st = fast_display_state();
+              GUID guid {};
+              {
+                std::lock_guard lock(st.mutex);
+                if (st.leases > 0 || !st.created || st.idle_generation != generation) return;
+                st.created = false;
+                st.device.clear();
+                guid = st.guid;
+              }
               if (VDISPLAY::removeVirtualDisplay(guid)) {
-                BOOST_LOG(info) << "App windows: removed the fast virtual display";
+                BOOST_LOG(info) << "App windows: removed the idle fast virtual display";
               } else {
                 BOOST_LOG(warning) << "App windows: failed to remove the fast virtual display";
               }
@@ -521,7 +533,13 @@ namespace host_windows {
       y = std::max(tmi.rcWork.top, std::min(y, tmi.rcWork.bottom - wh));
       if (SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)) {
         lease->moved = true;
-        BOOST_LOG(info) << "App windows: moved window 0x" << std::hex << handle << std::dec << " to the " << monitor_refresh_hz(target) << " Hz display for a " << fps << " fps session";
+        // The move is asynchronous; whoever pins the window next must see it
+        // on the new display, so wait (briefly) for it to land.
+        for (int i = 0; i < 100 && MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) != target; ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        BOOST_LOG(info) << "App windows: moved window 0x" << std::hex << handle << std::dec << " to the " << monitor_refresh_hz(target) << " Hz display for a " << fps << " fps session"
+                        << (MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) == target ? "" : " (move still pending)");
       }
     }
     return lease;
@@ -574,9 +592,10 @@ namespace host_windows {
         mi.cbSize = sizeof(mi);
         if (GetMonitorInfoW(mon, &mi) && (rect[0] != mi.rcWork.left || rect[1] != mi.rcWork.top)) {
           move_frame_to(hwnd, mi.rcWork.left, mi.rcWork.top);
-          if (frame_rect(handle, rect)) {
-            BOOST_LOG(info) << "App windows: parked window 0x" << std::hex << handle << std::dec << " at " << rect[0] << ',' << rect[1];
-          }
+          // The move is asynchronous: pin the intended spot, not a re-read.
+          rect[0] = mi.rcWork.left;
+          rect[1] = mi.rcWork.top;
+          BOOST_LOG(info) << "App windows: parked window 0x" << std::hex << handle << std::dec << " at " << rect[0] << ',' << rect[1];
         }
       }
     }

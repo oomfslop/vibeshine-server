@@ -6617,7 +6617,7 @@ launch_session->exact_target_hold.reset();
     // App-window layout long-polls park a worker for up to a second each; keep
     // them off the single-worker pools (one poll per streamed window).
     thread_pool_util::ThreadPool layout_route_pool;
-    layout_route_pool.start(8);
+    layout_route_pool.start(32);
     hardware_metrics::service_t metrics_service {[] {
       return platf::create_host_stats_provider();
     }};
