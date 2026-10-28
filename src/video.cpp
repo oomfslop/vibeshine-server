@@ -99,6 +99,13 @@ namespace proc {
 using namespace std::literals;
 
 namespace video {
+  bool effective_display_cursor = true;
+  static std::atomic<int> cursor_hide_requests {0};
+  void add_cursor_hide_request(int delta) {
+    const int n = cursor_hide_requests.fetch_add(delta, std::memory_order_acq_rel) + delta;
+    effective_display_cursor = display_cursor && n <= 0;
+  }
+
 
   namespace {
 #ifdef _WIN32
@@ -3357,7 +3364,7 @@ namespace video {
         return true;
       };
 
-      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
+      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &video::effective_display_cursor);
 
       if (artificial_reinit && status != platf::capture_e::error) {
         BOOST_LOG(debug) << "Capture restart: source=explicit-display-switch";
@@ -6097,7 +6104,7 @@ namespace video {
         return true;
       };
 
-      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &display_cursor);
+      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &video::effective_display_cursor);
       // capture() terminalizes this display's geometry before returning. Make
       // the terminal mapping visible to every active synchronous session before
       // tearing down their encoder state or returning to the caller.

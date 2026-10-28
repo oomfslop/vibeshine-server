@@ -3314,6 +3314,7 @@ namespace nvhttp {
     launch_session->client_vrr_requested = util::from_view(get_arg(args, "clientVrrRequested", "0"));
     try {
       launch_session->window_handle = std::stoull(get_arg(args, "windowHandle", "0"), nullptr, 0);
+      launch_session->hide_cursor = get_arg(args, "hideCursor", "0") == "1";
     } catch (...) {
       launch_session->window_handle = 0;
     }

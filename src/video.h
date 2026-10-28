@@ -28,6 +28,11 @@ extern "C" {
 struct AVPacket;
 
 namespace video {
+  /** Sessions that draw their own cursor ask for the host cursor to be left
+   *  out of the capture; the tray/hotkey toggle (display_cursor) still wins. */
+  void add_cursor_hide_request(int delta);
+  extern bool effective_display_cursor;
+
   /* Encoding configuration requested by remote client */
   struct config_t {
     int width;  // Video width in pixels

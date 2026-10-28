@@ -23,6 +23,7 @@ extern "C" {
 // local includes
 #include "config.h"
 #include "globals.h"
+#include "video.h"
 #include "input.h"
 #include "input_geometry_policy.h"
 #include "input_validation_policy.h"
@@ -292,6 +293,7 @@ namespace input {
     switch (keyCode) {
       case 0x4E /* VKEY_N */:
         display_cursor = !display_cursor;
+        video::add_cursor_hide_request(0);
         return 1;
     }
 

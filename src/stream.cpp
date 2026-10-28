@@ -613,6 +613,7 @@ namespace stream {
     bool app_window {};  ///< app-window session: lives independently of the configured application
     std::shared_ptr<void> app_window_display;  ///< keeps the window on a display fast enough for the session fps
     std::shared_ptr<void> app_window_pin;  ///< keeps the window where it is on the host
+    bool hide_cursor {};  ///< this session asked for the host cursor to be left out
     std::uint64_t remote_role_generation {};
     std::string monitor_profile_uuid;
     bool input_only {};
@@ -3547,6 +3548,10 @@ namespace stream {
       input::reset(session.input);
       session.app_window_pin.reset();
       session.app_window_display.reset();
+      if (session.hide_cursor) {
+        session.hide_cursor = false;
+        video::add_cursor_hide_request(-1);
+      }
 
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
       // GPU scheduling enabled. If this happens, we will terminate ourselves and the service can restart.
@@ -3937,6 +3942,8 @@ namespace stream {
       session->secondary_game_client = launch_session.secondary_game_client;
       session->remote_role = launch_session.role;
       session->app_window = launch_session.window_handle != 0;
+      session->hide_cursor = launch_session.hide_cursor;
+      if (session->hide_cursor) video::add_cursor_hide_request(1);
       session->remote_role_generation = launch_session.role_generation;
       session->monitor_profile_uuid = launch_session.monitor_profile_uuid;
       session->exact_monitor_target = launch_session.exact_monitor_target;
