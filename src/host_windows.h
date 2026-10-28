@@ -73,15 +73,16 @@ namespace host_windows {
   struct layout_t {
     bool valid = false;
     int rect[4] {0, 0, 0, 0};  ///< outer rect (restored placement when minimized)
-    int anchor[2] {0, 0};  ///< canvas position of rect's top-left
-    std::vector<std::array<int, 4>> popups;  ///< caption-less popups: outer rects in virtual-desktop pixels, bottom-most first
+    int anchor[2] {0, 0};  ///< canvas position of rect's top-left (always 0,0 now)
     struct child_t {
       std::uint64_t handle = 0;
       int rect[4] {0, 0, 0, 0};  ///< outer rect in virtual-desktop pixels
+      int canvas[4] {0, 0, 0, 0};  ///< where its picture sits on the canvas (the helper's slot)
+      bool dialog = false;  ///< owned window with a caption: movable window of its own; otherwise a menu/tooltip pinned to the parent
       std::string title;
       int caption = 0;
     };
-    std::vector<child_t> children;  ///< owned windows with a caption (dialogs), shown by the client as windows of their own
+    std::vector<child_t> popups;  ///< every popup of the window with a slot on the canvas, bottom-most first
     int radius = 0;  ///< corner radius in pixels the OS applies to the window and its popups (0 when square)
     int dpi = 96;  ///< the window's current DPI (changes when it lands on a differently scaled display)
     int caption = 0;
@@ -102,6 +103,19 @@ namespace host_windows {
    *  the display again once the last session using it lets go. Returns an
    *  empty token when the window's display is already fast enough. */
   std::shared_ptr<void> lease_fast_display(std::uint64_t handle, int fps);
+
+  /** Popup slots the capture helper reported for this window (canvas placement). */
+  struct popup_slot_t {
+    std::uint64_t handle = 0;
+    int host[4] {0, 0, 0, 0};
+    int canvas[4] {0, 0, 0, 0};
+    bool dialog = false;
+  };
+  void set_popup_slots(std::uint64_t target, std::vector<popup_slot_t> slots);
+  std::vector<popup_slot_t> popup_slots(std::uint64_t target);
+  /** Maps a canvas point of the session whose window is pinned at (origin_x, origin_y)
+   *  to a host point: inside a popup's slot it lands in that popup. */
+  bool remap_canvas_point(int origin_x, int origin_y, int cx, int cy, int &hx, int &hy);
 
   /** Keep the window where it is for the session (and its owned dialogs on
    *  the canvas_w x canvas_h canvas around it): input is mapped from the

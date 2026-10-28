@@ -101,6 +101,24 @@ namespace platf::dxgi {
     uint32_t canvas_height;
   };
 
+  constexpr uint32_t WGC_POPUP_SLOTS_MESSAGE_MAGIC = 0x57474350;  // "WGCP"
+  constexpr uint32_t WGC_POPUP_SLOTS_MAX = 48;
+
+  /** App-window sessions: where the helper composites each popup of the
+   *  streamed window on the canvas (helper -> main process, on every change). */
+  struct popup_slot_t {
+    uint64_t hwnd;
+    int32_t host_x, host_y;  ///< the popup's outer rect on the host (virtual-desktop px)
+    int32_t w, h;
+    int32_t canvas_x, canvas_y;  ///< its slot on the canvas
+    uint32_t dialog;  ///< owned window with a caption
+  };
+  struct popup_slots_t {
+    uint32_t magic;
+    uint32_t count;
+    popup_slot_t slots[WGC_POPUP_SLOTS_MAX];
+  };
+
   constexpr uint32_t WGC_ACTIVITY_ADMISSION_MESSAGE_MAGIC = 0x57474341;  // "WGCA"
 
   // Runtime-only update. This intentionally contains no display state: switching

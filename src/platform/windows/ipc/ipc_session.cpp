@@ -18,6 +18,8 @@
 
 // local includes
 #include "config.h"
+#include "src/host_windows.h"
+#include <cstring>
 #include "ipc_session.h"
 #include "misc_utils.h"
 #include "src/logging.h"
@@ -298,6 +300,29 @@ namespace platf::dxgi {
     auto on_message = [this](std::span<const uint8_t> msg) {
       if (msg.size() == 1) {
         handle_desktop_switch_message(msg);
+      } else if (msg.size() == sizeof(popup_slots_t) && _target_hwnd) {
+        popup_slots_t slots {};
+        std::memcpy(&slots, msg.data(), sizeof(slots));
+        if (slots.magic == WGC_POPUP_SLOTS_MESSAGE_MAGIC && slots.count <= WGC_POPUP_SLOTS_MAX) {
+          std::vector<host_windows::popup_slot_t> out;
+          out.reserve(slots.count);
+          for (uint32_t i = 0; i < slots.count; ++i) {
+            const auto &sl = slots.slots[i];
+            host_windows::popup_slot_t o;
+            o.handle = sl.hwnd;
+            o.host[0] = sl.host_x;
+            o.host[1] = sl.host_y;
+            o.host[2] = sl.w;
+            o.host[3] = sl.h;
+            o.canvas[0] = sl.canvas_x;
+            o.canvas[1] = sl.canvas_y;
+            o.canvas[2] = sl.w;
+            o.canvas[3] = sl.h;
+            o.dialog = sl.dialog != 0;
+            out.push_back(o);
+          }
+          host_windows::set_popup_slots(_target_hwnd, std::move(out));
+        }
       }
     };
 

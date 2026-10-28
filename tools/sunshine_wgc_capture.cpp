@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <cstring>
 #include <iomanip>
 #include <map>
 #include <memory>
@@ -2476,11 +2477,13 @@ public:
     std::optional<bool> cursor_applied;
     std::atomic<bool> closed {false};
     bool gdi = false;  ///< PrintWindow fallback (WGC refused the window)
+    bool dialog = false;  ///< owned window with a caption
     std::chrono::steady_clock::time_point gdi_last {};
   };
 
   WindowCompositor(IDirect3DDevice winrt_device, winrt::com_ptr<ID3D11Device> device, winrt::com_ptr<ID3D11DeviceContext> context,
-                   SharedResourceManager &shared, DXGI_FORMAT format, HWND target, UINT canvas_w, UINT canvas_h, int fps):
+                   SharedResourceManager &shared, DXGI_FORMAT format, HWND target, UINT canvas_w, UINT canvas_h, int fps,
+                   std::shared_ptr<AsyncNamedPipe> pipe):
       _winrt_device(std::move(winrt_device)),
       _device(std::move(device)),
       _context(std::move(context)),
@@ -2489,8 +2492,10 @@ public:
       _target(target),
       _canvas_w(canvas_w),
       _canvas_h(canvas_h),
-      _color_h(static_cast<UINT>(app_window_layout::color_height(static_cast<int>(canvas_h)))),
-      _fps(std::clamp(fps, 10, 240)) {
+      _bands(app_window_layout::frame_bands(static_cast<int>(canvas_h))),
+      _color_h(static_cast<UINT>(_bands.canvas_h)),
+      _fps(std::clamp(fps, 10, 240)),
+      _pipe(std::move(pipe)) {
   }
 
   ~WindowCompositor() {
@@ -2516,7 +2521,7 @@ public:
       composite_thread_proc();
     });
     BOOST_LOG(info) << "App-window capture: window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(_target) << std::dec
-                    << " on a " << _canvas_w << 'x' << _color_h << " canvas (+ alpha band), popups composited";
+                    << " on a " << _canvas_w << 'x' << _color_h << " canvas (window band " << _bands.window_h << ", popup band " << (_bands.canvas_h - _bands.popup_y) << ", + half-res alpha band)";
     return true;
   }
 
@@ -2662,7 +2667,7 @@ float4 ps(VSOut i) : SV_Target {
     cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     D3D11_SAMPLER_DESC sd {};
-    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
     D3D11_BLEND_DESC bd {};
@@ -2687,6 +2692,81 @@ float4 ps(VSOut i) : SV_Target {
     return true;
   }
 
+  /** Caller holds _captures_mutex. First-fit slot in the popup band for a popup
+   *  of w x h; sticky per window while it lives. Returns false when nothing fits. */
+  bool assign_slot(HWND hwnd, LONG w, LONG h, RECT &out) {
+    if (auto it = _slots.find(hwnd); it != _slots.end()) {
+      if (it->second.right - it->second.left == w && it->second.bottom - it->second.top == h) {
+        out = it->second;
+        return true;
+      }
+      _slots.erase(it);  // resized: place again
+    }
+    const LONG band_top = _bands.popup_y, band_bottom = _bands.canvas_h, band_right = static_cast<LONG>(_canvas_w);
+    w = std::min(w, band_right);
+    h = std::min(h, band_bottom - band_top);
+    if (w <= 0 || h <= 0) return false;
+    // Candidate positions: band origin and the right/bottom edges of existing slots (+8).
+    std::vector<POINT> candidates {{0, band_top}};
+    for (const auto &[other, r] : _slots) {
+      candidates.push_back({r.right + 8, r.top});
+      candidates.push_back({r.left, r.bottom + 8});
+      candidates.push_back({0, r.bottom + 8});
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const POINT &a, const POINT &b) { return a.y != b.y ? a.y < b.y : a.x < b.x; });
+    for (const POINT &c : candidates) {
+      RECT r {c.x, c.y, c.x + w, c.y + h};
+      if (r.right > band_right || r.bottom > band_bottom || r.left < 0) continue;
+      bool free = true;
+      for (const auto &[other, o] : _slots) {
+        RECT x {};
+        if (IntersectRect(&x, &r, &o)) {
+          free = false;
+          break;
+        }
+      }
+      if (free) {
+        _slots[hwnd] = r;
+        out = r;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Tell the main process where every popup sits (caller holds _captures_mutex). */
+  void publish_slots() {
+    std::vector<platf::dxgi::popup_slot_t> now;
+    for (auto &cap : _order) {
+      if (cap->is_target) continue;
+      auto it = _slots.find(cap->hwnd);
+      if (it == _slots.end()) continue;
+      platf::dxgi::popup_slot_t sl {};
+      sl.hwnd = reinterpret_cast<std::uintptr_t>(cap->hwnd);
+      sl.host_x = cap->rect.left;
+      sl.host_y = cap->rect.top;
+      sl.w = it->second.right - it->second.left;
+      sl.h = it->second.bottom - it->second.top;
+      sl.canvas_x = it->second.left;
+      sl.canvas_y = it->second.top;
+      sl.dialog = cap->dialog ? 1 : 0;
+      now.push_back(sl);
+      if (now.size() >= platf::dxgi::WGC_POPUP_SLOTS_MAX) break;
+    }
+    if (now.size() == _published.size() && std::equal(now.begin(), now.end(), _published.begin(), [](const auto &a, const auto &b) {
+          return std::memcmp(&a, &b, sizeof(a)) == 0;
+        })) {
+      return;
+    }
+    _published = now;
+    if (!_pipe || !_pipe->is_connected()) return;
+    platf::dxgi::popup_slots_t msg {};
+    msg.magic = platf::dxgi::WGC_POPUP_SLOTS_MESSAGE_MAGIC;
+    msg.count = static_cast<uint32_t>(now.size());
+    std::copy(now.begin(), now.end(), msg.slots);
+    _pipe->send(std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(&msg), sizeof(msg)));
+  }
+
   /** Draws src[sx, sx+w) x [sy, sy+h) of `cap` at canvas (dx, dy); alpha band when `alpha_band`. */
   void draw_quad(const capture_t &cap, UINT sx, UINT sy, UINT w, UINT h, UINT dx, UINT dy, bool alpha_band) {
     D3D11_MAPPED_SUBRESOURCE mapped {};
@@ -2695,11 +2775,13 @@ float4 ps(VSOut i) : SV_Target {
     }
     auto *cb = static_cast<quad_cb_t *>(mapped.pData);
     const float W = static_cast<float>(_canvas_w), H = static_cast<float>(_canvas_h);
-    const float y_off = alpha_band ? static_cast<float>(_color_h) : 0.f;
-    cb->dst[0] = dx / W * 2.f - 1.f;
-    cb->dst[1] = 1.f - (dy + y_off) / H * 2.f;
-    cb->dst[2] = (dx + w) / W * 2.f - 1.f;
-    cb->dst[3] = 1.f - (dy + y_off + h) / H * 2.f;
+    // The alpha band holds the canvas' alpha at half resolution below it.
+    const float k = alpha_band ? 0.5f : 1.f;
+    const float x0 = dx * k, y0 = (alpha_band ? static_cast<float>(_bands.alpha_y) : 0.f) + dy * k;
+    cb->dst[0] = x0 / W * 2.f - 1.f;
+    cb->dst[1] = 1.f - y0 / H * 2.f;
+    cb->dst[2] = (x0 + w * k) / W * 2.f - 1.f;
+    cb->dst[3] = 1.f - (y0 + h * k) / H * 2.f;
     cb->uv[0] = static_cast<float>(sx) / cap.latest_w;
     cb->uv[1] = static_cast<float>(sy) / cap.latest_h;
     cb->uv[2] = static_cast<float>(sx + w) / cap.latest_w;
@@ -2964,6 +3046,11 @@ float4 ps(VSOut i) : SV_Target {
             _failed.erase(p.hwnd);
           }
           cap->rect = p.rect;
+          cap->dialog = p.dialog;
+          RECT slot {};
+          if (!assign_slot(p.hwnd, p.rect.right - p.rect.left, p.rect.bottom - p.rect.top, slot)) {
+            continue;  // no room in the popup band right now
+          }
           order.push_back(cap);
           layout.emplace_back(p.hwnd, p.rect);
           if (cap->gdi) {
@@ -2984,9 +3071,11 @@ float4 ps(VSOut i) : SV_Target {
           }
           if (!kept) {
             destroy_capture(*old);
+            _slots.erase(old->hwnd);
           }
         }
         _order = std::move(order);
+        publish_slots();
       }
       bool changed = layout.size() != last_layout.size();
       for (size_t i = 0; !changed && i < layout.size(); ++i) {
@@ -3060,9 +3149,11 @@ float4 ps(VSOut i) : SV_Target {
     if (IsIconic(_target)) {
       return;
     }
-    int ax = 0, ay = 0;
-    app_window_layout::canvas_anchor(static_cast<int>(_canvas_w), static_cast<int>(_color_h),
-                                     target_rect.right - target_rect.left, target_rect.bottom - target_rect.top, ax, ay);
+    std::map<HWND, RECT> slots;
+    {
+      std::lock_guard lock(_captures_mutex);
+      slots = _slots;
+    }
 
     std::unique_lock ctx_lock(_ctx_mutex);
     if (!ensure_pipeline()) {
@@ -3111,9 +3202,17 @@ float4 ps(VSOut i) : SV_Target {
       if (!cap->latest || !cap->latest_srv || cap->latest_w == 0 || cap->latest_h == 0) {
         continue;
       }
-      // Canvas position of this window: the anchor plus its offset from the target.
-      LONG dx = ax + (cap->rect.left - target_rect.left);
-      LONG dy = ay + (cap->rect.top - target_rect.top);
+      // The window sits at the canvas origin (clipped to the window band);
+      // every popup has a slot of its own in the popup band.
+      LONG dx = 0, dy = 0;
+      LONG band_bottom = _bands.window_h;
+      if (!cap->is_target) {
+        auto it = slots.find(cap->hwnd);
+        if (it == slots.end()) continue;
+        dx = it->second.left;
+        dy = it->second.top;
+        band_bottom = _bands.canvas_h;
+      }
       UINT sx = 0, sy = 0, w = cap->latest_w, h = cap->latest_h;
       // A maximized window's capture covers GetWindowRect, whose invisible
       // borders hang off-screen; the picture (and the input mapping) use the
@@ -3146,11 +3245,11 @@ float4 ps(VSOut i) : SV_Target {
         h -= static_cast<UINT>(-dy);
         dy = 0;
       }
-      if (w == 0 || h == 0 || dx >= static_cast<LONG>(_canvas_w) || dy >= static_cast<LONG>(_color_h)) {
+      if (w == 0 || h == 0 || dx >= static_cast<LONG>(_canvas_w) || dy >= band_bottom) {
         continue;
       }
       w = std::min<UINT>(w, _canvas_w - static_cast<UINT>(dx));
-      h = std::min<UINT>(h, _color_h - static_cast<UINT>(dy));
+      h = std::min<UINT>(h, static_cast<UINT>(band_bottom - dy));
       draw_quad(*cap, sx, sy, w, h, static_cast<UINT>(dx), static_cast<UINT>(dy), false);
       draw_quad(*cap, sx, sy, w, h, static_cast<UINT>(dx), static_cast<UINT>(dy), true);
       qpc = std::max(qpc, cap->latest_qpc);
@@ -3177,9 +3276,13 @@ float4 ps(VSOut i) : SV_Target {
   SharedResourceManager &_shared;
   DXGI_FORMAT _format;
   HWND _target;
-  UINT _canvas_w, _canvas_h;  ///< encoder frame: picture band on top, alpha band below
-  UINT _color_h;  ///< height of each band
+  UINT _canvas_w, _canvas_h;  ///< encoder frame (colour canvas + half-resolution alpha band)
+  app_window_layout::frame_bands_t _bands;
+  UINT _color_h;  ///< colour canvas height (window band + popup band)
   int _fps;
+  std::shared_ptr<AsyncNamedPipe> _pipe;
+  std::map<HWND, RECT> _slots;  ///< popup -> its slot on the canvas (sticky while the popup lives)
+  std::vector<platf::dxgi::popup_slot_t> _published;  ///< last slot message sent
   // Compositing pipeline (alpha-blended quads; the alpha band gets alpha as grey)
   winrt::com_ptr<ID3D11VertexShader> _vs;
   winrt::com_ptr<ID3D11PixelShader> _ps;
@@ -3244,7 +3347,7 @@ int run_window_session(std::shared_ptr<AsyncNamedPipe> pipe_shared, D3D11DeviceM
   auto target = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(g_config.target_hwnd));
   WindowCompositor compositor {d3d11_manager.get_winrt_device(), d3d11_manager.get_device(), d3d11_manager.get_context(),
                                shared_resource_manager, capture_format, target, g_config.canvas_width, g_config.canvas_height,
-                               g_config.target_fps > 0 ? g_config.target_fps : 60};
+                               g_config.target_fps > 0 ? g_config.target_fps : 60, pipe_shared};
   if (!compositor.start()) {
     return 1;
   }

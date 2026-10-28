@@ -4120,7 +4120,6 @@ namespace nvhttp {
       {"rect", {layout.rect[0], layout.rect[1], layout.rect[2], layout.rect[3]}},
       {"anchor", {layout.anchor[0], layout.anchor[1]}},
       {"popups", nlohmann::json::array()},
-      {"children", nlohmann::json::array()},
       {"radius", layout.radius},
       {"dpi", layout.dpi},
       {"caption", layout.caption},
@@ -4129,11 +4128,15 @@ namespace nvhttp {
       {"focused", layout.focused},
       {"etag", std::to_string(layout.etag)},
     };
-    for (const auto &p : layout.popups) out["popups"].push_back({p[0], p[1], p[2], p[3]});
-    for (const auto &c : layout.children) {
+    for (const auto &c : layout.popups) {
       char handle[32];
       snprintf(handle, sizeof(handle), "0x%llx", static_cast<unsigned long long>(c.handle));
-      out["children"].push_back({{"hwnd", handle}, {"rect", {c.rect[0], c.rect[1], c.rect[2], c.rect[3]}}, {"title", c.title}, {"caption", c.caption}});
+      out["popups"].push_back({{"hwnd", handle},
+                               {"rect", {c.rect[0], c.rect[1], c.rect[2], c.rect[3]}},
+                               {"canvas", {c.canvas[0], c.canvas[1], c.canvas[2], c.canvas[3]}},
+                               {"dialog", c.dialog},
+                               {"title", c.title},
+                               {"caption", c.caption}});
     }
     write_json(response, out);
   }
@@ -6825,14 +6828,16 @@ launch_session->exact_target_hold.reset();
     https_server.resource["^/actions/window-icon$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
       run_discovery_nvhttp([response, request] { get_host_window_icon(response, request); });
     };
-    https_server.resource["^/actions/window-hittest$"]["GET"] = [run_blocking_nvhttp](auto response, auto request) {
-      run_blocking_nvhttp(response, "window-hittest", [response, request] { get_host_window_hittest(response, request); });
+    // Window queries and actions never touch the launch/resume gate: a slow
+    // host window must not make launches answer "busy" or hold other requests.
+    https_server.resource["^/actions/window-hittest$"]["GET"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
+      run_on_blocking_pool(layout_route_pool, [response, request] { get_host_window_hittest(response, request); });
     };
     https_server.resource["^/actions/window-layout$"]["GET"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
       run_on_blocking_pool(layout_route_pool, [response, request] { get_host_window_layout(response, request); });
     };
-    https_server.resource["^/actions/window$"]["POST"] = [run_blocking_nvhttp](auto response, auto request) {
-      run_blocking_nvhttp(response, "window", [response, request] { post_host_window_action(response, request); });
+    https_server.resource["^/actions/window$"]["POST"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
+      run_on_blocking_pool(layout_route_pool, [response, request] { post_host_window_action(response, request); });
     };
     https_server.resource["^/power-actions/v1$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
       run_discovery_nvhttp([response, request] { get_power_action_capabilities(response, request); });

@@ -83,14 +83,17 @@ namespace host_windows {
       if (GetWindow(hwnd, GW_OWNER) != nullptr) return false;
       const auto ex_style = static_cast<std::uintptr_t>(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
       if ((ex_style & WS_EX_TOOLWINDOW) != 0) return false;
-      if (GetWindowTextLengthW(hwnd) <= 0) return false;
+      wchar_t cls[64] {};
+      GetClassNameW(hwnd, cls, 64);
+      // The shell's untitled frame windows host system dialogs such as "Open
+      // with" (the modern picker); they are streamable, nothing else untitled is.
+      const bool frame_host = wcscmp(cls, L"ApplicationFrameWindow") == 0;
+      if (GetWindowTextLengthW(hwnd) <= 0 && !frame_host) return false;
       if (hwnd == GetShellWindow() || hwnd == GetDesktopWindow()) return false;
       DWORD pid = 0;
       GetWindowThreadProcessId(hwnd, &pid);
       if (pid == GetCurrentProcessId()) return false;
       // Skip the Windows shell surfaces (Start, search, taskbar hosts).
-      wchar_t cls[64] {};
-      GetClassNameW(hwnd, cls, 64);
       static const wchar_t *shell_classes[] = {L"Windows.UI.Core.CoreWindow", L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", L"ApplicationFrameWindow"};
       for (auto *c : shell_classes) {
         if (wcscmp(cls, c) == 0 && wcscmp(c, L"ApplicationFrameWindow") != 0) return false;
@@ -198,6 +201,7 @@ namespace host_windows {
       window_info_t info;
       info.handle = reinterpret_cast<std::uintptr_t>(hwnd);
       info.title = window_title(hwnd);
+      if (info.title.empty()) info.title = "System dialog";
       DWORD pid = 0;
       GetWindowThreadProcessId(hwnd, &pid);
       info.pid = pid;
@@ -272,30 +276,28 @@ namespace host_windows {
       if (GetClientRect(hwnd, &client) && ClientToScreen(hwnd, &origin)) {
         out.caption = std::max(0L, static_cast<LONG>(origin.y - out.rect[1]));
       }
-      // Popups are only meaningful where the canvas can show them: clip to the
-      // canvas and drop what falls outside entirely.
-      const int cx0 = out.rect[0] - out.anchor[0], cy0 = out.rect[1] - out.anchor[1];
+      // Every popup the helper gave a slot on the canvas; menus and dialogs alike
+      // are windows of their own on the client.
+      const auto slots = popup_slots(handle);
       for (const auto &p : app_window_layout::popup_windows(hwnd)) {
-        const int l = std::max<int>(p.rect.left, cx0), t = std::max<int>(p.rect.top, cy0);
-        const int r = std::min<int>(p.rect.right, cx0 + canvas_w), b = std::min<int>(p.rect.bottom, cy0 + canvas_h);
-        if (r <= l || b <= t) continue;
-        RECT parent {out.rect[0], out.rect[1], out.rect[0] + out.rect[2], out.rect[1] + out.rect[3]}, overlap {};
-        const bool over_parent = IntersectRect(&overlap, &p.rect, &parent) != 0;
-        if (p.dialog && !over_parent) {
-          layout_t::child_t child;
-          child.handle = reinterpret_cast<std::uintptr_t>(p.hwnd);
-          child.rect[0] = l;
-          child.rect[1] = t;
-          child.rect[2] = r - l;
-          child.rect[3] = b - t;
+        const auto id = reinterpret_cast<std::uintptr_t>(p.hwnd);
+        auto slot = std::find_if(slots.begin(), slots.end(), [&](const popup_slot_t &sl) { return sl.handle == id; });
+        if (slot == slots.end()) continue;  // not composited yet
+        layout_t::child_t child;
+        child.handle = id;
+        child.rect[0] = p.rect.left;
+        child.rect[1] = p.rect.top;
+        child.rect[2] = p.rect.right - p.rect.left;
+        child.rect[3] = p.rect.bottom - p.rect.top;
+        std::copy(std::begin(slot->canvas), std::end(slot->canvas), child.canvas);
+        child.dialog = p.dialog;
+        if (p.dialog) {
           child.title = window_title(p.hwnd);
           RECT cr {};
           POINT co {0, 0};
           if (GetClientRect(p.hwnd, &cr) && ClientToScreen(p.hwnd, &co)) child.caption = std::max(0L, static_cast<LONG>(co.y - p.rect.top));
-          out.children.push_back(std::move(child));
-        } else {
-          out.popups.push_back({l, t, r - l, b - t});
         }
+        out.popups.push_back(std::move(child));
       }
       if (app_window_layout::rounded_corners_os() && !IsZoomed(hwnd)) {
         const UINT dpi = GetDpiForWindow(hwnd);
@@ -314,12 +316,11 @@ namespace host_windows {
     for (int v : out.rect) mix(static_cast<std::uint32_t>(v));
     mix(static_cast<std::uint32_t>(out.anchor[0]));
     mix(static_cast<std::uint32_t>(out.anchor[1]));
-    for (const auto &p : out.popups) {
-      for (int v : p) mix(static_cast<std::uint32_t>(v));
-    }
-    for (const auto &c : out.children) {
+    for (const auto &c : out.popups) {
       mix(c.handle);
       for (int v : c.rect) mix(static_cast<std::uint32_t>(v));
+      for (int v : c.canvas) mix(static_cast<std::uint32_t>(v));
+      mix(c.dialog);
       mix(c.caption);
       for (unsigned char ch : c.title) mix(ch);
     }
@@ -333,6 +334,41 @@ namespace host_windows {
     return out;
   }
 
+
+  namespace {
+    std::mutex g_slots_mutex;
+    std::map<std::uint64_t, std::vector<popup_slot_t>> g_slots;  ///< target hwnd -> slots
+    std::map<std::uint64_t, POINT> g_session_origins;  ///< target hwnd -> pinned origin (for input remapping)
+  }  // namespace
+
+  void set_popup_slots(std::uint64_t target, std::vector<popup_slot_t> slots) {
+    std::lock_guard lock(g_slots_mutex);
+    g_slots[target] = std::move(slots);
+  }
+
+  std::vector<popup_slot_t> popup_slots(std::uint64_t target) {
+    std::lock_guard lock(g_slots_mutex);
+    auto it = g_slots.find(target);
+    return it == g_slots.end() ? std::vector<popup_slot_t> {} : it->second;
+  }
+
+  bool remap_canvas_point(int origin_x, int origin_y, int cx, int cy, int &hx, int &hy) {
+    std::lock_guard lock(g_slots_mutex);
+    for (const auto &[target, origin] : g_session_origins) {
+      if (origin.x != origin_x || origin.y != origin_y) continue;
+      auto it = g_slots.find(target);
+      if (it == g_slots.end()) return false;
+      for (auto sl = it->second.rbegin(); sl != it->second.rend(); ++sl) {
+        if (cx >= sl->canvas[0] && cy >= sl->canvas[1] && cx < sl->canvas[0] + sl->canvas[2] && cy < sl->canvas[1] + sl->canvas[3]) {
+          hx = sl->host[0] + (cx - sl->canvas[0]);
+          hy = sl->host[1] + (cy - sl->canvas[1]);
+          return true;
+        }
+      }
+      return false;
+    }
+    return false;
+  }
 
   namespace {
     int monitor_refresh_hz(HMONITOR mon) {
@@ -467,6 +503,11 @@ namespace host_windows {
     auto &st = fast_display_state();
     std::lock_guard lock(st.mutex);
     HMONITOR target = find_fast_monitor(fps, st.device);
+    if (!target && st.created) {
+      // Gone (the end-of-stream cleanup removes every virtual display).
+      st.created = false;
+      st.device.clear();
+    }
     if (!target) {
       // Create one the size of the window's monitor, at the window's DPI.
       MONITORINFOEXW mi {};
@@ -590,12 +631,24 @@ namespace host_windows {
       if (HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) {
         MONITORINFO mi {};
         mi.cbSize = sizeof(mi);
-        if (GetMonitorInfoW(mon, &mi) && (rect[0] != mi.rcWork.left || rect[1] != mi.rcWork.top)) {
-          move_frame_to(hwnd, mi.rcWork.left, mi.rcWork.top);
-          // The move is asynchronous: pin the intended spot, not a re-read.
-          rect[0] = mi.rcWork.left;
-          rect[1] = mi.rcWork.top;
-          BOOST_LOG(info) << "App windows: parked window 0x" << std::hex << handle << std::dec << " at " << rect[0] << ',' << rect[1];
+        if (GetMonitorInfoW(mon, &mi)) {
+          // A spot of its own per session (16 px apart): the input path finds
+          // the session by this origin.
+          int taken = 0;
+          {
+            std::lock_guard lock(g_pins_mutex);
+            for (const auto &[other, pin] : g_pins) {
+              if (pin->origin.y == mi.rcWork.top && pin->origin.x >= mi.rcWork.left && pin->origin.x < mi.rcWork.left + 16 * 64) ++taken;
+            }
+          }
+          const int x = mi.rcWork.left + 16 * taken, y = mi.rcWork.top;
+          if (rect[0] != x || rect[1] != y) {
+            move_frame_to(hwnd, x, y);
+            // The move is asynchronous: pin the intended spot, not a re-read.
+            rect[0] = x;
+            rect[1] = y;
+            BOOST_LOG(info) << "App windows: parked window 0x" << std::hex << handle << std::dec << " at " << rect[0] << ',' << rect[1];
+          }
         }
       }
     }
@@ -609,6 +662,10 @@ namespace host_windows {
       std::lock_guard lock(g_pins_mutex);
       g_pins[hwnd] = pin;
     }
+    {
+      std::lock_guard lock(g_slots_mutex);
+      g_session_origins[handle] = pin->origin;
+    }
     std::thread([pin] {
       unsigned restores = 0;
       auto last_log = std::chrono::steady_clock::now() - std::chrono::seconds(2);
@@ -618,44 +675,18 @@ namespace host_windows {
         RECT frame {};
         if (FAILED(DwmGetWindowAttribute(pin->hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)))) continue;
         const POINT want = pin->origin;
-        if (pin->canvas_w > 0 && pin->canvas_h > 0) {
-          // Owned dialogs are shown by the client as windows of their own,
-          // cut from the same canvas: keep them inside it (once, when they
-          // first stray outside; their host position is otherwise theirs).
-          int ax = 0, ay = 0;
-          app_window_layout::canvas_anchor(pin->canvas_w, pin->canvas_h, frame.right - frame.left, frame.bottom - frame.top, ax, ay);
-          // The client shows each dialog in a window of its own, cut from the
-          // same canvas as the parent, so on the canvas a dialog must not sit
-          // on top of the parent (the parent's picture would include it).
-          // Park dialogs beside the parent: to its right, else below it.
-          const LONG cx0 = want.x - ax, cy0 = want.y - ay;
-          const LONG cx1 = cx0 + pin->canvas_w, cy1 = cy0 + pin->canvas_h;
-          LONG right_y = frame.top, below_x = frame.left;
-          for (const auto &p : app_window_layout::popup_windows(pin->hwnd)) {
-            if (!p.dialog) continue;
-            const LONG w = p.rect.right - p.rect.left, h = p.rect.bottom - p.rect.top;
-            RECT overlap {};
-            const bool over_parent = IntersectRect(&overlap, &p.rect, &frame) != 0;
-            const bool inside = p.rect.left >= cx0 && p.rect.top >= cy0 && p.rect.right <= cx1 && p.rect.bottom <= cy1;
-            if (!over_parent && inside) {
-              continue;  // already parked somewhere fine
-            }
-            LONG x = p.rect.left, y = p.rect.top;
-            if (frame.right + 8 + w <= cx1 && right_y + h <= cy1) {
-              x = frame.right + 8;
-              y = right_y;
-              right_y += h + 8;
-            } else if (frame.bottom + 8 + h <= cy1 && below_x + w <= cx1) {
-              x = below_x;
-              y = frame.bottom + 8;
-              below_x += w + 8;
-            } else {
-              // No room beside it: at least keep it on the canvas.
-              x = std::max(cx0, std::min(x, cx1 - w));
-              y = std::max(cy0, std::min(y, cy1 - h));
-            }
-            if (x != p.rect.left || y != p.rect.top) {
-              move_frame_to(p.hwnd, static_cast<int>(x), static_cast<int>(y));
+        if (!MonitorFromPoint(POINT {want.x + 8, want.y + 8}, MONITOR_DEFAULTTONULL)) {
+          // The display we parked on is gone (virtual display removed):
+          // re-park on whatever the window landed on.
+          if (HMONITOR mon = MonitorFromWindow(pin->hwnd, MONITOR_DEFAULTTONEAREST)) {
+            MONITORINFO mi {};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(mon, &mi)) {
+              pin->origin = {mi.rcWork.left, mi.rcWork.top};
+              std::lock_guard lock(g_slots_mutex);
+              g_session_origins[reinterpret_cast<std::uintptr_t>(pin->hwnd)] = pin->origin;
+              BOOST_LOG(info) << "App windows: window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(pin->hwnd) << std::dec << " re-parked at " << pin->origin.x << ',' << pin->origin.y;
+              continue;
             }
           }
         }
@@ -688,6 +719,11 @@ namespace host_windows {
         {
           std::lock_guard lock(g_pins_mutex);
           if (auto it = g_pins.find(pin->hwnd); it != g_pins.end() && it->second == pin) g_pins.erase(it);
+        }
+        {
+          std::lock_guard lock(g_slots_mutex);
+          g_session_origins.erase(reinterpret_cast<std::uintptr_t>(pin->hwnd));
+          g_slots.erase(reinterpret_cast<std::uintptr_t>(pin->hwnd));
         }
         pin->stop.store(true, std::memory_order_release);
       }
@@ -882,15 +918,16 @@ namespace host_windows {
     switch (op) {
       case op_e::activate: {
         if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
-        // Foreground rules: attach to the current foreground thread so the
-        // request isn't ignored, then detach.
-        const DWORD fg_thread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
-        const DWORD our_thread = GetCurrentThreadId();
-        const bool attached = fg_thread && fg_thread != our_thread && AttachThreadInput(fg_thread, our_thread, TRUE);
+        // No AttachThreadInput here: it blocks for as long as the foreground
+        // window's thread is busy (a drag in progress) and this runs on a
+        // request worker. SwitchToThisWindow is the fallback the shell uses.
         AllowSetForegroundWindow(ASFW_ANY);
-        const bool ok = SetForegroundWindow(hwnd) != 0;
+        bool ok = SetForegroundWindow(hwnd) != 0;
+        if (!ok || GetForegroundWindow() != hwnd) {
+          SwitchToThisWindow(hwnd, TRUE);
+          ok = GetForegroundWindow() == hwnd;
+        }
         BringWindowToTop(hwnd);
-        if (attached) AttachThreadInput(fg_thread, our_thread, FALSE);
         return ok;
       }
       case op_e::move: {
@@ -914,7 +951,7 @@ namespace host_windows {
           dw = (win.right - win.left) - (frame.right - frame.left);
           dh = (win.bottom - win.top) - (frame.bottom - frame.top);
         }
-        if (!SetWindowPos(hwnd, nullptr, 0, 0, std::max(1, w + dw), std::max(1, h + dh), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) return false;
+        if (!SetWindowPos(hwnd, nullptr, 0, 0, std::max(1, w + dw), std::max(1, h + dh), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)) return false;
         return true;
       }
       case op_e::minimize:
@@ -966,6 +1003,16 @@ namespace host_windows {
   }
 
   bool pinned_position(std::uint64_t, int &, int &) {
+    return false;
+  }
+
+  void set_popup_slots(std::uint64_t, std::vector<popup_slot_t>) {}
+
+  std::vector<popup_slot_t> popup_slots(std::uint64_t) {
+    return {};
+  }
+
+  bool remap_canvas_point(int, int, int, int, int &, int &) {
     return false;
   }
 

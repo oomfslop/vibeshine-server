@@ -19,28 +19,34 @@
 namespace app_window_layout {
 
   /**
-   * @brief Canvas position of a window's top-left corner.
-   *
-   * The canvas is larger than the window so popups that stick out past the
-   * window's edges still fit. The window is anchored at a fixed fraction of
-   * the canvas (an eighth from the left, a tenth from the top: popups mostly
-   * open to the right and below, flipped ones need less) and only pushed
-   * towards the origin when it would not fit otherwise, so moves never shift
-   * the picture and resizes only shift it once the window nearly fills the
-   * canvas. Even coordinates keep chroma planes aligned.
+   * @brief The encoder frame of an app-window session: a colour canvas on top
+   *        (the window band, where the window sits at 0,0, followed by the
+   *        popup band where menus and dialogs get slots of their own) and,
+   *        below it at half resolution, the canvas' alpha as grey (video has
+   *        no alpha channel). frame_h = 3/2 * canvas_h.
    */
-  inline void canvas_anchor(int canvas_w, int canvas_h, int win_w, int win_h, int &ax, int &ay) {
-    ax = std::clamp(canvas_w / 8, 0, std::max(0, canvas_w - win_w)) & ~1;
-    ay = std::clamp(canvas_h / 10, 0, std::max(0, canvas_h - win_h)) & ~1;
+  struct frame_bands_t {
+    int canvas_h = 0;  ///< colour canvas height (window band + popup band)
+    int window_h = 0;  ///< window band: the streamed window lives in rows [0, window_h)
+    int popup_y = 0;  ///< popup band starts here, ends at canvas_h
+    int alpha_y = 0;  ///< alpha band (half resolution: canvas_w/2 x canvas_h/2) starts here
+  };
+  inline frame_bands_t frame_bands(int frame_h) {
+    frame_bands_t b;
+    b.canvas_h = frame_h * 2 / 3;
+    const int popup = (b.canvas_h / 3) & ~63;
+    b.window_h = b.canvas_h - popup;
+    b.popup_y = b.window_h;
+    b.alpha_y = b.canvas_h;
+    return b;
   }
-
-  /**
-   * @brief The encoder frame of an app-window session is two bands: the
-   *        composited picture on top and, below it, the same pixels' alpha
-   *        as grey (video has no alpha channel). Both bands are this tall.
-   */
   inline int color_height(int frame_height) {
-    return frame_height / 2;
+    return frame_bands(frame_height).canvas_h;
+  }
+  /** The window sits at the canvas origin; kept for the callers' shape. */
+  inline void canvas_anchor(int, int, int, int, int &ax, int &ay) {
+    ax = 0;
+    ay = 0;
   }
 
   /** Outer (DWM extended frame) rect of a window, or GetWindowRect as a fallback. */
