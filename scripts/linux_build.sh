@@ -655,7 +655,7 @@ function run_step_cmake() {
     "-B=build"
     "-G=Ninja"
     "-S=."
-    "-DBUILD_TESTS=ON"
+    "-DBUILD_TESTS=${SUNSHINE_BUILD_TESTS:-ON}"
     "-DBUILD_WERROR=ON"
     "-DCMAKE_BUILD_TYPE=Release"
     "-DCMAKE_INSTALL_PREFIX=/usr"
@@ -670,6 +670,13 @@ function run_step_cmake() {
 
   if [[ "$appimage_build" == 1 ]]; then
     cmake_args+=("-DSUNSHINE_BUILD_APPIMAGE=ON")
+  fi
+
+  # Compiler cache (CI): SUNSHINE_COMPILER_LAUNCHER=ccache
+  if [[ -n "${SUNSHINE_COMPILER_LAUNCHER:-}" ]]; then
+    cmake_args+=("-DCMAKE_C_COMPILER_LAUNCHER=${SUNSHINE_COMPILER_LAUNCHER}")
+    cmake_args+=("-DCMAKE_CXX_COMPILER_LAUNCHER=${SUNSHINE_COMPILER_LAUNCHER}")
+    cmake_args+=("-DCMAKE_CUDA_COMPILER_LAUNCHER=${SUNSHINE_COMPILER_LAUNCHER}")
   fi
 
   # Publisher metadata

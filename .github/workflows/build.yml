@@ -41,16 +41,17 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Set up MSYS2 (UCRT64)
         uses: msys2/setup-msys2@v2
         with:
           msystem: ucrt64
-          update: true
+          update: false
           cache: true
           install: >-
             git
+            mingw-w64-ucrt-x86_64-ccache
             mingw-w64-ucrt-x86_64-boost
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-cppwinrt
@@ -96,6 +97,13 @@ jobs:
           "WIX=$wixRoot\" >> $env:GITHUB_ENV
           (Join-Path $wixRoot 'bin') >> $env:GITHUB_PATH
 
+      - name: Compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-windows-${{ github.sha }}
+          restore-keys: ccache-windows-
+
       - name: Resolve version
         id: version
         shell: bash
@@ -115,8 +123,12 @@ jobs:
           NPM_PATH="$(cygpath -m "${NODEJS_PATH}/npm.cmd")"
           DOTNET_EXE="$(cygpath -m "${DOTNET_PATH}")"
           echo "npm: ${NPM_PATH} ($(npm --version)), dotnet: ${DOTNET_EXE}"
+          export CCACHE_DIR="$(cygpath -u "${GITHUB_WORKSPACE}")/.ccache"
+          ccache --max-size=1G --zero-stats
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DBUILD_VERSION="$BUILD_VERSION" \
             -DBUILD_WERROR=OFF \
             -DBUILD_TESTS=OFF \
@@ -138,7 +150,9 @@ jobs:
       - name: Build
         run: |
           export PATH="$PATH:$(cygpath -u "$NODEJS_PATH")"
+          export CCACHE_DIR="$(cygpath -u "${GITHUB_WORKSPACE}")/.ccache"
           cmake --build build --target all --parallel "$(nproc)"
+          ccache --show-stats
 
       - name: Package portable ZIP
         run: |
@@ -178,12 +192,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Set up Node.js (web UI)
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+
+      - name: Compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-linux-${{ github.sha }}
+          restore-keys: ccache-linux-
 
       - name: Resolve version
         id: version
@@ -199,7 +220,12 @@ jobs:
           BRANCH: ${{ github.head_ref || github.ref_name }}
           BUILD_VERSION: ${{ steps.version.outputs.version }}
           COMMIT: ${{ github.sha }}
+          SUNSHINE_BUILD_TESTS: "OFF"
+          SUNSHINE_COMPILER_LAUNCHER: ccache
+          CCACHE_DIR: /home/runner/.cache/ccache
+          CCACHE_MAXSIZE: 1G
         run: |
+          sudo apt-get install -y ccache
           chmod +x ./scripts/linux_build.sh
           echo "::add-matcher::.github/matchers/gcc.json"
           cuda_arg="--skip-cuda"
@@ -212,6 +238,7 @@ jobs:
             --ubuntu-test-repo \
             $cuda_arg
           echo "::remove-matcher owner=gcc::"
+          ccache --show-stats
           ls -la build/cpack_artifacts/ || ls -la build/
 
       - name: Upload artifacts
