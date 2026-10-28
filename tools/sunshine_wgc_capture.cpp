@@ -2703,24 +2703,32 @@ float4 ps(VSOut i) : SV_Target {
       }
       _slots.erase(it);  // resized: place again
     }
-    const LONG band_top = _bands.popup_y, band_bottom = _bands.canvas_h, band_right = static_cast<LONG>(_canvas_w);
-    w = std::min(w, band_right);
-    h = std::min(h, band_bottom - band_top);
+    // The whole colour canvas is available except the window's own rectangle
+    // (its real size, which the window band only bounds): first the popup band
+    // below the window band, then free space right of and below the window.
+    const LONG canvas_right = static_cast<LONG>(_canvas_w), canvas_bottom = _bands.canvas_h;
+    RECT window_rect {0, 0, _target_capture ? std::min<LONG>(_target_capture->rect.right - _target_capture->rect.left, canvas_right) : canvas_right,
+                      _target_capture ? std::min<LONG>(_target_capture->rect.bottom - _target_capture->rect.top, _bands.window_h) : _bands.window_h};
+    w = std::min(w, canvas_right);
+    h = std::min(h, canvas_bottom);
     if (w <= 0 || h <= 0) return false;
-    // Candidate positions: band origin and the right/bottom edges of existing slots (+8).
-    std::vector<POINT> candidates {{0, band_top}};
+    // Candidate positions: band origin, the window's right/bottom edges, and
+    // the right/bottom edges of existing slots (+8).
+    std::vector<POINT> candidates {{0, _bands.popup_y}, {window_rect.right + 8, 0}, {0, window_rect.bottom + 8}};
     for (const auto &[other, r] : _slots) {
       candidates.push_back({r.right + 8, r.top});
       candidates.push_back({r.left, r.bottom + 8});
       candidates.push_back({0, r.bottom + 8});
+      candidates.push_back({window_rect.right + 8, r.bottom + 8});
     }
     std::sort(candidates.begin(), candidates.end(), [](const POINT &a, const POINT &b) { return a.y != b.y ? a.y < b.y : a.x < b.x; });
     for (const POINT &c : candidates) {
       RECT r {c.x, c.y, c.x + w, c.y + h};
-      if (r.right > band_right || r.bottom > band_bottom || r.left < 0) continue;
+      if (r.right > canvas_right || r.bottom > canvas_bottom || r.left < 0 || r.top < 0) continue;
+      RECT x {};
+      if (IntersectRect(&x, &r, &window_rect)) continue;
       bool free = true;
       for (const auto &[other, o] : _slots) {
-        RECT x {};
         if (IntersectRect(&x, &r, &o)) {
           free = false;
           break;
@@ -2733,6 +2741,21 @@ float4 ps(VSOut i) : SV_Target {
       }
     }
     return false;
+  }
+
+  /** Caller holds _captures_mutex. Slots the window grew into are given up (reassigned next tick). */
+  void evict_slots_under_window() {
+    if (!_target_capture) return;
+    RECT window_rect {0, 0, std::min<LONG>(_target_capture->rect.right - _target_capture->rect.left, static_cast<LONG>(_canvas_w)),
+                      std::min<LONG>(_target_capture->rect.bottom - _target_capture->rect.top, _bands.window_h)};
+    for (auto it = _slots.begin(); it != _slots.end();) {
+      RECT x {};
+      if (IntersectRect(&x, &it->second, &window_rect)) {
+        it = _slots.erase(it);
+      } else {
+        ++it;
+      }
+    }
   }
 
   /** Tell the main process where every popup sits (caller holds _captures_mutex). */
@@ -3023,6 +3046,7 @@ float4 ps(VSOut i) : SV_Target {
         if (app_window_layout::frame_rect(_target, target_rect)) {
           _target_capture->rect = target_rect;
         }
+        evict_slots_under_window();
         layout.emplace_back(_target, _target_capture->rect);
         std::vector<std::shared_ptr<capture_t>> order;
         order.push_back(_target_capture);

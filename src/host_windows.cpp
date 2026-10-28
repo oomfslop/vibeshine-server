@@ -400,17 +400,28 @@ namespace host_windows {
       aim = g_aim;
     }
     if (!aim.intended || !IsWindow(aim.intended)) return;
+    {
+      HWND under = WindowFromPoint(aim.point);
+      BOOST_LOG(debug) << "App windows: press aimed at 0x" << std::hex << reinterpret_cast<std::uintptr_t>(aim.intended) << " at host " << std::dec << aim.point.x << ',' << aim.point.y
+                       << ", window under it 0x" << std::hex << reinterpret_cast<std::uintptr_t>(under ? GetAncestor(under, GA_ROOT) : nullptr) << std::dec
+                       << (IsWindowEnabled(aim.intended) ? "" : " (disabled)");
+    }
     // A window disabled by its modal dialog must stay below that dialog: the
     // click will be ignored anyway, and raising it would only hide the dialog.
     if (!IsWindowEnabled(aim.intended)) return;
     // On the host the window and its dialogs overlap freely (their positions
     // mean nothing to the client), so make sure the window the client aimed
-    // at is the one on top at that point; only ever reorder within the family.
-    if (HWND under = WindowFromPoint(aim.point)) {
-      under = GetAncestor(under, GA_ROOT);
-      if (under && under != aim.intended && std::find(aim.family.begin(), aim.family.end(), under) != aim.family.end()) {
-        SetWindowPos(aim.intended, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-      }
+    // at is the topmost of its family at that point. Decide by z-order, not
+    // WindowFromPoint: that skips disabled windows (a modal dialog's owner)
+    // and would report whatever lies behind them.
+    HWND topmost = nullptr;
+    for (HWND w = GetTopWindow(nullptr); w && !topmost; w = GetWindow(w, GW_HWNDNEXT)) {
+      if (std::find(aim.family.begin(), aim.family.end(), w) == aim.family.end()) continue;
+      RECT r {};
+      if (IsWindowVisible(w) && GetWindowRect(w, &r) && PtInRect(&r, aim.point)) topmost = w;
+    }
+    if (topmost && topmost != aim.intended) {
+      SetWindowPos(aim.intended, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
   }
 
