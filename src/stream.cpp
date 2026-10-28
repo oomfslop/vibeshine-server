@@ -609,6 +609,7 @@ namespace stream {
     std::uint32_t client_display_refresh_millihz = 0;
     bool secondary_game_client = false;
     remote_session::role_e remote_role {remote_session::role_e::game};
+    bool app_window {};  ///< app-window session: lives independently of the configured application
     std::uint64_t remote_role_generation {};
     std::string monitor_profile_uuid;
     bool input_only {};
@@ -1803,7 +1804,9 @@ namespace stream {
             continue;
           }
 
+          // App-window sessions are not tied to the configured application.
           const bool game_session_requires_shutdown =
+            !session->app_window &&
             rtsp_stream::pending_policy::game_session_requires_shutdown(
               game_runtime_active,
               session->remote_role
@@ -1822,7 +1825,7 @@ namespace stream {
               ++pos;
               continue;
             }
-            if (session->remote_role == remote_session::role_e::game) {
+            if (session->remote_role == remote_session::role_e::game && !session->app_window) {
               has_game_session_pending_or_draining = true;
             } else {
               has_processless_live_session = true;
@@ -1837,7 +1840,7 @@ namespace stream {
               continue;
             }
 
-            if (session->remote_role != remote_session::role_e::game) {
+            if (session->remote_role != remote_session::role_e::game || session->app_window) {
               has_processless_live_session = true;
             }
             auto &feedback_queue = session->control.feedback_queue;
@@ -3928,6 +3931,7 @@ namespace stream {
       session->client_display_refresh_millihz = launch_session.client_display_refresh_millihz;
       session->secondary_game_client = launch_session.secondary_game_client;
       session->remote_role = launch_session.role;
+      session->app_window = launch_session.window_handle != 0;
       session->remote_role_generation = launch_session.role_generation;
       session->monitor_profile_uuid = launch_session.monitor_profile_uuid;
       session->exact_monitor_target = launch_session.exact_monitor_target;
@@ -3978,6 +3982,12 @@ namespace stream {
           session->config.monitor.capture_source = video::capture_source_e::active_output;
           session->config.monitor.capture_output.reset();
           break;
+      }
+      if (launch_session.window_handle) {
+        // App-window session: private WGC capture of one window, no audio.
+        session->config.monitor.capture_source = video::capture_source_e::window;
+        session->config.monitor.capture_output = "hwnd:" + std::to_string(launch_session.window_handle);
+        session->audio_disabled = true;
       }
       BOOST_LOG(info) << "Session capture source: role=" << static_cast<int>(launch_session.role)
                       << " source=" << static_cast<int>(session->config.monitor.capture_source)

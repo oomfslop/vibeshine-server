@@ -206,6 +206,7 @@ namespace rtsp_stream {
     snapshot->monitor_profile_uuid = source.monitor_profile_uuid;
     snapshot->exact_monitor_target = source.exact_monitor_target;
     snapshot->remote_capture_output = source.remote_capture_output;
+    snapshot->window_handle = source.window_handle;
     snapshot->rtsp_source_address = source.rtsp_source_address;
     snapshot->gcm_key = source.gcm_key;
     snapshot->iv = source.iv;

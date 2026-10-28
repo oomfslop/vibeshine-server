@@ -59,7 +59,7 @@ namespace platf::dxgi {
      * @param advanced_color_capture True when the target display is already HDR/Advanced Color.
      * @return `0` on success; non-zero otherwise.
      */
-    int init(const ::video::config_t &config, std::string_view display_name, ID3D11Device *device, bool advanced_color_capture);
+    int init(const ::video::config_t &config, std::string_view display_name, ID3D11Device *device, bool advanced_color_capture, std::uint64_t target_hwnd = 0);
 
     /**
      * @brief Start the helper process and set up IPC connection if not already initialized.
@@ -221,6 +221,7 @@ namespace platf::dxgi {
     UINT _height = 0;  ///< Shared texture height.
     ::video::config_t _config;  ///< Cached video config.
     std::string _display_name;  ///< Display name copy.
+    std::uint64_t _target_hwnd = 0;  ///< App-window capture target (0 = display).
     bool _advanced_color_capture = false;  ///< True when target display is already Advanced Color/HDR.
     bool _cursor_visible = true;  ///< Desired WGC inclusion, owned by the capture thread.
     std::optional<bool> _sent_cursor_visible;  ///< Last state sent to this helper generation.

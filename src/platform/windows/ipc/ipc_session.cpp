@@ -200,7 +200,8 @@ namespace platf::dxgi {
     }
   }
 
-  int ipc_session_t::init(const ::video::config_t &config, std::string_view display_name, ID3D11Device *device, bool advanced_color_capture) {
+  int ipc_session_t::init(const ::video::config_t &config, std::string_view display_name, ID3D11Device *device, bool advanced_color_capture, std::uint64_t target_hwnd) {
+    _target_hwnd = target_hwnd;
     _process_helper = std::make_unique<ProcessHandler>();
     _config = config;
     _display_name = display_name;
@@ -362,6 +363,7 @@ namespace platf::dxgi {
     config_data.initial_frame_buffer_size = wgc_initial_frame_buffer_size();
     config_data.max_frame_buffer_size = wgc_max_frame_buffer_size(_config);
     config_data.activity_admission_fps = _activity_admission_fps.load(std::memory_order_relaxed);
+    config_data.target_hwnd = _target_hwnd;
 
     // Convert display_name (std::string) to wchar_t[32]
     if (!_display_name.empty()) {

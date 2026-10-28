@@ -115,6 +115,13 @@ namespace host_windows {
       info.rect[1] = frame.top;
       info.rect[2] = frame.right - frame.left;
       info.rect[3] = frame.bottom - frame.top;
+      RECT win {};
+      if (GetWindowRect(hwnd, &win)) {
+        info.bounds[0] = win.left;
+        info.bounds[1] = win.top;
+        info.bounds[2] = win.right - win.left;
+        info.bounds[3] = win.bottom - win.top;
+      }
       info.client[0] = origin.x;
       info.client[1] = origin.y;
       info.client[2] = cw;
@@ -132,6 +139,33 @@ namespace host_windows {
 
   bool supported() {
     return true;
+  }
+
+  bool exists(std::uint64_t handle) {
+    return IsWindow(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle))) != 0;
+  }
+
+  bool frame_rect(std::uint64_t handle, int out[4]) {
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    if (!IsWindow(hwnd)) return false;
+    RECT frame {};
+    if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) && !GetWindowRect(hwnd, &frame)) return false;
+    out[0] = frame.left;
+    out[1] = frame.top;
+    out[2] = frame.right - frame.left;
+    out[3] = frame.bottom - frame.top;
+    return out[2] > 0 && out[3] > 0;
+  }
+
+  bool window_rect(std::uint64_t handle, int out[4]) {
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    RECT win {};
+    if (!IsWindow(hwnd) || !GetWindowRect(hwnd, &win)) return false;
+    out[0] = win.left;
+    out[1] = win.top;
+    out[2] = win.right - win.left;
+    out[3] = win.bottom - win.top;
+    return out[2] > 0 && out[3] > 0;
   }
 
   std::vector<window_info_t> list() {
@@ -276,6 +310,18 @@ namespace host_windows {
   }
 #else
   bool supported() {
+    return false;
+  }
+
+  bool exists(std::uint64_t) {
+    return false;
+  }
+
+  bool frame_rect(std::uint64_t, int[4]) {
+    return false;
+  }
+
+  bool window_rect(std::uint64_t, int[4]) {
     return false;
   }
 

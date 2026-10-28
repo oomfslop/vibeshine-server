@@ -133,7 +133,7 @@ const int INITIAL_LOG_LEVEL = 2;
 constexpr uint32_t DEFAULT_WGC_IPC_FLAGS =
   platf::dxgi::WGC_IPC_FLAG_DRAIN_TO_LATEST |
   platf::dxgi::WGC_IPC_FLAG_ALLOW_BUFFER_DECREASE;
-static platf::dxgi::config_data_t g_config = {0, 0, 0, L"", {0, 0}, 10000, 60, 1, 2, DEFAULT_WGC_IPC_FLAGS, 120};
+static platf::dxgi::config_data_t g_config = {0, 0, 0, L"", {0, 0}, 10000, 60, 1, 2, DEFAULT_WGC_IPC_FLAGS, 120, 0};
 static std::mutex g_config_mutex;
 static std::condition_variable g_config_cv;
 static std::atomic<int32_t> g_activity_admission_fps {120};
@@ -637,6 +637,7 @@ public:
 class DisplayManager {
 private:
   HMONITOR _selected_monitor = nullptr;  ///< Handle to the selected monitor for capture
+  HWND _target_hwnd = nullptr;  ///< App-window capture target (nullptr = monitor capture)
   MONITORINFO _monitor_info = {sizeof(MONITORINFO)};  ///< Information about the selected monitor
   UINT _width = 0;  ///< Final capture width in pixels
   UINT _height = 0;  ///< Final capture height in pixels
@@ -652,6 +653,16 @@ public:
    * @return true if a monitor was successfully selected; false if monitor selection failed.
    */
   bool select_monitor(const platf::dxgi::config_data_t &config) {
+    if (config.target_hwnd) {
+      // App-window capture: the window's monitor only matters as a fallback.
+      _target_hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(config.target_hwnd));
+      if (!IsWindow(_target_hwnd)) {
+        BOOST_LOG(error) << "App-window capture target 0x" << std::hex << config.target_hwnd << std::dec << " is not a window";
+        return false;
+      }
+      _selected_monitor = MonitorFromWindow(_target_hwnd, MONITOR_DEFAULTTONEAREST);
+      return _selected_monitor != nullptr;
+    }
     auto find_requested_monitor = [&]() -> HMONITOR {
       struct EnumData {
         const wchar_t *target_name;
@@ -740,6 +751,15 @@ public:
     }
 
     auto activation_factory = winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+    if (_target_hwnd) {
+      HRESULT hr = activation_factory->CreateForWindow(_target_hwnd, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item));
+      if (FAILED(hr)) {
+        BOOST_LOG(error) << "Failed to create GraphicsCaptureItem for window: " << hr;
+        return false;
+      }
+      BOOST_LOG(info) << "App-window capture item created for 0x" << std::hex << reinterpret_cast<std::uintptr_t>(_target_hwnd) << std::dec;
+      return true;
+    }
     HRESULT hr = activation_factory->CreateForMonitor(_selected_monitor, winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item));
     if (FAILED(hr)) {
       BOOST_LOG(error) << "Failed to create GraphicsCaptureItem for monitor: " << hr;
@@ -1373,6 +1393,17 @@ public:
       return;
     }
 
+    if (frame && g_config.target_hwnd) {
+      const auto content = frame.ContentSize();
+      if (content.Width != static_cast<int32_t>(_width) || content.Height != static_cast<int32_t>(_height)) {
+        // The window was resized: the pool and shared texture are fixed-size,
+        // so restart the capture at the new size (the host reinitialises).
+        BOOST_LOG(info) << "App-window content size changed " << _width << 'x' << _height << " -> "
+                        << content.Width << 'x' << content.Height << "; restarting capture";
+        g_capture_item_closed.store(true, std::memory_order_release);
+        return;
+      }
+    }
     if (!frame) {
       // Frame drop detected - record timestamp for sliding window analysis
       auto now = std::chrono::steady_clock::now();

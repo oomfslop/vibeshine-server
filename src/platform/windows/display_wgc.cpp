@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include "src/host_windows.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -236,6 +237,22 @@ namespace platf::dxgi {
       return -1;
     }
 
+    if (_target_hwnd) {
+      // App-window capture: the capture surface is the window, not the output.
+      int rect[4];
+      if (!host_windows::frame_rect(_target_hwnd, rect)) {
+        BOOST_LOG(warning) << "App-window capture: window 0x" << std::hex << _target_hwnd << std::dec << " is gone";
+        return -1;
+      }
+      offset_x = rect[0] - GetSystemMetrics(SM_XVIRTUALSCREEN);
+      offset_y = rect[1] - GetSystemMetrics(SM_YVIRTUALSCREEN);
+      width = width_before_rotation = rect[2];
+      height = height_before_rotation = rect[3];
+      display_rotation = DXGI_MODE_ROTATION_IDENTITY;
+      BOOST_LOG(info) << "App-window capture: window 0x" << std::hex << _target_hwnd << std::dec << " at " << rect[0] << ',' << rect[1]
+                      << " size " << width << 'x' << height << " on " << display_name;
+    }
+
     capture_format = DXGI_FORMAT_UNKNOWN;  // Start with unknown format (prevents race condition/crash on first frame)
     _present_stamper = std::make_shared<present_timing::capture_stamper_t>(captured_output_desc.DeviceName);
     present_timing::set_active_stamper(_present_stamper);
@@ -244,7 +261,7 @@ namespace platf::dxgi {
 
     // Create session
     _ipc_session = std::make_unique<ipc_session_t>();
-    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture)) {
+    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture, _target_hwnd)) {
       return -1;
     }
     game_refresh_target = make_wgc_activity_admission_target(
@@ -255,6 +272,30 @@ namespace platf::dxgi {
     );
 
     return 0;
+  }
+
+  std::optional<input_geometry_snapshot_t> display_wgc_ipc_vram_t::input_geometry_snapshot() const {
+    if (!_target_hwnd) return display_base_t::input_geometry_snapshot();
+    // Live window rect so absolute mouse input follows the window when it moves.
+    int rect[4];
+    input_geometry_snapshot_t snapshot;
+    snapshot.valid = host_windows::frame_rect(_target_hwnd, rect);
+    if (!snapshot.valid) return snapshot;
+    snapshot.offset_x = rect[0] - GetSystemMetrics(SM_XVIRTUALSCREEN);
+    snapshot.offset_y = rect[1] - GetSystemMetrics(SM_YVIRTUALSCREEN);
+    snapshot.desktop_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    snapshot.desktop_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    snapshot.target.rect_left = rect[0];
+    snapshot.target.rect_top = rect[1];
+    snapshot.target.rect_right = rect[0] + rect[2];
+    snapshot.target.rect_bottom = rect[1] + rect[3];
+    snapshot.target.monitor = static_cast<std::uintptr_t>(_target_hwnd);
+    // Sequence derived from the rect so publication only happens on change.
+    snapshot.geometry_sequence = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(rect[0])) << 48) ^
+                                 (static_cast<std::uint64_t>(static_cast<std::uint32_t>(rect[1])) << 32) ^
+                                 (static_cast<std::uint64_t>(static_cast<std::uint32_t>(rect[2])) << 16) ^
+                                 static_cast<std::uint64_t>(static_cast<std::uint32_t>(rect[3]));
+    return snapshot;
   }
 
   capture_e display_wgc_ipc_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {

@@ -3312,6 +3312,11 @@ namespace nvhttp {
         0;
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
     launch_session->client_vrr_requested = util::from_view(get_arg(args, "clientVrrRequested", "0"));
+    try {
+      launch_session->window_handle = std::stoull(get_arg(args, "windowHandle", "0"), nullptr, 0);
+    } catch (...) {
+      launch_session->window_handle = 0;
+    }
     // Resume requests usually omit appid. Resolve the running application's
     // preference as well, before display preparation and HDR request overrides.
     auto color_app_ctx = launch_app_ctx;
@@ -4016,6 +4021,7 @@ namespace nvhttp {
         {"process", w.process},
         {"pid", w.pid},
         {"rect", {w.rect[0], w.rect[1], w.rect[2], w.rect[3]}},
+        {"bounds", {w.bounds[0], w.bounds[1], w.bounds[2], w.bounds[3]}},
         {"client", {w.client[0], w.client[1], w.client[2], w.client[3]}},
         {"caption", w.caption},
         {"borders", {w.borders[0], w.borders[1], w.borders[2], w.borders[3]}},
@@ -4489,6 +4495,52 @@ namespace nvhttp {
   void resume(bool &host_audio, resp_https_t response, req_https_t request, int current_appid, bool normal_app_transition = true, bool launched_from_applist = false, std::uint64_t trace_id = 0);
   void cancel(resp_https_t response, req_https_t request);
 
+  // App-window streaming: a session that captures one host window. It never
+  // starts or stops an application, never touches display configuration and
+  // never joins the shared desktop producer, so any number of them can run
+  // next to each other and next to a normal session.
+  bool try_launch_window_session(pt::ptree &tree, const args_t &args, req_https_t request, const resolved_client_identity_t &identity, std::uint64_t trace_id) {
+    std::uint64_t window_handle = 0;
+    try {
+      window_handle = std::stoull(get_arg(args, "windowHandle", "0"), nullptr, 0);
+    } catch (...) {
+    }
+    if (!window_handle) return false;
+    tree.put("root.resume", 0);
+    if (!identity.allow_windows || !host_windows::supported()) {
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "App-window streaming is not enabled for this device");
+      return true;
+    }
+    if (!host_windows::exists(window_handle)) {
+      tree.put("root.<xmlattr>.status_code", 404);
+      tree.put("root.<xmlattr>.status_message", "The requested window no longer exists");
+      return true;
+    }
+    auto launch_session = make_launch_session(false, args, request, false, &identity, false, dispatch::include_request_identity_log_fields(trace_id));
+    launch_session->window_handle = window_handle;
+    launch_session->role = remote_session::role_e::game;
+    launch_session->role_generation = launch_session->id;
+    launch_session->host_audio = false;
+    launch_session->continuous_audio = false;
+    if (!paired_client_uuid_enabled(launch_session->client_uuid)) {
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Paired client authorization was revoked before stream admission");
+      return true;
+    }
+    if (!rtsp_stream::launch_session_raise(launch_session)) {
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "RTSP pending session admission was rejected");
+      return true;
+    }
+    BOOST_LOG(info) << "App-window session admitted for client [" << identity.name << "] window 0x" << std::hex << window_handle << std::dec
+                    << " (" << launch_session->width << 'x' << launch_session->height << '@' << launch_session->fps << ")";
+    tree.put("root.<xmlattr>.status_code", 200);
+    tree.put("root.sessionUrl0", std::format("{}{}:{}", launch_session->rtsp_url_scheme, net::addr_to_url_escaped_string(request->local_endpoint().address()), static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))));
+    tree.put("root.gamesession", 1);
+    return true;
+  }
+
   void launch(bool &host_audio, resp_https_t response, req_https_t request, int current_appid, std::uint64_t trace_id = 0) {
     // Trace-enabled launch/resume routes correlate with a private trace ID;
     // do not emit raw request headers or query values into verbose logs.
@@ -4543,6 +4595,7 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "A paired TLS client identity is required");
       return;
     }
+    if (try_launch_window_session(tree, args, request, request_identity, trace_id)) return;
 
     auto appid_str = get_arg(args, "appid", "0");
     auto appuuid_str = get_arg(args, "appuuid", "");
@@ -5507,6 +5560,7 @@ launch_session->exact_target_hold.reset();
       tree.put("root.<xmlattr>.status_message", "A paired TLS client identity is required");
       return;
     }
+    if (try_launch_window_session(tree, args, request, resolve_client_identity_from_request(request), trace_id)) return;
 
     std::unique_lock normal_transition_lock {normal_http_app_transition_mutex, std::defer_lock};
     if (normal_app_transition) {

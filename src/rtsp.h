@@ -109,6 +109,8 @@ namespace rtsp_stream {
     // and adaptive-headroom checks. The renderer may still fall back later.
     bool client_vrr_requested = false;
     bool requested_resolution_only = false;
+    // App-window streaming: capture only this top-level window (HWND); 0 = normal session.
+    std::uint64_t window_handle = 0;
     std::string virtual_display_catalog_error;
     bool client_display_mode_override;
     // Exact refresh requested by a per-client display-mode override, expressed

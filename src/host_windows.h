@@ -18,6 +18,7 @@ namespace host_windows {
     std::string process;  ///< executable file name (no path)
     std::uint32_t pid = 0;
     int rect[4] {0, 0, 0, 0};  ///< outer rect (DWM extended frame bounds): x, y, w, h in virtual-desktop pixels
+    int bounds[4] {0, 0, 0, 0};  ///< raw window rect (GetWindowRect) = the captured image's extent
     int client[4] {0, 0, 0, 0};  ///< client area rect, same space
     int caption = 0;  ///< caption bar height in pixels (client top - outer top)
     int borders[4] {0, 0, 0, 0};  ///< frame thickness left, top (excluding caption), right, bottom
@@ -39,6 +40,11 @@ namespace host_windows {
   };
 
   bool supported();
+  bool exists(std::uint64_t handle);
+  /** Outer (DWM frame) rect in virtual-desktop pixels: x, y, w, h. */
+  bool frame_rect(std::uint64_t handle, int out[4]);
+  /** Raw window rect (GetWindowRect, includes invisible resize borders): what WGC captures. */
+  bool window_rect(std::uint64_t handle, int out[4]);
   std::vector<window_info_t> list();
   /** PNG bytes of the window's icon (large), empty when unavailable. */
   std::string icon_png(std::uint64_t handle);
