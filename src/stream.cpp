@@ -63,6 +63,7 @@ extern "C" {
 #include "send_result_observation.h"
 #include "session_history.h"
 #include "stream.h"
+#include "app_desk.h"
 #include "stream_broadcast_runtime.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -610,6 +611,7 @@ namespace stream {
     bool secondary_game_client = false;
     remote_session::role_e remote_role {remote_session::role_e::game};
     bool app_window {};  ///< app-window session: lives independently of the configured application
+    std::string desk_client;  ///< desk session: the client whose desk this streams
     bool hide_cursor {};  ///< this session asked for the host cursor to be left out
     std::uint64_t remote_role_generation {};
     std::string monitor_profile_uuid;
@@ -3547,6 +3549,10 @@ namespace stream {
         session.hide_cursor = false;
         video::add_cursor_hide_request(-1);
       }
+      if (!session.desk_client.empty()) {
+        app_desk::session_ended(session.desk_client);
+        session.desk_client.clear();
+      }
 
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
       // GPU scheduling enabled. If this happens, we will terminate ourselves and the service can restart.
@@ -3937,6 +3943,11 @@ namespace stream {
       session->secondary_game_client = launch_session.secondary_game_client;
       session->remote_role = launch_session.role;
       session->app_window = !launch_session.desk_display.empty();
+      if (session->app_window) {
+        session->desk_client = launch_session.client_uuid;
+        app_desk::session_started(session->desk_client);
+        BOOST_LOG(info) << "Desk stream started for client " << session->desk_client;
+      }
       // A desk has a producer of its own and hides the cursor there; only
       // shared-display sessions need the process-wide request.
       session->hide_cursor = launch_session.hide_cursor && launch_session.desk_display.empty();

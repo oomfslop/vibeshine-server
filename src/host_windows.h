@@ -38,6 +38,7 @@ namespace host_windows {
     restore,
     maximize,
     close,
+    lower,  ///< to the bottom of the z-order, without activating
   };
 
   bool supported();

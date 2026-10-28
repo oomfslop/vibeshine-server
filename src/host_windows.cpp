@@ -33,6 +33,7 @@ namespace host_windows {
       {"restore", op_e::restore},
       {"maximize", op_e::maximize},
       {"close", op_e::close},
+      {"lower", op_e::lower},
     };
     for (const auto &entry : table) {
       if (name == entry.name) {
@@ -274,32 +275,30 @@ namespace host_windows {
     if (!IsWindow(hwnd) || IsIconic(hwnd) || !frame_rect(handle, frame)) return "none";
     const POINT screen {frame[0] + x, frame[1] + y};
     const LPARAM pt = MAKELPARAM(static_cast<WORD>(screen.x), static_cast<WORD>(screen.y));
-    DWORD_PTR result = HTNOWHERE;
-    if (!SendMessageTimeoutW(hwnd, WM_NCHITTEST, 0, pt, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &result)) return "none";
-    if (static_cast<LRESULT>(result) == HTCLIENT) {
-      // Apps that draw their own title bar in a child window (XAML islands:
-      // Explorer, many WinUI apps) answer HTCLIENT at the top level and put
-      // the real caption/button hit-test in the island's window. Ask the
-      // windows under the point, deepest first.
-      HWND child = hwnd;
-      std::vector<HWND> chain;
-      for (int depth = 0; depth < 8; ++depth) {
-        POINT client = screen;
-        ScreenToClient(child, &client);
-        HWND next = RealChildWindowFromPoint(child, client);
-        if (!next || next == child) break;
-        chain.push_back(next);
-        child = next;
-      }
-      for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-        DWORD_PTR r = HTNOWHERE;
-        if (SendMessageTimeoutW(*it, WM_NCHITTEST, 0, pt, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &r) &&
-            r != HTCLIENT && r != HTNOWHERE && r != static_cast<DWORD_PTR>(HTTRANSPARENT) && r != HTERROR) {
-          result = r;
-          break;
-        }
-      }
+    // Ask like the system routes a click: the deepest visible child under the
+    // point first; one that answers HTTRANSPARENT passes it to its parent.
+    // (Asking the top-level first is wrong for apps whose top level claims
+    // the whole title strip as caption while child windows on top of it, the
+    // tabs, take the clicks: Windows Terminal.)
+    std::vector<HWND> chain {hwnd};
+    for (int depth = 0; depth < 8; ++depth) {
+      POINT client = screen;
+      ScreenToClient(chain.back(), &client);
+      HWND next = ChildWindowFromPointEx(chain.back(), client, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
+      if (!next || next == chain.back()) break;
+      chain.push_back(next);
     }
+    DWORD_PTR result = HTNOWHERE;
+    bool answered = false;
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+      DWORD_PTR r = HTNOWHERE;
+      if (!SendMessageTimeoutW(*it, WM_NCHITTEST, 0, pt, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &r)) continue;
+      if (r == static_cast<DWORD_PTR>(HTTRANSPARENT) || r == HTNOWHERE || r == static_cast<DWORD_PTR>(HTERROR)) continue;
+      result = r;
+      answered = true;
+      break;
+    }
+    if (!answered) return "none";
     switch (static_cast<LRESULT>(result)) {
       case HTCAPTION:
       case HTSYSMENU:
@@ -410,6 +409,8 @@ namespace host_windows {
         return ShowWindow(hwnd, SW_MAXIMIZE) != 0 || IsZoomed(hwnd);
       case op_e::close:
         return PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0;
+      case op_e::lower:
+        return SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS) != 0;
     }
     return false;
   }

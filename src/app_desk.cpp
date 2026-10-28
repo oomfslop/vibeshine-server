@@ -393,12 +393,47 @@ namespace app_desk {
     return it->second.info;
   }
 
+  namespace {
+    std::map<std::string, std::pair<int, unsigned>> g_sessions;  ///< client -> (live desk streams, generation)
+  }
+
+  void session_started(const std::string &client_uuid) {
+    std::lock_guard lock(g_mutex);
+    auto &s = g_sessions[client_uuid];
+    ++s.first;
+    ++s.second;
+  }
+
+  void session_ended(const std::string &client_uuid) {
+    unsigned generation = 0;
+    {
+      std::lock_guard lock(g_mutex);
+      auto &s = g_sessions[client_uuid];
+      s.first = std::max(0, s.first - 1);
+      if (s.first > 0) return;
+      generation = ++s.second;
+    }
+    std::thread([client_uuid, generation] {
+      std::this_thread::sleep_for(std::chrono::seconds(20));
+      {
+        std::lock_guard lock(g_mutex);
+        auto &s = g_sessions[client_uuid];
+        if (s.first > 0 || s.second != generation) return;
+      }
+      BOOST_LOG(info) << "Desk: no stream for client " << client_uuid << " since 20 s; closing its desk";
+      close(client_uuid);
+    }).detach();
+  }
+
   void close(const std::string &client_uuid) {
     std::lock_guard lock(g_mutex);
     auto it = g_desks.find(client_uuid);
     if (it == g_desks.end()) return;
     for (const auto &[hwnd, origin] : it->second.adopted) {
-      if (IsWindow(hwnd)) move_frame_to(hwnd, origin.x, origin.y);
+      if (!IsWindow(hwnd)) continue;
+      RECT frame {};
+      if (app_window_layout::frame_rect(hwnd, frame)) settle_dpi_change(hwnd, GetDpiForWindow(hwnd), frame);
+      move_frame_to(hwnd, origin.x, origin.y);
     }
     it->second.adopted.clear();
     it->second.open = false;
@@ -640,6 +675,10 @@ namespace app_desk {
   }
 
   void close(const std::string &) {}
+
+  void session_started(const std::string &) {}
+
+  void session_ended(const std::string &) {}
 
   bool any_open() {
     return false;

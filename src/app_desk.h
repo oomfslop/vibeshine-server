@@ -37,6 +37,12 @@ namespace app_desk {
    *  generic end-of-stream display cleanup). */
   bool any_open();
 
+  /** A desk stream of this client started / ended. When the last one ends
+   *  and none starts again within a short grace period (reconnects), the desk
+   *  is closed: windows never stay stranded on a display nobody sees. */
+  void session_started(const std::string &client_uuid);
+  void session_ended(const std::string &client_uuid);
+
   /** Move a host window onto the desk at desk-relative (x, y); its original
    *  place is remembered and restored by release/close. */
   bool adopt(const std::string &client_uuid, std::uint64_t hwnd, int x, int y);
