@@ -612,6 +612,7 @@ namespace stream {
     remote_session::role_e remote_role {remote_session::role_e::game};
     bool app_window {};  ///< app-window session: lives independently of the configured application
     std::shared_ptr<void> app_window_display;  ///< keeps the window on a display fast enough for the session fps
+    std::shared_ptr<void> app_window_pin;  ///< keeps the window where it is on the host
     std::uint64_t remote_role_generation {};
     std::string monitor_profile_uuid;
     bool input_only {};
@@ -3544,6 +3545,7 @@ namespace stream {
 
       // Release input before any potentially hung capture joins.
       input::reset(session.input);
+      session.app_window_pin.reset();
       session.app_window_display.reset();
 
       // Current Nvidia drivers have a bug where NVENC can deadlock the encoder thread with hardware-accelerated
@@ -3993,6 +3995,7 @@ namespace stream {
         session->audio_disabled = true;
         // Per-window capture runs at the window's monitor refresh rate.
         session->app_window_display = host_windows::lease_fast_display(launch_session.window_handle, session->config.monitor.framerate);
+        session->app_window_pin = host_windows::pin_position(launch_session.window_handle);
       }
       BOOST_LOG(info) << "Session capture source: role=" << static_cast<int>(launch_session.role)
                       << " source=" << static_cast<int>(session->config.monitor.capture_source)

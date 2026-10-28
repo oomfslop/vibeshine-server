@@ -16,6 +16,8 @@
   #include "platform/windows/app_window_layout.h"
   #include "platform/windows/image_convert.h"
   #include "platform/windows/virtual_display.h"
+  #include <atomic>
+  #include <map>
   #include <mutex>
   #include <thread>
   #include <chrono>
@@ -497,6 +499,86 @@ namespace host_windows {
     return lease;
   }
 
+
+  namespace {
+    struct pin_t {
+      HWND hwnd = nullptr;
+      POINT origin {};  ///< pinned frame-rect origin
+      std::atomic<bool> stop {false};
+      std::thread thread;
+    };
+    std::mutex g_pins_mutex;
+    std::map<HWND, std::shared_ptr<pin_t>> g_pins;
+
+    void move_frame_to(HWND hwnd, int x, int y) {
+      RECT frame {}, win {};
+      int dx = 0, dy = 0;
+      if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) && GetWindowRect(hwnd, &win)) {
+        dx = frame.left - win.left;
+        dy = frame.top - win.top;
+      }
+      SetWindowPos(hwnd, nullptr, x - dx, y - dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    void set_pin_origin(HWND hwnd, int x, int y) {
+      std::lock_guard lock(g_pins_mutex);
+      if (auto it = g_pins.find(hwnd); it != g_pins.end()) {
+        it->second->origin = {x, y};
+      }
+    }
+  }  // namespace
+
+  std::shared_ptr<void> pin_position(std::uint64_t handle) {
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    int rect[4];
+    if (!frame_rect(handle, rect)) return {};
+    auto pin = std::make_shared<pin_t>();
+    pin->hwnd = hwnd;
+    pin->origin = {rect[0], rect[1]};
+    {
+      std::lock_guard lock(g_pins_mutex);
+      g_pins[hwnd] = pin;
+    }
+    pin->thread = std::thread([pin] {
+      while (!pin->stop.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        if (!IsWindow(pin->hwnd) || IsIconic(pin->hwnd) || IsZoomed(pin->hwnd)) continue;
+        RECT frame {};
+        if (FAILED(DwmGetWindowAttribute(pin->hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)))) continue;
+        const POINT want = pin->origin;
+        if (frame.left != want.x || frame.top != want.y) {
+          move_frame_to(pin->hwnd, want.x, want.y);
+        }
+      }
+    });
+    struct token_t {
+      std::shared_ptr<pin_t> pin;
+      explicit token_t(std::shared_ptr<pin_t> p):
+          pin(std::move(p)) {}
+      token_t(const token_t &) = delete;
+      token_t &operator=(const token_t &) = delete;
+      ~token_t() {
+        pin->stop.store(true, std::memory_order_release);
+        if (pin->thread.joinable()) pin->thread.join();
+        std::lock_guard lock(g_pins_mutex);
+        if (auto it = g_pins.find(pin->hwnd); it != g_pins.end() && it->second == pin) g_pins.erase(it);
+      }
+    };
+    BOOST_LOG(info) << "App windows: pinned window 0x" << std::hex << handle << std::dec << " at " << rect[0] << ',' << rect[1];
+    return std::make_shared<token_t>(pin);
+  }
+
+  bool pinned_position(std::uint64_t handle, int &x, int &y) {
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    std::lock_guard lock(g_pins_mutex);
+    if (auto it = g_pins.find(hwnd); it != g_pins.end()) {
+      x = it->second->origin.x;
+      y = it->second->origin.y;
+      return true;
+    }
+    return false;
+  }
+
   std::vector<hit_region_t> hit_regions(std::uint64_t handle) {
     std::vector<hit_region_t> out;
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
@@ -667,6 +749,7 @@ namespace host_windows {
           dx = frame.left - win.left;
           dy = frame.top - win.top;
         }
+        set_pin_origin(hwnd, x, y);
         return SetWindowPos(hwnd, nullptr, x - dx, y - dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) != 0;
       }
       case op_e::resize: {
@@ -696,6 +779,7 @@ namespace host_windows {
             if (shift_x || shift_y) {
               SetWindowPos(hwnd, nullptr, win.left + shift_x, win.top + shift_y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
+            set_pin_origin(hwnd, frame.left + shift_x, frame.top + shift_y);
           }
         }
         return true;
@@ -742,6 +826,14 @@ namespace host_windows {
 
   std::shared_ptr<void> lease_fast_display(std::uint64_t, int) {
     return {};
+  }
+
+  std::shared_ptr<void> pin_position(std::uint64_t) {
+    return {};
+  }
+
+  bool pinned_position(std::uint64_t, int &, int &) {
+    return false;
   }
 
   std::vector<window_info_t> list() {

@@ -253,6 +253,7 @@ namespace platf::dxgi {
       height = height_before_rotation = std::max(2, config.height);
       int ax = 0, ay = 0;
       app_window_layout::canvas_anchor(width, app_window_layout::color_height(height), rect[2], rect[3], ax, ay);
+      (void) host_windows::pinned_position(_target_hwnd, rect[0], rect[1]);
       offset_x = rect[0] - ax - GetSystemMetrics(SM_XVIRTUALSCREEN);
       offset_y = rect[1] - ay - GetSystemMetrics(SM_YVIRTUALSCREEN);
       display_rotation = DXGI_MODE_ROTATION_IDENTITY;
@@ -291,6 +292,8 @@ namespace platf::dxgi {
     if (!snapshot.valid) return snapshot;
     int ax = 0, ay = 0;
     app_window_layout::canvas_anchor(width, app_window_layout::color_height(height), rect[2], rect[3], ax, ay);
+    // The pinned origin, so a host-side move can never feed back into the cursor.
+    (void) host_windows::pinned_position(_target_hwnd, rect[0], rect[1]);
     snapshot.offset_x = rect[0] - ax - GetSystemMetrics(SM_XVIRTUALSCREEN);
     snapshot.offset_y = rect[1] - ay - GetSystemMetrics(SM_YVIRTUALSCREEN);
     snapshot.desktop_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);

@@ -95,4 +95,13 @@ namespace host_windows {
    *  empty token when the window's display is already fast enough. */
   std::shared_ptr<void> lease_fast_display(std::uint64_t handle, int fps);
 
+  /** Keep the window where it is for the session: input is mapped from the
+   *  pinned origin and anything that moves the window on the host (a drag
+   *  the app handles itself from forwarded input, edge snapping) is undone
+   *  within milliseconds, so there is no feedback between cursor and window.
+   *  Our own moves (slide-to-fit on resize) update the pin. */
+  std::shared_ptr<void> pin_position(std::uint64_t handle);
+  /** Pinned outer-rect origin, when pinned. */
+  bool pinned_position(std::uint64_t handle, int &x, int &y);
+
 }  // namespace host_windows
