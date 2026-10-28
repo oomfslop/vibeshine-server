@@ -1,0 +1,240 @@
+name: Build
+
+# Fork CI: unsigned x64 builds for Windows 10/11 (portable ZIP + MSI) and
+# Linux (Debian package) on every push and pull request; tagged pushes
+# (v*) also get a GitHub release with the artifacts attached.
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      linux_cuda:
+        description: Build the Linux package with CUDA (NVENC on Linux hosts); slow
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: "22"
+  # Version used for untagged builds (the build refuses 0.0.0). Bump when
+  # rebasing on a newer upstream release; tags v<version> override it.
+  BASE_VERSION: "2.0.1"
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ucrt64
+          update: true
+          cache: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-cppwinrt
+            mingw-w64-ucrt-x86_64-curl-winssl
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-libwebp
+            mingw-w64-ucrt-x86_64-MinHook
+            mingw-w64-ucrt-x86_64-miniupnpc
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-nlohmann-json
+            mingw-w64-ucrt-x86_64-onevpl
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-tools
+
+      - name: Set up .NET (uninstaller UI, WiX)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.x"
+
+      - name: Set up Node.js (web UI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            src_assets/common/assets/web/package-lock.json
+            src_assets/common/assets/web-legacy/package-lock.json
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: choco install wixtoolset -y --no-progress
+
+      - name: Resolve tool paths
+        shell: pwsh
+        run: |
+          "NODEJS_PATH=$(Split-Path -Parent (Get-Command node).Source)" >> $env:GITHUB_ENV
+          "DOTNET_PATH=$((Get-Command dotnet).Source)" >> $env:GITHUB_ENV
+          $wixRoot = Join-Path ${env:ProgramFiles(x86)} 'WiX Toolset v3.14'
+          "WIX=$wixRoot\" >> $env:GITHUB_ENV
+          (Join-Path $wixRoot 'bin') >> $env:GITHUB_PATH
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${BASE_VERSION}-sloplight.${GITHUB_RUN_NUMBER}+${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          export PATH="$PATH:$(cygpath -u "$NODEJS_PATH")"
+          # cmake must get npm.cmd (a Windows path), not the POSIX npm shim.
+          NPM_PATH="$(cygpath -m "${NODEJS_PATH}/npm.cmd")"
+          DOTNET_EXE="$(cygpath -m "${DOTNET_PATH}")"
+          echo "npm: ${NPM_PATH} ($(npm --version)), dotnet: ${DOTNET_EXE}"
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_VERSION="$BUILD_VERSION" \
+            -DBUILD_WERROR=OFF \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER=OFF \
+            -DBUILD_VIRTUALDISPLAY_PROBE=OFF \
+            -DBUILD_VIRTUALDISPLAY_TOOLS=OFF \
+            -DBUILD_VIRTUALDISPLAY_VULKAN_LAYER=OFF \
+            -DSUNSHINE_ENABLE_WEBRTC=OFF \
+            -DSUNSHINE_ENABLE_PYROWAVE=OFF \
+            -DSUNSHINE_DOTNET_EXECUTABLE="${DOTNET_EXE}" \
+            -DSUNSHINE_NPM_EXECUTABLE="${NPM_PATH}" \
+            -DSUNSHINE_ASSETS_DIR=assets \
+            -DSUNSHINE_PUBLISHER_NAME="${GITHUB_REPOSITORY_OWNER}" \
+            -DSUNSHINE_PUBLISHER_WEBSITE="https://github.com/${GITHUB_REPOSITORY}" \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL="https://github.com/${GITHUB_REPOSITORY}/issues" \
+            .
+
+      - name: Build
+        run: |
+          export PATH="$PATH:$(cygpath -u "$NODEJS_PATH")"
+          cmake --build build --target all --parallel "$(nproc)"
+
+      - name: Package portable ZIP
+        run: |
+          export PATH="$PATH:$(cygpath -u "$NODEJS_PATH")"
+          cmake --build build --target package_portable
+          ls -la build/cpack_artifacts/
+
+      - name: Package MSI
+        # Needs WiX; kept best-effort so a packaging regression upstream
+        # doesn't hide the portable build.
+        continue-on-error: true
+        run: |
+          export PATH="$PATH:$(cygpath -u "$NODEJS_PATH")"
+          cmake --build build --target package_msi
+          ls -la build/cpack_artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibeshine-windows-x64
+          path: |
+            build/cpack_artifacts/*.zip
+            build/cpack_artifacts/*.msi
+          if-no-files-found: error
+
+  linux:
+    name: Linux x64 (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Node.js (web UI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${BASE_VERSION}-sloplight.${GITHUB_RUN_NUMBER}+${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and package (.deb)
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          chmod +x ./scripts/linux_build.sh
+          echo "::add-matcher::.github/matchers/gcc.json"
+          cuda_arg="--skip-cuda"
+          if [[ "${{ inputs.linux_cuda }}" == "true" ]]; then cuda_arg=""; fi
+          ./scripts/linux_build.sh \
+            --publisher-name="${GITHUB_REPOSITORY_OWNER}" \
+            --publisher-website="https://github.com/${GITHUB_REPOSITORY}" \
+            --publisher-issue-url="https://github.com/${GITHUB_REPOSITORY}/issues" \
+            --skip-cleanup \
+            --ubuntu-test-repo \
+            $cuda_arg
+          echo "::remove-matcher owner=gcc::"
+          ls -la build/cpack_artifacts/ || ls -la build/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibeshine-linux-x64
+          path: |
+            build/cpack_artifacts/*.deb
+            build/sunshine
+          if-no-files-found: error
+
+  release:
+    name: Attach to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/vibeshine-windows-x64/*
+            artifacts/vibeshine-linux-x64/*.deb
+          generate_release_notes: true
