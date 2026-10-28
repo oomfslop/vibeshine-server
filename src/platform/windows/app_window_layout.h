@@ -71,25 +71,50 @@ namespace app_window_layout {
         return true;
       }
     }
-    if (GetWindow(hwnd, GW_OWNER)) {
-      return false;  // owned by some other window
-    }
     DWORD target_pid = 0, pid = 0;
     const DWORD target_tid = GetWindowThreadProcessId(target, &target_pid);
     const DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
-    if (tid != target_tid || pid != target_pid) {
+    if (pid != target_pid) {
       return false;
     }
     const LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+    if (HWND owner = GetWindow(hwnd, GW_OWNER)) {
+      // Owned by something else in this process. Dialogs that hang off an
+      // invisible helper window (Explorer's property sheets, many shell
+      // dialogs) belong to the app's window the user is working in.
+      if ((style & WS_CAPTION) != WS_CAPTION) {
+        return false;
+      }
+      for (HWND o = owner; o; o = GetWindow(o, GW_OWNER)) {
+        if (IsWindowVisible(o)) {
+          return false;  // a visible window of its own owns it
+        }
+      }
+      return true;
+    }
+    if (tid != target_tid) {
+      return false;
+    }
     if (!(style & WS_POPUP) || (style & WS_CAPTION) == WS_CAPTION) {
       return false;
     }
     return true;
   }
 
+  /** An owned window with its own caption (dialog, tool window): the client
+   *  shows these as windows of their own rather than as part of the owner. */
+  inline bool is_owned_dialog(HWND target, HWND hwnd) {
+    if (!is_popup_of(target, hwnd)) {
+      return false;
+    }
+    const LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+    return (style & WS_CAPTION) == WS_CAPTION;
+  }
+
   struct popup_t {
     HWND hwnd;
     RECT rect;  ///< outer rect in virtual-desktop pixels
+    bool dialog = false;  ///< is_owned_dialog
   };
 
   /**
@@ -105,7 +130,8 @@ namespace app_window_layout {
       if (is_popup_of(c->target, hwnd)) {
         RECT r {};
         if (frame_rect(hwnd, r)) {
-          c->out.push_back({hwnd, r});
+          const LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+          c->out.push_back({hwnd, r, (style & WS_CAPTION) == WS_CAPTION});
         }
       }
       return TRUE;

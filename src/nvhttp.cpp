@@ -4120,6 +4120,7 @@ namespace nvhttp {
       {"rect", {layout.rect[0], layout.rect[1], layout.rect[2], layout.rect[3]}},
       {"anchor", {layout.anchor[0], layout.anchor[1]}},
       {"popups", nlohmann::json::array()},
+      {"children", nlohmann::json::array()},
       {"radius", layout.radius},
       {"dpi", layout.dpi},
       {"caption", layout.caption},
@@ -4129,6 +4130,11 @@ namespace nvhttp {
       {"etag", std::to_string(layout.etag)},
     };
     for (const auto &p : layout.popups) out["popups"].push_back({p[0], p[1], p[2], p[3]});
+    for (const auto &c : layout.children) {
+      char handle[32];
+      snprintf(handle, sizeof(handle), "0x%llx", static_cast<unsigned long long>(c.handle));
+      out["children"].push_back({{"hwnd", handle}, {"rect", {c.rect[0], c.rect[1], c.rect[2], c.rect[3]}}, {"title", c.title}, {"caption", c.caption}});
+    }
     write_json(response, out);
   }
 

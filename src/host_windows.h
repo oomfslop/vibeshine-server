@@ -74,7 +74,14 @@ namespace host_windows {
     bool valid = false;
     int rect[4] {0, 0, 0, 0};  ///< outer rect (restored placement when minimized)
     int anchor[2] {0, 0};  ///< canvas position of rect's top-left
-    std::vector<std::array<int, 4>> popups;  ///< outer rects in virtual-desktop pixels, bottom-most first
+    std::vector<std::array<int, 4>> popups;  ///< caption-less popups: outer rects in virtual-desktop pixels, bottom-most first
+    struct child_t {
+      std::uint64_t handle = 0;
+      int rect[4] {0, 0, 0, 0};  ///< outer rect in virtual-desktop pixels
+      std::string title;
+      int caption = 0;
+    };
+    std::vector<child_t> children;  ///< owned windows with a caption (dialogs), shown by the client as windows of their own
     int radius = 0;  ///< corner radius in pixels the OS applies to the window and its popups (0 when square)
     int dpi = 96;  ///< the window's current DPI (changes when it lands on a differently scaled display)
     int caption = 0;
@@ -96,12 +103,13 @@ namespace host_windows {
    *  empty token when the window's display is already fast enough. */
   std::shared_ptr<void> lease_fast_display(std::uint64_t handle, int fps);
 
-  /** Keep the window where it is for the session: input is mapped from the
+  /** Keep the window where it is for the session (and its owned dialogs on
+   *  the canvas_w x canvas_h canvas around it): input is mapped from the
    *  pinned origin and anything that moves the window on the host (a drag
    *  the app handles itself from forwarded input, edge snapping) is undone
    *  within milliseconds, so there is no feedback between cursor and window.
    *  Our own moves (slide-to-fit on resize) update the pin. */
-  std::shared_ptr<void> pin_position(std::uint64_t handle);
+  std::shared_ptr<void> pin_position(std::uint64_t handle, int canvas_w = 0, int canvas_h = 0);
   /** Pinned outer-rect origin, when pinned. */
   bool pinned_position(std::uint64_t handle, int &x, int &y);
 

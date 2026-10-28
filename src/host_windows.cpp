@@ -278,7 +278,22 @@ namespace host_windows {
       for (const auto &p : app_window_layout::popup_windows(hwnd)) {
         const int l = std::max<int>(p.rect.left, cx0), t = std::max<int>(p.rect.top, cy0);
         const int r = std::min<int>(p.rect.right, cx0 + canvas_w), b = std::min<int>(p.rect.bottom, cy0 + canvas_h);
-        if (r > l && b > t) out.popups.push_back({l, t, r - l, b - t});
+        if (r <= l || b <= t) continue;
+        if (p.dialog) {
+          layout_t::child_t child;
+          child.handle = reinterpret_cast<std::uintptr_t>(p.hwnd);
+          child.rect[0] = l;
+          child.rect[1] = t;
+          child.rect[2] = r - l;
+          child.rect[3] = b - t;
+          child.title = window_title(p.hwnd);
+          RECT cr {};
+          POINT co {0, 0};
+          if (GetClientRect(p.hwnd, &cr) && ClientToScreen(p.hwnd, &co)) child.caption = std::max(0L, static_cast<LONG>(co.y - p.rect.top));
+          out.children.push_back(std::move(child));
+        } else {
+          out.popups.push_back({l, t, r - l, b - t});
+        }
       }
       if (app_window_layout::rounded_corners_os() && !IsZoomed(hwnd)) {
         const UINT dpi = GetDpiForWindow(hwnd);
@@ -299,6 +314,12 @@ namespace host_windows {
     mix(static_cast<std::uint32_t>(out.anchor[1]));
     for (const auto &p : out.popups) {
       for (int v : p) mix(static_cast<std::uint32_t>(v));
+    }
+    for (const auto &c : out.children) {
+      mix(c.handle);
+      for (int v : c.rect) mix(static_cast<std::uint32_t>(v));
+      mix(c.caption);
+      for (unsigned char ch : c.title) mix(ch);
     }
     mix(out.radius);
     mix(out.dpi);
@@ -512,6 +533,7 @@ namespace host_windows {
       HWND hwnd = nullptr;
       POINT origin {};  ///< pinned frame-rect origin
       POINT before {};  ///< where the window was before the session parked it
+      int canvas_w = 0, canvas_h = 0;  ///< canvas the client can show (0 = unknown)
       std::atomic<bool> stop {false};
     };
     std::mutex g_pins_mutex;
@@ -537,7 +559,7 @@ namespace host_windows {
     }
   }  // namespace
 
-  std::shared_ptr<void> pin_position(std::uint64_t handle) {
+  std::shared_ptr<void> pin_position(std::uint64_t handle, int canvas_w, int canvas_h) {
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
     int rect[4];
     if (!frame_rect(handle, rect)) return {};
@@ -562,6 +584,8 @@ namespace host_windows {
     pin->hwnd = hwnd;
     pin->origin = {rect[0], rect[1]};
     pin->before = before;
+    pin->canvas_w = canvas_w;
+    pin->canvas_h = canvas_h;
     {
       std::lock_guard lock(g_pins_mutex);
       g_pins[hwnd] = pin;
@@ -575,6 +599,47 @@ namespace host_windows {
         RECT frame {};
         if (FAILED(DwmGetWindowAttribute(pin->hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)))) continue;
         const POINT want = pin->origin;
+        if (pin->canvas_w > 0 && pin->canvas_h > 0) {
+          // Owned dialogs are shown by the client as windows of their own,
+          // cut from the same canvas: keep them inside it (once, when they
+          // first stray outside; their host position is otherwise theirs).
+          int ax = 0, ay = 0;
+          app_window_layout::canvas_anchor(pin->canvas_w, pin->canvas_h, frame.right - frame.left, frame.bottom - frame.top, ax, ay);
+          // The client shows each dialog in a window of its own, cut from the
+          // same canvas as the parent, so on the canvas a dialog must not sit
+          // on top of the parent (the parent's picture would include it).
+          // Park dialogs beside the parent: to its right, else below it.
+          const LONG cx0 = want.x - ax, cy0 = want.y - ay;
+          const LONG cx1 = cx0 + pin->canvas_w, cy1 = cy0 + pin->canvas_h;
+          LONG right_y = frame.top, below_x = frame.left;
+          for (const auto &p : app_window_layout::popup_windows(pin->hwnd)) {
+            if (!p.dialog) continue;
+            const LONG w = p.rect.right - p.rect.left, h = p.rect.bottom - p.rect.top;
+            RECT overlap {};
+            const bool over_parent = IntersectRect(&overlap, &p.rect, &frame) != 0;
+            const bool inside = p.rect.left >= cx0 && p.rect.top >= cy0 && p.rect.right <= cx1 && p.rect.bottom <= cy1;
+            if (!over_parent && inside) {
+              continue;  // already parked somewhere fine
+            }
+            LONG x = p.rect.left, y = p.rect.top;
+            if (frame.right + 8 + w <= cx1 && right_y + h <= cy1) {
+              x = frame.right + 8;
+              y = right_y;
+              right_y += h + 8;
+            } else if (frame.bottom + 8 + h <= cy1 && below_x + w <= cx1) {
+              x = below_x;
+              y = frame.bottom + 8;
+              below_x += w + 8;
+            } else {
+              // No room beside it: at least keep it on the canvas.
+              x = std::max(cx0, std::min(x, cx1 - w));
+              y = std::max(cy0, std::min(y, cy1 - h));
+            }
+            if (x != p.rect.left || y != p.rect.top) {
+              move_frame_to(p.hwnd, static_cast<int>(x), static_cast<int>(y));
+            }
+          }
+        }
         if (frame.left != want.x || frame.top != want.y) {
           move_frame_to(pin->hwnd, want.x, want.y);
           ++restores;
@@ -877,7 +942,7 @@ namespace host_windows {
     return {};
   }
 
-  std::shared_ptr<void> pin_position(std::uint64_t) {
+  std::shared_ptr<void> pin_position(std::uint64_t, int, int) {
     return {};
   }
 

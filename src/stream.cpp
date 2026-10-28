@@ -44,6 +44,9 @@ extern "C" {
 #include "deferred_stream_start_policy.h"
 #include "display_helper_integration.h"
 #include "host_windows.h"
+#ifdef _WIN32
+  #include "platform/windows/app_window_layout.h"
+#endif
 #include "globals.h"
 #include "hardware_metrics_session.h"
 #include "host_stats.h"
@@ -4002,7 +4005,8 @@ namespace stream {
         session->audio_disabled = true;
         // Per-window capture runs at the window's monitor refresh rate.
         session->app_window_display = host_windows::lease_fast_display(launch_session.window_handle, session->config.monitor.framerate);
-        session->app_window_pin = host_windows::pin_position(launch_session.window_handle);
+        session->app_window_pin = host_windows::pin_position(launch_session.window_handle, session->config.monitor.width,
+                                                             app_window_layout::color_height(session->config.monitor.height));
       }
       BOOST_LOG(info) << "Session capture source: role=" << static_cast<int>(launch_session.role)
                       << " source=" << static_cast<int>(session->config.monitor.capture_source)
