@@ -4121,6 +4121,7 @@ namespace nvhttp {
       {"anchor", {layout.anchor[0], layout.anchor[1]}},
       {"popups", nlohmann::json::array()},
       {"radius", layout.radius},
+      {"dpi", layout.dpi},
       {"caption", layout.caption},
       {"state", layout.state},
       {"title", layout.title},

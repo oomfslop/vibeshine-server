@@ -285,6 +285,7 @@ namespace host_windows {
         out.radius = static_cast<int>(8 * (dpi ? dpi : 96) / 96);
       }
     }
+    if (const UINT dpi = GetDpiForWindow(hwnd)) out.dpi = static_cast<int>(dpi);
     // FNV-1a over the fields the client reacts to.
     std::uint64_t h = 1469598103934665603ull;
     auto mix = [&h](std::uint64_t v) {
@@ -300,6 +301,7 @@ namespace host_windows {
       for (int v : p) mix(static_cast<std::uint32_t>(v));
     }
     mix(out.radius);
+    mix(out.dpi);
     mix(out.caption);
     mix(out.focused);
     for (unsigned char c : out.state) mix(c);
@@ -504,6 +506,7 @@ namespace host_windows {
     struct pin_t {
       HWND hwnd = nullptr;
       POINT origin {};  ///< pinned frame-rect origin
+      POINT before {};  ///< where the window was before the session parked it
       std::atomic<bool> stop {false};
       std::thread thread;
     };
@@ -532,14 +535,34 @@ namespace host_windows {
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
     int rect[4];
     if (!frame_rect(handle, rect)) return {};
+    const POINT before {rect[0], rect[1]};
+    // Park the window at the top-left of its display's work area, once. The
+    // client shows it wherever it likes; on the host the only thing that
+    // matters is that every pixel of it stays reachable by injected input,
+    // and a window no larger than the display always fits from the corner.
+    if (!IsIconic(hwnd) && !IsZoomed(hwnd)) {
+      if (HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) {
+        MONITORINFO mi {};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(mon, &mi) && (rect[0] != mi.rcWork.left || rect[1] != mi.rcWork.top)) {
+          move_frame_to(hwnd, mi.rcWork.left, mi.rcWork.top);
+          if (frame_rect(handle, rect)) {
+            BOOST_LOG(info) << "App windows: parked window 0x" << std::hex << handle << std::dec << " at " << rect[0] << ',' << rect[1];
+          }
+        }
+      }
+    }
     auto pin = std::make_shared<pin_t>();
     pin->hwnd = hwnd;
     pin->origin = {rect[0], rect[1]};
+    pin->before = before;
     {
       std::lock_guard lock(g_pins_mutex);
       g_pins[hwnd] = pin;
     }
     pin->thread = std::thread([pin] {
+      unsigned restores = 0;
+      auto last_log = std::chrono::steady_clock::now() - std::chrono::seconds(2);
       while (!pin->stop.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(8));
         if (!IsWindow(pin->hwnd) || IsIconic(pin->hwnd) || IsZoomed(pin->hwnd)) continue;
@@ -548,6 +571,13 @@ namespace host_windows {
         const POINT want = pin->origin;
         if (frame.left != want.x || frame.top != want.y) {
           move_frame_to(pin->hwnd, want.x, want.y);
+          ++restores;
+          const auto now = std::chrono::steady_clock::now();
+          if (now - last_log >= std::chrono::seconds(1)) {
+            BOOST_LOG(info) << "App windows: window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(pin->hwnd) << std::dec
+                            << " was moved to " << frame.left << ',' << frame.top << " by something else; put back (" << restores << " so far)";
+            last_log = now;
+          }
         }
       }
     });
@@ -560,8 +590,15 @@ namespace host_windows {
       ~token_t() {
         pin->stop.store(true, std::memory_order_release);
         if (pin->thread.joinable()) pin->thread.join();
-        std::lock_guard lock(g_pins_mutex);
-        if (auto it = g_pins.find(pin->hwnd); it != g_pins.end() && it->second == pin) g_pins.erase(it);
+        {
+          std::lock_guard lock(g_pins_mutex);
+          if (auto it = g_pins.find(pin->hwnd); it != g_pins.end() && it->second == pin) g_pins.erase(it);
+        }
+        // Give the host user their window back where it was.
+        if (IsWindow(pin->hwnd) && !IsIconic(pin->hwnd) && !IsZoomed(pin->hwnd) &&
+            (pin->before.x != pin->origin.x || pin->before.y != pin->origin.y)) {
+          move_frame_to(pin->hwnd, pin->before.x, pin->before.y);
+        }
       }
     };
     BOOST_LOG(info) << "App windows: pinned window 0x" << std::hex << handle << std::dec << " at " << rect[0] << ',' << rect[1];
@@ -762,26 +799,6 @@ namespace host_windows {
           dh = (win.bottom - win.top) - (frame.bottom - frame.top);
         }
         if (!SetWindowPos(hwnd, nullptr, 0, 0, std::max(1, w + dw), std::max(1, h + dh), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) return false;
-        // Injected mouse input is clamped to the screen, so a window that grew
-        // past its monitor's edge would have unreachable parts: slide it back
-        // onto the work area (the window never has to sit where the client
-        // shows it; client-side positions are independent of the host's).
-        if (HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) {
-          MONITORINFO mi {};
-          mi.cbSize = sizeof(mi);
-          if (GetMonitorInfoW(mon, &mi) && SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) && GetWindowRect(hwnd, &win)) {
-            const RECT &work = mi.rcWork;
-            int shift_x = 0, shift_y = 0;
-            if (frame.right > work.right) shift_x = work.right - frame.right;
-            if (frame.left + shift_x < work.left) shift_x = work.left - frame.left;
-            if (frame.bottom > work.bottom) shift_y = work.bottom - frame.bottom;
-            if (frame.top + shift_y < work.top) shift_y = work.top - frame.top;
-            if (shift_x || shift_y) {
-              SetWindowPos(hwnd, nullptr, win.left + shift_x, win.top + shift_y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-            }
-            set_pin_origin(hwnd, frame.left + shift_x, frame.top + shift_y);
-          }
-        }
         return true;
       }
       case op_e::minimize:

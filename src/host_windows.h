@@ -76,6 +76,7 @@ namespace host_windows {
     int anchor[2] {0, 0};  ///< canvas position of rect's top-left
     std::vector<std::array<int, 4>> popups;  ///< outer rects in virtual-desktop pixels, bottom-most first
     int radius = 0;  ///< corner radius in pixels the OS applies to the window and its popups (0 when square)
+    int dpi = 96;  ///< the window's current DPI (changes when it lands on a differently scaled display)
     int caption = 0;
     std::string state;
     std::string title;
