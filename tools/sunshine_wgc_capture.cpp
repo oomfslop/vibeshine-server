@@ -3115,19 +3115,42 @@ float4 ps(VSOut i) : SV_Target {
       LONG dx = ax + (cap->rect.left - target_rect.left);
       LONG dy = ay + (cap->rect.top - target_rect.top);
       UINT sx = 0, sy = 0, w = cap->latest_w, h = cap->latest_h;
+      // A maximized window's capture covers GetWindowRect, whose invisible
+      // borders hang off-screen; the picture (and the input mapping) use the
+      // DWM frame, so skip the border part of the texture.
+      {
+        RECT raw {};
+        const LONG frame_w = cap->rect.right - cap->rect.left, frame_h = cap->rect.bottom - cap->rect.top;
+        if (GetWindowRect(cap->hwnd, &raw) && (raw.right - raw.left) == static_cast<LONG>(w) && (raw.bottom - raw.top) == static_cast<LONG>(h) &&
+            (frame_w != static_cast<LONG>(w) || frame_h != static_cast<LONG>(h))) {
+          const LONG bx = cap->rect.left - raw.left, by = cap->rect.top - raw.top;
+          if (bx > 0 && bx < static_cast<LONG>(w)) {
+            sx = static_cast<UINT>(bx);
+            w = static_cast<UINT>(std::min<LONG>(frame_w, static_cast<LONG>(w) - bx));
+          }
+          if (by > 0 && by < static_cast<LONG>(h)) {
+            sy = static_cast<UINT>(by);
+            h = static_cast<UINT>(std::min<LONG>(frame_h, static_cast<LONG>(h) - by));
+          }
+        }
+      }
       if (dx < 0) {
-        sx = static_cast<UINT>(-dx);
+        if (static_cast<UINT>(-dx) >= w) continue;
+        sx += static_cast<UINT>(-dx);
+        w -= static_cast<UINT>(-dx);
         dx = 0;
       }
       if (dy < 0) {
-        sy = static_cast<UINT>(-dy);
+        if (static_cast<UINT>(-dy) >= h) continue;
+        sy += static_cast<UINT>(-dy);
+        h -= static_cast<UINT>(-dy);
         dy = 0;
       }
-      if (sx >= w || sy >= h || dx >= static_cast<LONG>(_canvas_w) || dy >= static_cast<LONG>(_color_h)) {
+      if (w == 0 || h == 0 || dx >= static_cast<LONG>(_canvas_w) || dy >= static_cast<LONG>(_color_h)) {
         continue;
       }
-      w = std::min<UINT>(w - sx, _canvas_w - static_cast<UINT>(dx));
-      h = std::min<UINT>(h - sy, _color_h - static_cast<UINT>(dy));
+      w = std::min<UINT>(w, _canvas_w - static_cast<UINT>(dx));
+      h = std::min<UINT>(h, _color_h - static_cast<UINT>(dy));
       draw_quad(*cap, sx, sy, w, h, static_cast<UINT>(dx), static_cast<UINT>(dy), false);
       draw_quad(*cap, sx, sy, w, h, static_cast<UINT>(dx), static_cast<UINT>(dy), true);
       qpc = std::max(qpc, cap->latest_qpc);

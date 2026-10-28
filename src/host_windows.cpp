@@ -400,20 +400,25 @@ namespace host_windows {
       bool moved = false;
       ~fast_display_lease_t() {
         if (moved && IsWindow(hwnd)) {
-          SetWindowPos(hwnd, nullptr, original.left, original.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+          SetWindowPos(hwnd, nullptr, original.left, original.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
         }
         auto &st = fast_display_state();
         std::lock_guard lock(st.mutex);
         if (--st.leases <= 0) {
           st.leases = 0;
           if (st.created) {
-            if (VDISPLAY::removeVirtualDisplay(st.guid)) {
-              BOOST_LOG(info) << "App windows: removed the fast virtual display";
-            } else {
-              BOOST_LOG(warning) << "App windows: failed to remove the fast virtual display";
-            }
             st.created = false;
             st.device.clear();
+            // Driver round-trips take a while; the session teardown that
+            // releases us holds the stream lifecycle lock, so do it elsewhere.
+            const GUID guid = st.guid;
+            std::thread([guid] {
+              if (VDISPLAY::removeVirtualDisplay(guid)) {
+                BOOST_LOG(info) << "App windows: removed the fast virtual display";
+              } else {
+                BOOST_LOG(warning) << "App windows: failed to remove the fast virtual display";
+              }
+            }).detach();
           }
         }
       }
@@ -493,7 +498,7 @@ namespace host_windows {
       LONG y = tmi.rcWork.top + (lease->original.top - cmi.rcMonitor.top);
       x = std::max(tmi.rcWork.left, std::min(x, tmi.rcWork.right - ww));
       y = std::max(tmi.rcWork.top, std::min(y, tmi.rcWork.bottom - wh));
-      if (SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)) {
+      if (SetWindowPos(hwnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)) {
         lease->moved = true;
         BOOST_LOG(info) << "App windows: moved window 0x" << std::hex << handle << std::dec << " to the " << monitor_refresh_hz(target) << " Hz display for a " << fps << " fps session";
       }
@@ -508,7 +513,6 @@ namespace host_windows {
       POINT origin {};  ///< pinned frame-rect origin
       POINT before {};  ///< where the window was before the session parked it
       std::atomic<bool> stop {false};
-      std::thread thread;
     };
     std::mutex g_pins_mutex;
     std::map<HWND, std::shared_ptr<pin_t>> g_pins;
@@ -520,7 +524,9 @@ namespace host_windows {
         dx = frame.left - win.left;
         dy = frame.top - win.top;
       }
-      SetWindowPos(hwnd, nullptr, x - dx, y - dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+      // Asynchronous: never wait on the window's thread (it may be inside a
+      // modal loop or waiting on us), so nothing here can deadlock a teardown.
+      SetWindowPos(hwnd, nullptr, x - dx, y - dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
 
     void set_pin_origin(HWND hwnd, int x, int y) {
@@ -560,7 +566,7 @@ namespace host_windows {
       std::lock_guard lock(g_pins_mutex);
       g_pins[hwnd] = pin;
     }
-    pin->thread = std::thread([pin] {
+    std::thread([pin] {
       unsigned restores = 0;
       auto last_log = std::chrono::steady_clock::now() - std::chrono::seconds(2);
       while (!pin->stop.load(std::memory_order_acquire)) {
@@ -580,7 +586,12 @@ namespace host_windows {
           }
         }
       }
-    });
+      // Give the host user their window back where it was.
+      if (IsWindow(pin->hwnd) && !IsIconic(pin->hwnd) && !IsZoomed(pin->hwnd) &&
+          (pin->before.x != pin->origin.x || pin->before.y != pin->origin.y)) {
+        move_frame_to(pin->hwnd, pin->before.x, pin->before.y);
+      }
+    }).detach();
     struct token_t {
       std::shared_ptr<pin_t> pin;
       explicit token_t(std::shared_ptr<pin_t> p):
@@ -588,17 +599,13 @@ namespace host_windows {
       token_t(const token_t &) = delete;
       token_t &operator=(const token_t &) = delete;
       ~token_t() {
-        pin->stop.store(true, std::memory_order_release);
-        if (pin->thread.joinable()) pin->thread.join();
+        // The watcher thread exits on its own (it is detached) and moves the
+        // window back where it was; nothing here waits on anything.
         {
           std::lock_guard lock(g_pins_mutex);
           if (auto it = g_pins.find(pin->hwnd); it != g_pins.end() && it->second == pin) g_pins.erase(it);
         }
-        // Give the host user their window back where it was.
-        if (IsWindow(pin->hwnd) && !IsIconic(pin->hwnd) && !IsZoomed(pin->hwnd) &&
-            (pin->before.x != pin->origin.x || pin->before.y != pin->origin.y)) {
-          move_frame_to(pin->hwnd, pin->before.x, pin->before.y);
-        }
+        pin->stop.store(true, std::memory_order_release);
       }
     };
     BOOST_LOG(info) << "App windows: pinned window 0x" << std::hex << handle << std::dec << " at " << rect[0] << ',' << rect[1];
@@ -704,9 +711,34 @@ namespace host_windows {
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
     int frame[4];
     if (!IsWindow(hwnd) || IsIconic(hwnd) || !frame_rect(handle, frame)) return "none";
-    const LPARAM pt = MAKELPARAM(static_cast<WORD>(frame[0] + x), static_cast<WORD>(frame[1] + y));
+    const POINT screen {frame[0] + x, frame[1] + y};
+    const LPARAM pt = MAKELPARAM(static_cast<WORD>(screen.x), static_cast<WORD>(screen.y));
     DWORD_PTR result = HTNOWHERE;
     if (!SendMessageTimeoutW(hwnd, WM_NCHITTEST, 0, pt, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &result)) return "none";
+    if (static_cast<LRESULT>(result) == HTCLIENT) {
+      // Apps that draw their own title bar in a child window (XAML islands:
+      // Explorer, many WinUI apps) answer HTCLIENT at the top level and put
+      // the real caption/button hit-test in the island's window. Ask the
+      // windows under the point, deepest first.
+      HWND child = hwnd;
+      std::vector<HWND> chain;
+      for (int depth = 0; depth < 8; ++depth) {
+        POINT client = screen;
+        ScreenToClient(child, &client);
+        HWND next = RealChildWindowFromPoint(child, client);
+        if (!next || next == child) break;
+        chain.push_back(next);
+        child = next;
+      }
+      for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        DWORD_PTR r = HTNOWHERE;
+        if (SendMessageTimeoutW(*it, WM_NCHITTEST, 0, pt, SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &r) &&
+            r != HTCLIENT && r != HTNOWHERE && r != static_cast<DWORD_PTR>(HTTRANSPARENT) && r != HTERROR) {
+          result = r;
+          break;
+        }
+      }
+    }
     switch (static_cast<LRESULT>(result)) {
       case HTCAPTION:
       case HTSYSMENU:
