@@ -2535,7 +2535,7 @@ namespace confighttp {
         input_tree.contains("virtual_display_layout") ||
         input_tree.contains("config_overrides") ||
         input_tree.contains("prefer_10bit_sdr");
-      const bool has_extended_fields = has_device_fields || input_tree.contains("enabled") || input_tree.contains("allow_sleep") || input_tree.contains("allow_clipboard");
+      const bool has_extended_fields = has_device_fields || input_tree.contains("enabled") || input_tree.contains("allow_sleep") || input_tree.contains("allow_clipboard") || input_tree.contains("allow_windows");
 
       if (!has_extended_fields) {
         output_tree["status"] = nvhttp::set_client_hdr_profile(uuid, hdr_profile.value_or(""));
@@ -2551,7 +2551,11 @@ namespace confighttp {
         bad_request(response, request, "allow_clipboard must be a boolean");
         return;
       }
-      const bool has_grant_fields = input_tree.contains("allow_sleep") || input_tree.contains("allow_clipboard");
+      if (input_tree.contains("allow_windows") && !input_tree["allow_windows"].is_boolean()) {
+        bad_request(response, request, "allow_windows must be a boolean");
+        return;
+      }
+      const bool has_grant_fields = input_tree.contains("allow_sleep") || input_tree.contains("allow_clipboard") || input_tree.contains("allow_windows");
       // Apply a requested disable before introducing a separate sleep grant.
       if (input_tree.contains("enabled")) {
         output_tree["enabled_updated"] = nvhttp::set_client_enabled(uuid, input_tree.value("enabled", true));
@@ -2572,6 +2576,14 @@ namespace confighttp {
       if (input_tree.contains("allow_clipboard")) {
         output_tree["allow_clipboard_updated"] = nvhttp::set_client_clipboard_allowed(uuid, input_tree["allow_clipboard"].get<bool>());
         if (!output_tree["allow_clipboard_updated"].get<bool>()) {
+          output_tree["status"] = false;
+          send_response(response, output_tree);
+          return;
+        }
+      }
+      if (input_tree.contains("allow_windows")) {
+        output_tree["allow_windows_updated"] = nvhttp::set_client_windows_allowed(uuid, input_tree["allow_windows"].get<bool>());
+        if (!output_tree["allow_windows_updated"].get<bool>()) {
           output_tree["status"] = false;
           send_response(response, output_tree);
           return;

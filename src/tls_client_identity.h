@@ -28,6 +28,7 @@ namespace nvhttp::tls_identity {
     bool enabled = false;
     bool allow_sleep = false;
     bool allow_clipboard = false;
+    bool allow_windows = false;
   };
 
   struct identity_t {
@@ -35,6 +36,7 @@ namespace nvhttp::tls_identity {
     std::string name;
     bool allow_sleep = false;
     bool allow_clipboard = false;
+    bool allow_windows = false;
   };
 
   struct authentication_result_t {

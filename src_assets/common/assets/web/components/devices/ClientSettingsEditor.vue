@@ -20,6 +20,7 @@ export interface ClientDeviceDraft {
   name: string;
   allowSleep: boolean;
   allowClipboard: boolean;
+  allowWindows: boolean;
   enabled: boolean;
   displayMode: string;
   displayOverrideEnabled: boolean;
@@ -428,6 +429,23 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
             />
             <span class="vs-switch__track" aria-hidden="true" />
             <span class="vs-sr-only">{{ t('ui.devices.editor.allow_clipboard') }}</span>
+          </label>
+        </SettingRow>
+        <SettingRow
+          class="client-setting-row--switch"
+          :label="t('ui.devices.editor.allow_windows')"
+          :description="t('ui.devices.editor.allow_windows_description')"
+          :control-id="`${controlIdPrefix}-allow-windows`"
+        >
+          <label class="vs-switch">
+            <input
+              :id="`${controlIdPrefix}-allow-windows`"
+              v-model="draft.allowWindows"
+              type="checkbox"
+              :disabled="busy"
+            />
+            <span class="vs-switch__track" aria-hidden="true" />
+            <span class="vs-sr-only">{{ t('ui.devices.editor.allow_windows') }}</span>
           </label>
         </SettingRow>
         <SettingRow :label="t('pin.device_name')" :control-id="`${controlIdPrefix}-name`">

@@ -383,6 +383,41 @@ namespace platf::img {
     }
   }  // namespace
 
+  bool encode_hicon_to_png_bytes(void *hicon_raw, std::string &out_png) {
+    CoInitGuard co;
+    winrt::com_ptr<IWICImagingFactory> factory;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(factory.put())))) return false;
+    winrt::com_ptr<IWICBitmap> bmp;
+    if (FAILED(factory->CreateBitmapFromHICON(static_cast<HICON>(hicon_raw), bmp.put()))) return false;
+    winrt::com_ptr<IWICFormatConverter> conv;
+    if (FAILED(factory->CreateFormatConverter(conv.put()))) return false;
+    if (FAILED(conv->Initialize(bmp.get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) return false;
+    winrt::com_ptr<IStream> stream;
+    if (FAILED(CreateStreamOnHGlobal(nullptr, TRUE, stream.put()))) return false;
+    winrt::com_ptr<IWICBitmapEncoder> encoder;
+    if (FAILED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.put()))) return false;
+    if (FAILED(encoder->Initialize(stream.get(), WICBitmapEncoderNoCache))) return false;
+    winrt::com_ptr<IWICBitmapFrameEncode> frame;
+    if (FAILED(encoder->CreateNewFrame(frame.put(), nullptr))) return false;
+    if (FAILED(frame->Initialize(nullptr))) return false;
+    UINT w = 0, h = 0;
+    conv->GetSize(&w, &h);
+    frame->SetSize(w, h);
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+    frame->SetPixelFormat(&fmt);
+    if (FAILED(frame->WriteSource(conv.get(), nullptr))) return false;
+    if (FAILED(frame->Commit()) || FAILED(encoder->Commit())) return false;
+    HGLOBAL global = nullptr;
+    if (FAILED(GetHGlobalFromStream(stream.get(), &global)) || !global) return false;
+    const SIZE_T size = GlobalSize(global);
+    const void *data = GlobalLock(global);
+    if (!data) return false;
+    out_png.assign(static_cast<const char *>(data), size);
+    GlobalUnlock(global);
+    // The stream owns the HGLOBAL (fDeleteOnRelease) and frees it on release.
+    return !out_png.empty();
+  }
+
   int probe_largest_icon_size(const std::wstring &exe_path) {
     return scan_executable_icons(exe_path).best_dim;
   }

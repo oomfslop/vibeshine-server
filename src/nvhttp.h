@@ -211,6 +211,9 @@ namespace nvhttp {
   // Administrator opt-in for Apollo-style clipboard sync (GET/POST
   // /actions/clipboard) by this client while it is streaming. Off by default.
   bool set_client_clipboard_allowed(std::string_view uuid, bool allowed);
+  // Administrator opt-in for app-window streaming: listing the host's
+  // windows, fetching their icons, acting on them (/actions/windows). Off by default.
+  bool set_client_windows_allowed(std::string_view uuid, bool allowed);
   bool has_client_uuid(std::string_view uuid);
   std::string get_cert_by_uuid(std::string_view uuid);
 

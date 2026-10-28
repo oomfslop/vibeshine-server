@@ -11,6 +11,8 @@ namespace platf::img {
   // Return the largest icon dimension (in pixels) embedded in an executable/DLL, or 0 if none.
   // Cheap: reads only the icon directory resources, not the pixel data.
   int probe_largest_icon_size(const std::wstring &exe_path);
+  /** Encode a window/class icon to PNG bytes (straight-alpha BGRA). */
+  bool encode_hicon_to_png_bytes(void *hicon, std::string &out_png);
 
   // Extract the largest icon embedded in an executable/DLL and write it as a 96 DPI PNG.
   // out_native_size receives the icon's native pixel dimension. Returns false when the file

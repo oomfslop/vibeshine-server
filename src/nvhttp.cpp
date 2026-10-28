@@ -90,6 +90,7 @@
 
 #include "process.h"
 #include "rtsp.h"
+#include "host_windows.h"
 #include "rtsp_pending_policy.h"
 #include "stream.h"
 #include "system_tray.h"
@@ -2073,6 +2074,7 @@ namespace nvhttp {
     bool enabled = true;
     bool allow_sleep = false;
     bool allow_clipboard = false;
+    bool allow_windows = false;
     bool prefer_10bit_sdr = false;
     std::optional<std::int64_t> last_seen;
     std::unordered_map<std::string, std::string> config_overrides;
@@ -2124,7 +2126,7 @@ namespace nvhttp {
     std::vector<tls_identity::client_record_view_t> views;
     views.reserve(client.named_devices.size());
     for (const auto &record : client.named_devices) {
-      views.push_back({record.uuid, record.name, record.cert, record.enabled, record.allow_sleep, record.allow_clipboard});
+      views.push_back({record.uuid, record.name, record.cert, record.enabled, record.allow_sleep, record.allow_clipboard, record.allow_windows});
     }
     return views;
   }
@@ -2201,6 +2203,7 @@ namespace nvhttp {
       named_cert_node.put("enabled"s, named_cert.enabled);
       named_cert_node.put("allow_sleep"s, named_cert.allow_sleep);
       named_cert_node.put("allow_clipboard"s, named_cert.allow_clipboard);
+      named_cert_node.put("allow_windows"s, named_cert.allow_windows);
       named_cert_node.put("requested_resolution_only"s, named_cert.requested_resolution_only);
       if (!named_cert.hdr_profile.empty()) {
         named_cert_node.put("hdr_profile"s, named_cert.hdr_profile);
@@ -2387,6 +2390,7 @@ namespace nvhttp {
               named_cert.enabled = element.get<bool>("enabled", true);
               named_cert.allow_sleep = element.get<bool>("allow_sleep", false);
               named_cert.allow_clipboard = element.get<bool>("allow_clipboard", false);
+              named_cert.allow_windows = element.get<bool>("allow_windows", false);
               named_cert.requested_resolution_only = element.get<bool>("requested_resolution_only", false);
               named_cert.prefer_10bit_sdr = element.get<bool>("prefer_10bit_sdr", false);
               if (auto last_seen = element.get_optional<std::int64_t>("last_seen")) {
@@ -3894,6 +3898,9 @@ namespace nvhttp {
     constexpr std::uint32_t list_apps = 1u << 24;
     constexpr std::uint32_t view_streams = 1u << 25;
     constexpr std::uint32_t launch_apps = 1u << 26;
+    // Fork extension (not in Apollo): the client may list, inspect and stream
+    // individual host windows (app-window mode).
+    constexpr std::uint32_t app_windows = 1u << 30;
     constexpr std::uint32_t paired_default = input_controller | input_touch | input_pen | input_mouse | input_keyboard |
                                              list_apps | view_streams | launch_apps;
   }  // namespace apollo_permission_e
@@ -3954,6 +3961,112 @@ namespace nvhttp {
     response->write(SimpleWeb::StatusCode::success_ok);
   }
 
+  // App-window streaming support: list the host's windows, fetch an icon,
+  // act on a window. Gated by the per-device "allow_windows" grant.
+  namespace {
+    bool windows_request_allowed(resp_https_t &response, req_https_t &request, const char *what) {
+      const auto identity = resolve_client_identity_from_request(request);
+      if (identity.uuid.empty()) {
+        response->write(SimpleWeb::StatusCode::client_error_unauthorized);
+        response->close_connection_after_response = true;
+        return false;
+      }
+      if (!identity.allow_windows) {
+        BOOST_LOG(info) << "Window " << what << " denied for client [" << identity.name
+                        << "]: enable \"Allow app-window streaming\" for this device in the web UI.";
+        response->write(SimpleWeb::StatusCode::client_error_unauthorized);
+        response->close_connection_after_response = true;
+        return false;
+      }
+      if (!host_windows::supported()) {
+        response->write(SimpleWeb::StatusCode::server_error_not_implemented);
+        response->close_connection_after_response = true;
+        return false;
+      }
+      return true;
+    }
+
+    std::uint64_t parse_window_handle(const std::string &text) {
+      try {
+        return std::stoull(text, nullptr, 0);
+      } catch (...) {
+        return 0;
+      }
+    }
+
+    void write_json(resp_https_t &response, const nlohmann::json &body, SimpleWeb::StatusCode code = SimpleWeb::StatusCode::success_ok) {
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", "application/json");
+      headers.emplace("Cache-Control", "no-store");
+      response->write(code, body.dump(), headers);
+    }
+  }  // namespace
+
+  void get_host_windows(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    if (!windows_request_allowed(response, request, "list")) return;
+    nlohmann::json out;
+    out["windows"] = nlohmann::json::array();
+    for (const auto &w : host_windows::list()) {
+      char handle[32];
+      snprintf(handle, sizeof(handle), "0x%llx", static_cast<unsigned long long>(w.handle));
+      out["windows"].push_back({
+        {"hwnd", handle},
+        {"title", w.title},
+        {"process", w.process},
+        {"pid", w.pid},
+        {"rect", {w.rect[0], w.rect[1], w.rect[2], w.rect[3]}},
+        {"client", {w.client[0], w.client[1], w.client[2], w.client[3]}},
+        {"caption", w.caption},
+        {"borders", {w.borders[0], w.borders[1], w.borders[2], w.borders[3]}},
+        {"state", w.state},
+        {"focused", w.focused},
+        {"icon", w.icon_key},
+        {"monitor", w.monitor},
+        {"dpi", w.dpi},
+      });
+    }
+    write_json(response, out);
+  }
+
+  void get_host_window_icon(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    if (!windows_request_allowed(response, request, "icon")) return;
+    const auto args = request->parse_query_string();
+    const auto handle = parse_window_handle(get_arg(args, "hwnd", ""));
+    const auto png = handle ? host_windows::icon_png(handle) : std::string {};
+    if (png.empty()) {
+      response->write(SimpleWeb::StatusCode::client_error_not_found);
+      response->close_connection_after_response = true;
+      return;
+    }
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "image/png");
+    headers.emplace("Cache-Control", "private, max-age=3600");
+    response->write(SimpleWeb::StatusCode::success_ok, png, headers);
+  }
+
+  void post_host_window_action(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    if (!windows_request_allowed(response, request, "action")) return;
+    const auto args = request->parse_query_string();
+    const auto handle = parse_window_handle(get_arg(args, "hwnd", ""));
+    host_windows::op_e op;
+    if (!handle || !host_windows::parse_op(get_arg(args, "op", ""), op)) {
+      write_json(response, {{"status", false}, {"error", "hwnd and a valid op are required"}}, SimpleWeb::StatusCode::client_error_bad_request);
+      return;
+    }
+    auto num = [&](const char *name) {
+      try {
+        return std::stoi(get_arg(args, name, "0"));
+      } catch (...) {
+        return 0;
+      }
+    };
+    const bool ok = host_windows::action(handle, op, num("x"), num("y"), num("w"), num("h"));
+    write_json(response, {{"status", ok}}, ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_not_found);
+  }
+
   template<class T>
   void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
@@ -3974,6 +4087,9 @@ namespace nvhttp {
         apollo_permissions = apollo_permission_e::paired_default;
         if (identity.allow_clipboard) {
           apollo_permissions |= apollo_permission_e::clipboard_set | apollo_permission_e::clipboard_read;
+        }
+        if (identity.allow_windows && host_windows::supported()) {
+          apollo_permissions |= apollo_permission_e::app_windows;
         }
       }
     }
@@ -4199,6 +4315,7 @@ namespace nvhttp {
       named_cert_node["enabled"] = named_cert.enabled;
       named_cert_node["allow_sleep"] = named_cert.allow_sleep;
       named_cert_node["allow_clipboard"] = named_cert.allow_clipboard;
+      named_cert_node["allow_windows"] = named_cert.allow_windows;
       named_cert_node["hdr_profile"] = named_cert.hdr_profile;
       named_cert_node["display_mode"] = named_cert.display_mode;
       named_cert_node["output_name_override"] = named_cert.output_name_override;
@@ -6558,6 +6675,15 @@ launch_session->exact_target_hold.reset();
     https_server.resource["^/actions/clipboard$"]["POST"] = [run_blocking_nvhttp](auto response, auto request) {
       run_blocking_nvhttp(response, "clipboard", [response, request] { set_clipboard(response, request); });
     };
+    https_server.resource["^/actions/windows$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
+      run_discovery_nvhttp([response, request] { get_host_windows(response, request); });
+    };
+    https_server.resource["^/actions/window-icon$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
+      run_discovery_nvhttp([response, request] { get_host_window_icon(response, request); });
+    };
+    https_server.resource["^/actions/window$"]["POST"] = [run_blocking_nvhttp](auto response, auto request) {
+      run_blocking_nvhttp(response, "window", [response, request] { post_host_window_action(response, request); });
+    };
     https_server.resource["^/power-actions/v1$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
       run_discovery_nvhttp([response, request] { get_power_action_capabilities(response, request); });
     };
@@ -6901,6 +7027,23 @@ launch_session->exact_target_hold.reset();
       const bool saved = fresh_state || save_state_snapshot_locked(client_root);
       // Same rule as the sleep grant: a failed grant cannot expand authority.
       if (!saved && allowed) client.allow_clipboard = previous;
+      return saved;
+    }
+    return false;
+  }
+
+  bool set_client_windows_allowed(std::string_view uuid, bool allowed) {
+    const bool fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
+    if (!fresh_state && !authorization_state_ready.load(std::memory_order_acquire)) return false;
+    if (!fresh_state) statefile::migrate_recent_state_keys();
+    std::lock_guard state_lock(statefile::state_mutex());
+    std::lock_guard client_lock(client_mutex);
+    for (auto &client : client_root.named_devices) {
+      if (client.uuid != uuid) continue;
+      const bool previous = client.allow_windows;
+      client.allow_windows = allowed;
+      const bool saved = fresh_state || save_state_snapshot_locked(client_root);
+      if (!saved && allowed) client.allow_windows = previous;
       return saved;
     }
     return false;

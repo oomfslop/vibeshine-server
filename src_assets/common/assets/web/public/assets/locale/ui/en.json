@@ -447,7 +447,9 @@
         "allow_sleep": "Allow this device to put the PC to sleep",
         "allow_sleep_description": "Separate permission for compatible clients and Windows hosts with native sleep support. Sleep requires every host application and stream to be closed. Disabled by default.",
         "allow_clipboard": "Allow clipboard sync",
-        "allow_clipboard_description": "Lets Apollo-compatible clients (Artemis, Sloplight) copy text to and from this PC's clipboard while they are streaming. Disabled by default."
+        "allow_clipboard_description": "Lets Apollo-compatible clients (Artemis, Sloplight) copy text to and from this PC's clipboard while they are streaming. Disabled by default.",
+        "allow_windows": "Allow app-window streaming",
+        "allow_windows_description": "Lets Sloplight list this PC's windows, fetch their icons, and move, resize, focus or close them, so individual apps can be streamed as separate windows. Disabled by default."
       },
       "common_settings_title": "Common host settings unavailable",
       "common_settings_unavailable": "The common host settings could not be loaded. Existing client overrides are preserved, but inherited values may be incomplete.",
