@@ -29,6 +29,7 @@ namespace app_desk {
     struct desk_state_t {
       GUID guid {};
       std::wstring device;  ///< "\\\\.\\DISPLAYn"
+      std::wstring monitor_path;  ///< device path the DPI scale is set through
       desk_t info;
       std::map<HWND, POINT> adopted;  ///< window -> frame origin before adoption
       bool open = false;  ///< a client is using it (false = idle, kept for a while)
@@ -67,6 +68,18 @@ namespace app_desk {
                           reinterpret_cast<LPARAM>(&ctx));
       if (ctx.found && rect_out) *rect_out = ctx.rect;
       return ctx.found;
+    }
+
+    /** Effective DPI of a monitor (0 when unknown). */
+    int monitor_dpi(HMONITOR mon) {
+      using fn_t = HRESULT(WINAPI *)(HMONITOR, int, UINT *, UINT *);
+      static fn_t fn = [] {
+        HMODULE shcore = LoadLibraryW(L"shcore.dll");
+        return shcore ? reinterpret_cast<fn_t>(GetProcAddress(shcore, "GetDpiForMonitor")) : nullptr;
+      }();
+      UINT x = 0, y = 0;
+      if (!mon || !fn || FAILED(fn(mon, 0 /* MDT_EFFECTIVE_DPI */, &x, &y))) return 0;
+      return static_cast<int>(x);
     }
 
     /** Attach a (detached) display at the given mode, right of everything else,
@@ -146,6 +159,40 @@ namespace app_desk {
       SetWindowPos(hwnd, nullptr, x - dx, y - dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
 
+    /** A window that crosses to a display of another DPI gets WM_DPICHANGED
+     *  with a suggested, scaled frame; some apps (Explorer) take it, some
+     *  (Notepad) rescale their content but keep the frame. Once the move has
+     *  settled, give the ones that kept it the scaled frame, as a monitor
+     *  drag would have. Off this thread: the window may be slow. */
+    void settle_dpi_change(HWND hwnd, UINT dpi_before, RECT frame_before) {
+      std::thread([hwnd, dpi_before, frame_before] {
+        // The move is posted; wait for the window to be on the other DPI.
+        UINT dpi_after = dpi_before;
+        for (int i = 0; i < 20 && dpi_after == dpi_before; ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          if (!IsWindow(hwnd)) return;
+          dpi_after = GetDpiForWindow(hwnd);
+        }
+        if (!dpi_before || !dpi_after || dpi_after == dpi_before || IsIconic(hwnd)) {
+          BOOST_LOG(debug) << "Desk: window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec << " dpi " << dpi_before << " -> " << dpi_after << ", nothing to settle";
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));  // let it answer WM_DPICHANGED first
+        RECT frame {};
+        if (!app_window_layout::frame_rect(hwnd, frame)) return;
+        const LONG w0 = frame_before.right - frame_before.left, h0 = frame_before.bottom - frame_before.top;
+        const LONG w1 = frame.right - frame.left, h1 = frame.bottom - frame.top;
+        if (w0 <= 0 || h0 <= 0 || std::abs(w1 - w0) > w0 / 20 || std::abs(h1 - h0) > h0 / 20) return;  // it rescaled itself
+        RECT win {};
+        if (!GetWindowRect(hwnd, &win)) return;
+        const LONG ww = MulDiv(win.right - win.left, static_cast<int>(dpi_after), static_cast<int>(dpi_before));
+        const LONG wh = MulDiv(win.bottom - win.top, static_cast<int>(dpi_after), static_cast<int>(dpi_before));
+        SetWindowPos(hwnd, nullptr, 0, 0, ww, wh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        BOOST_LOG(info) << "Desk: window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec << " kept its frame across " << dpi_before << "->" << dpi_after
+                        << " dpi; resized " << w1 << 'x' << h1 << " -> " << ww << 'x' << wh;
+      }).detach();
+    }
+
     std::string window_title(HWND hwnd) {
       const int length = GetWindowTextLengthW(hwnd);
       if (length <= 0) return {};
@@ -208,12 +255,25 @@ namespace app_desk {
     std::lock_guard lock(g_mutex);
     auto &desk = g_desks[client_uuid];
     RECT rect {};
+    // Newer drivers expose exactly the requested mode; older ones only a catalog.
+    const bool custom = VDISPLAY::supportsRequestedResolutionCatalog();
     bool present = !desk.device.empty() && find_monitor(desk.device, &rect);
+    if (present && custom && (rect.right - rect.left != w || rect.bottom - rect.top != h)) {
+      // A different size needs a display created for it: recreate.
+      BOOST_LOG(info) << "Desk: recreating the display for " << w << 'x' << h;
+      VDISPLAY::set_virtual_display_protected(desk.guid, desk.device, false);
+      VDISPLAY::removeVirtualDisplay(desk.guid);
+      desk.device.clear();
+      desk.monitor_path.clear();
+      present = false;
+    }
     if (present) {
-      if (auto mode = pick_mode(desk.device, w, h, fps)) {
-        w = mode->w;
-        h = mode->h;
-        fps = mode->hz;
+      if (!custom) {
+        if (auto mode = pick_mode(desk.device, w, h, fps)) {
+          w = mode->w;
+          h = mode->h;
+          fps = mode->hz;
+        }
       }
       if (rect.right - rect.left != w || rect.bottom - rect.top != h || monitor_refresh_hz(desk.device.c_str()) != fps) {
         // Different size or rate: retune the existing display.
@@ -235,7 +295,7 @@ namespace app_desk {
       VDISPLAY::setWatchdogFeedingEnabled(true);
       auto created = VDISPLAY::createVirtualDisplay(("desk-" + client_uuid).c_str(), "App windows desk", nullptr,
                                                     static_cast<uint32_t>(w), static_cast<uint32_t>(h), static_cast<uint32_t>(fps), desk.guid,
-                                                    0, false, 1, std::nullopt, false, true, true, false);
+                                                    0, false, 1, std::nullopt, false, true, true, custom);
       if (!created) {
         BOOST_LOG(warning) << "Desk: the virtual display driver could not create a " << w << 'x' << h << '@' << fps << " display";
         g_desks.erase(client_uuid);
@@ -243,15 +303,13 @@ namespace app_desk {
       }
       desk.device = created->display_name.value_or(L"");
       VDISPLAY::set_virtual_display_protected(desk.guid, desk.device, true);
-      if (created->monitor_device_path) {
-        (void) VDISPLAY::set_display_scale_percent(*created->monitor_device_path, static_cast<std::uint32_t>(dpi * 100 / 96));
-      }
+      if (created->monitor_device_path) desk.monitor_path = *created->monitor_device_path;
       // The driver brings it up detached or at a default mode: attach it at ours.
       present = false;
       bool picked = false;
       for (int i = 0; i < 200 && !present; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        if (!desk.device.empty() && !picked) {
+        if (!desk.device.empty() && !picked && !custom) {
           if (auto mode = pick_mode(desk.device, w, h, fps)) {
             w = mode->w;
             h = mode->h;
@@ -284,6 +342,24 @@ namespace app_desk {
     desk.info.rect[3] = rect.bottom - rect.top;
     desk.info.fps = fps;
     desk.info.dpi = dpi;
+    // The scale can only be set on an attached display; apply it now and
+    // wait for it to show, then report what the desk really runs at.
+    if (monitor_dpi(find_monitor(desk.device)) != dpi && !desk.monitor_path.empty()) {
+      const auto r = VDISPLAY::set_display_scale_percent(desk.monitor_path, static_cast<std::uint32_t>(dpi * 100 / 96));
+      BOOST_LOG(info) << "Desk: scale " << dpi * 100 / 96 << "% requested: found=" << r.target_found << " applied=" << r.applied << " current=" << r.current_percent
+                      << " recommended=" << r.recommended_percent << " status=" << r.status;
+    }
+    for (int i = 0; i < 30; ++i) {
+      const int actual = monitor_dpi(find_monitor(desk.device));
+      if (actual == dpi) break;
+      if (i == 29 && actual > 0) {
+        BOOST_LOG(warning) << "Desk: asked for " << dpi << " dpi, the display runs at " << actual;
+        desk.info.dpi = actual;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    BOOST_LOG(info) << "Desk: open " << desk.info.display << ' ' << desk.info.rect[2] << 'x' << desk.info.rect[3] << '@' << fps << " at " << desk.info.dpi << " dpi"
+                    << (custom ? " (exact mode)" : " (catalog mode)");
     return desk.info;
   }
 
@@ -334,6 +410,7 @@ namespace app_desk {
     RECT frame {};
     if (!app_window_layout::frame_rect(hwnd, frame)) return false;
     it->second.adopted[hwnd] = {frame.left, frame.top};
+    settle_dpi_change(hwnd, GetDpiForWindow(hwnd), frame);
     // First time: keep it inside the desk.
     const LONG w = frame.right - frame.left, h = frame.bottom - frame.top;
     const LONG dw = rect.right - rect.left, dh = rect.bottom - rect.top;
@@ -350,7 +427,11 @@ namespace app_desk {
     if (it == g_desks.end()) return false;
     auto a = it->second.adopted.find(hwnd);
     if (a == it->second.adopted.end()) return false;
-    if (IsWindow(hwnd)) move_frame_to(hwnd, a->second.x, a->second.y);
+    if (IsWindow(hwnd)) {
+      RECT frame {};
+      if (app_window_layout::frame_rect(hwnd, frame)) settle_dpi_change(hwnd, GetDpiForWindow(hwnd), frame);
+      move_frame_to(hwnd, a->second.x, a->second.y);
+    }
     it->second.adopted.erase(a);
     return true;
   }
