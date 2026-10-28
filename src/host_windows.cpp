@@ -483,7 +483,27 @@ namespace host_windows {
           dw = (win.right - win.left) - (frame.right - frame.left);
           dh = (win.bottom - win.top) - (frame.bottom - frame.top);
         }
-        return SetWindowPos(hwnd, nullptr, 0, 0, std::max(1, w + dw), std::max(1, h + dh), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE) != 0;
+        if (!SetWindowPos(hwnd, nullptr, 0, 0, std::max(1, w + dw), std::max(1, h + dh), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) return false;
+        // Injected mouse input is clamped to the screen, so a window that grew
+        // past its monitor's edge would have unreachable parts: slide it back
+        // onto the work area (the window never has to sit where the client
+        // shows it; client-side positions are independent of the host's).
+        if (HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) {
+          MONITORINFO mi {};
+          mi.cbSize = sizeof(mi);
+          if (GetMonitorInfoW(mon, &mi) && SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) && GetWindowRect(hwnd, &win)) {
+            const RECT &work = mi.rcWork;
+            int shift_x = 0, shift_y = 0;
+            if (frame.right > work.right) shift_x = work.right - frame.right;
+            if (frame.left + shift_x < work.left) shift_x = work.left - frame.left;
+            if (frame.bottom > work.bottom) shift_y = work.bottom - frame.bottom;
+            if (frame.top + shift_y < work.top) shift_y = work.top - frame.top;
+            if (shift_x || shift_y) {
+              SetWindowPos(hwnd, nullptr, win.left + shift_x, win.top + shift_y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+          }
+        }
+        return true;
       }
       case op_e::minimize:
         return ShowWindow(hwnd, SW_MINIMIZE) != 0 || IsIconic(hwnd);

@@ -102,6 +102,7 @@ target_link_libraries(sunshine_wgc_capture
         ${Boost_LIBRARIES}
         ${CMAKE_THREAD_LIBS_INIT}
         d3d11
+        d3dcompiler
         dwmapi
         dxgi
         ole32

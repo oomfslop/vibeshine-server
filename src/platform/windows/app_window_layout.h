@@ -23,14 +23,24 @@ namespace app_window_layout {
    *
    * The canvas is larger than the window so popups that stick out past the
    * window's edges still fit. The window is anchored at a fixed fraction of
-   * the canvas (left quarter, top eighth) and only pushed towards the origin
-   * when it would not fit otherwise, so moves never shift the picture and
-   * resizes only shift it when the window grows past three quarters of the
+   * the canvas (an eighth from the left, a tenth from the top: popups mostly
+   * open to the right and below, flipped ones need less) and only pushed
+   * towards the origin when it would not fit otherwise, so moves never shift
+   * the picture and resizes only shift it once the window nearly fills the
    * canvas. Even coordinates keep chroma planes aligned.
    */
   inline void canvas_anchor(int canvas_w, int canvas_h, int win_w, int win_h, int &ax, int &ay) {
-    ax = std::clamp(canvas_w / 4, 0, std::max(0, canvas_w - win_w)) & ~1;
-    ay = std::clamp(canvas_h / 8, 0, std::max(0, canvas_h - win_h)) & ~1;
+    ax = std::clamp(canvas_w / 8, 0, std::max(0, canvas_w - win_w)) & ~1;
+    ay = std::clamp(canvas_h / 10, 0, std::max(0, canvas_h - win_h)) & ~1;
+  }
+
+  /**
+   * @brief The encoder frame of an app-window session is two bands: the
+   *        composited picture on top and, below it, the same pixels' alpha
+   *        as grey (video has no alpha channel). Both bands are this tall.
+   */
+  inline int color_height(int frame_height) {
+    return frame_height / 2;
   }
 
   /** Outer (DWM extended frame) rect of a window, or GetWindowRect as a fallback. */

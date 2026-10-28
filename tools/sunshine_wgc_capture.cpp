@@ -38,6 +38,7 @@
 
 // platform includes
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <inspectable.h>  // For IInspectable
 #include <KnownFolders.h>
@@ -2468,6 +2469,7 @@ public:
     winrt::event_token closed_token {};
     winrt::Windows::Graphics::SizeInt32 pool_size {0, 0};
     winrt::com_ptr<ID3D11Texture2D> latest;  ///< helper-owned copy of the newest frame (guarded by _ctx_mutex)
+    winrt::com_ptr<ID3D11ShaderResourceView> latest_srv;
     UINT latest_w = 0, latest_h = 0;
     uint64_t latest_qpc = 0;
     std::optional<bool> cursor_applied;
@@ -2486,6 +2488,7 @@ public:
       _target(target),
       _canvas_w(canvas_w),
       _canvas_h(canvas_h),
+      _color_h(static_cast<UINT>(app_window_layout::color_height(static_cast<int>(canvas_h)))),
       _fps(std::clamp(fps, 10, 240)) {
   }
 
@@ -2512,7 +2515,7 @@ public:
       composite_thread_proc();
     });
     BOOST_LOG(info) << "App-window capture: window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(_target) << std::dec
-                    << " on a " << _canvas_w << 'x' << _canvas_h << " canvas, popups composited";
+                    << " on a " << _canvas_w << 'x' << _color_h << " canvas (+ alpha band), popups composited";
     return true;
   }
 
@@ -2596,9 +2599,117 @@ private:
       cap.latest = nullptr;
       return false;
     }
+    cap.latest_srv = nullptr;
+    if (FAILED(_device->CreateShaderResourceView(cap.latest.get(), nullptr, cap.latest_srv.put()))) {
+      BOOST_LOG(error) << "App-window capture: failed to create a frame texture view";
+      cap.latest = nullptr;
+      return false;
+    }
     cap.latest_w = w;
     cap.latest_h = h;
     return true;
+  }
+
+  struct quad_cb_t {
+    float dst[4];  ///< NDC x0, y0 (top), x1, y1 (bottom)
+    float uv[4];  ///< u0, v0, u1, v1
+    float mode[4];  ///< x: write alpha as grey, y: treat the source as opaque
+  };
+
+  bool ensure_pipeline() {
+    if (_vs && _ps) {
+      return true;
+    }
+    if (_pipeline_failed) {
+      return false;
+    }
+    static const char *source = R"(
+cbuffer cb : register(b0) { float4 dst; float4 uv; float4 mode; };
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VSOut vs(uint id : SV_VertexID) {
+  float2 p = float2(id & 1, id >> 1);
+  VSOut o;
+  o.pos = float4(lerp(dst.x, dst.z, p.x), lerp(dst.y, dst.w, p.y), 0.0, 1.0);
+  o.uv = float2(lerp(uv.x, uv.z, p.x), lerp(uv.y, uv.w, p.y));
+  return o;
+}
+float4 ps(VSOut i) : SV_Target {
+  float4 c = tex.Sample(smp, i.uv);
+  if (mode.y > 0.5) c = float4(c.rgb, 1.0);
+  if (mode.x > 0.5) return float4(c.a, c.a, c.a, c.a);
+  return c;
+}
+)";
+    winrt::com_ptr<ID3DBlob> vs_blob, ps_blob, err;
+    if (FAILED(D3DCompile(source, strlen(source), "aw_composite", nullptr, nullptr, "vs", "vs_5_0", 0, 0, vs_blob.put(), err.put())) ||
+        FAILED(D3DCompile(source, strlen(source), "aw_composite", nullptr, nullptr, "ps", "ps_5_0", 0, 0, ps_blob.put(), err.put()))) {
+      BOOST_LOG(error) << "App-window composite: shader compilation failed: " << (err ? static_cast<const char *>(err->GetBufferPointer()) : "?");
+      _pipeline_failed = true;
+      return false;
+    }
+    if (FAILED(_device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), nullptr, _vs.put())) ||
+        FAILED(_device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr, _ps.put()))) {
+      BOOST_LOG(error) << "App-window composite: shader creation failed";
+      _pipeline_failed = true;
+      return false;
+    }
+    D3D11_BUFFER_DESC cbd {};
+    cbd.ByteWidth = sizeof(quad_cb_t);
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    D3D11_SAMPLER_DESC sd {};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    D3D11_BLEND_DESC bd {};
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;  // sources are premultiplied
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    D3D11_RASTERIZER_DESC rd {};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    if (FAILED(_device->CreateBuffer(&cbd, nullptr, _cb.put())) || FAILED(_device->CreateSamplerState(&sd, _sampler.put())) ||
+        FAILED(_device->CreateBlendState(&bd, _blend.put())) || FAILED(_device->CreateRasterizerState(&rd, _raster.put()))) {
+      BOOST_LOG(error) << "App-window composite: pipeline state creation failed";
+      _pipeline_failed = true;
+      return false;
+    }
+    return true;
+  }
+
+  /** Draws src[sx, sx+w) x [sy, sy+h) of `cap` at canvas (dx, dy); alpha band when `alpha_band`. */
+  void draw_quad(const capture_t &cap, UINT sx, UINT sy, UINT w, UINT h, UINT dx, UINT dy, bool alpha_band) {
+    D3D11_MAPPED_SUBRESOURCE mapped {};
+    if (FAILED(_context->Map(_cb.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+      return;
+    }
+    auto *cb = static_cast<quad_cb_t *>(mapped.pData);
+    const float W = static_cast<float>(_canvas_w), H = static_cast<float>(_canvas_h);
+    const float y_off = alpha_band ? static_cast<float>(_color_h) : 0.f;
+    cb->dst[0] = dx / W * 2.f - 1.f;
+    cb->dst[1] = 1.f - (dy + y_off) / H * 2.f;
+    cb->dst[2] = (dx + w) / W * 2.f - 1.f;
+    cb->dst[3] = 1.f - (dy + y_off + h) / H * 2.f;
+    cb->uv[0] = static_cast<float>(sx) / cap.latest_w;
+    cb->uv[1] = static_cast<float>(sy) / cap.latest_h;
+    cb->uv[2] = static_cast<float>(sx + w) / cap.latest_w;
+    cb->uv[3] = static_cast<float>(sy + h) / cap.latest_h;
+    cb->mode[0] = alpha_band ? 1.f : 0.f;
+    cb->mode[1] = cap.gdi ? 1.f : 0.f;
+    cb->mode[2] = cb->mode[3] = 0.f;
+    _context->Unmap(_cb.get(), 0);
+    ID3D11ShaderResourceView *srv = cap.latest_srv.get();
+    _context->PSSetShaderResources(0, 1, &srv);
+    _context->Draw(4, 0);
   }
 
   /** Called on WGC's free-threaded callback thread. */
@@ -2930,10 +3041,13 @@ private:
       return;
     }
     int ax = 0, ay = 0;
-    app_window_layout::canvas_anchor(static_cast<int>(_canvas_w), static_cast<int>(_canvas_h),
+    app_window_layout::canvas_anchor(static_cast<int>(_canvas_w), static_cast<int>(_color_h),
                                      target_rect.right - target_rect.left, target_rect.bottom - target_rect.top, ax, ay);
 
     std::unique_lock ctx_lock(_ctx_mutex);
+    if (!ensure_pipeline()) {
+      return;
+    }
     auto &keyed = _shared.get_keyed_mutex();
     const HRESULT hr = keyed->AcquireSync(0, 200);
     if (hr == WAIT_TIMEOUT) {
@@ -2952,33 +3066,56 @@ private:
       BOOST_LOG(error) << "App-window composite: cannot create the canvas render target view";
       return;
     }
-    const float black[4] {0.f, 0.f, 0.f, 1.f};
-    _context->ClearRenderTargetView(_canvas_rtv.get(), black);
+    // Transparent black everywhere: the picture band ends up premultiplied
+    // by coverage, the alpha band holds the coverage itself.
+    const float clear[4] {0.f, 0.f, 0.f, 0.f};
+    _context->ClearRenderTargetView(_canvas_rtv.get(), clear);
+    ID3D11RenderTargetView *rtv = _canvas_rtv.get();
+    _context->OMSetRenderTargets(1, &rtv, nullptr);
+    const float blend_factor[4] {0.f, 0.f, 0.f, 0.f};
+    _context->OMSetBlendState(_blend.get(), blend_factor, 0xffffffff);
+    _context->RSSetState(_raster.get());
+    D3D11_VIEWPORT vp {0.f, 0.f, static_cast<float>(_canvas_w), static_cast<float>(_canvas_h), 0.f, 1.f};
+    _context->RSSetViewports(1, &vp);
+    _context->IASetInputLayout(nullptr);
+    _context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    _context->VSSetShader(_vs.get(), nullptr, 0);
+    _context->PSSetShader(_ps.get(), nullptr, 0);
+    ID3D11Buffer *cb = _cb.get();
+    _context->VSSetConstantBuffers(0, 1, &cb);
+    _context->PSSetConstantBuffers(0, 1, &cb);
+    ID3D11SamplerState *sampler = _sampler.get();
+    _context->PSSetSamplers(0, 1, &sampler);
     uint64_t qpc = 0;
     for (auto &cap : order) {
-      if (!cap->latest || cap->latest_w == 0 || cap->latest_h == 0) {
+      if (!cap->latest || !cap->latest_srv || cap->latest_w == 0 || cap->latest_h == 0) {
         continue;
       }
       // Canvas position of this window: the anchor plus its offset from the target.
       LONG dx = ax + (cap->rect.left - target_rect.left);
       LONG dy = ay + (cap->rect.top - target_rect.top);
-      D3D11_BOX box {0, 0, 0, cap->latest_w, cap->latest_h, 1};
+      UINT sx = 0, sy = 0, w = cap->latest_w, h = cap->latest_h;
       if (dx < 0) {
-        box.left = static_cast<UINT>(-dx);
+        sx = static_cast<UINT>(-dx);
         dx = 0;
       }
       if (dy < 0) {
-        box.top = static_cast<UINT>(-dy);
+        sy = static_cast<UINT>(-dy);
         dy = 0;
       }
-      if (box.left >= box.right || box.top >= box.bottom || dx >= static_cast<LONG>(_canvas_w) || dy >= static_cast<LONG>(_canvas_h)) {
+      if (sx >= w || sy >= h || dx >= static_cast<LONG>(_canvas_w) || dy >= static_cast<LONG>(_color_h)) {
         continue;
       }
-      box.right = std::min<UINT>(box.right, box.left + (_canvas_w - static_cast<UINT>(dx)));
-      box.bottom = std::min<UINT>(box.bottom, box.top + (_canvas_h - static_cast<UINT>(dy)));
-      _context->CopySubresourceRegion(canvas.get(), 0, static_cast<UINT>(dx), static_cast<UINT>(dy), 0, cap->latest.get(), 0, &box);
+      w = std::min<UINT>(w - sx, _canvas_w - static_cast<UINT>(dx));
+      h = std::min<UINT>(h - sy, _color_h - static_cast<UINT>(dy));
+      draw_quad(*cap, sx, sy, w, h, static_cast<UINT>(dx), static_cast<UINT>(dy), false);
+      draw_quad(*cap, sx, sy, w, h, static_cast<UINT>(dx), static_cast<UINT>(dy), true);
       qpc = std::max(qpc, cap->latest_qpc);
     }
+    ID3D11ShaderResourceView *null_srv = nullptr;
+    _context->PSSetShaderResources(0, 1, &null_srv);
+    ID3D11RenderTargetView *null_rtv = nullptr;
+    _context->OMSetRenderTargets(1, &null_rtv, nullptr);
     if (qpc == 0) {
       LARGE_INTEGER now {};
       QueryPerformanceCounter(&now);
@@ -2997,8 +3134,17 @@ private:
   SharedResourceManager &_shared;
   DXGI_FORMAT _format;
   HWND _target;
-  UINT _canvas_w, _canvas_h;
+  UINT _canvas_w, _canvas_h;  ///< encoder frame: picture band on top, alpha band below
+  UINT _color_h;  ///< height of each band
   int _fps;
+  // Compositing pipeline (alpha-blended quads; the alpha band gets alpha as grey)
+  winrt::com_ptr<ID3D11VertexShader> _vs;
+  winrt::com_ptr<ID3D11PixelShader> _ps;
+  winrt::com_ptr<ID3D11Buffer> _cb;
+  winrt::com_ptr<ID3D11SamplerState> _sampler;
+  winrt::com_ptr<ID3D11BlendState> _blend;
+  winrt::com_ptr<ID3D11RasterizerState> _raster;
+  bool _pipeline_failed = false;
 
   std::mutex _ctx_mutex;  ///< serializes every use of the immediate context
   winrt::com_ptr<ID3D11RenderTargetView> _canvas_rtv;
