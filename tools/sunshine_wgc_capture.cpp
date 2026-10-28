@@ -2481,6 +2481,9 @@ public:
     bool dialog = false;  ///< owned window with a caption
     bool inline_part = false;  ///< drawn in place over the parent, no slot
     bool seeded = false;  ///< first picture taken with PrintWindow because WGC delivered nothing yet
+    HBITMAP dib = nullptr;  ///< persistent GDI picture for screen copies (occluded parts keep old pixels)
+    void *dib_bits = nullptr;
+    int dib_w = 0, dib_h = 0;
     std::chrono::steady_clock::time_point created = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point gdi_last {};
   };
@@ -2963,6 +2966,12 @@ float4 ps(VSOut i) : SV_Target {
   }
 
   void destroy_capture(capture_t &cap) noexcept {
+    if (cap.dib) {
+      DeleteObject(cap.dib);
+      cap.dib = nullptr;
+      cap.dib_bits = nullptr;
+      cap.dib_w = cap.dib_h = 0;
+    }
     try {
       if (cap.pool && cap.frame_token.value != 0) {
         cap.pool.FrameArrived(cap.frame_token);
@@ -2985,8 +2994,11 @@ float4 ps(VSOut i) : SV_Target {
     cap.item = nullptr;
   }
 
-  /** PrintWindow a GDI-fallback popup into its frame texture (layout thread). */
-  void refresh_gdi_capture(capture_t &cap) {
+  /** GDI picture of a popup WGC cannot capture (layout thread): PrintWindow,
+   *  or for layered windows a copy of the screen at its rectangle. The screen
+   *  copy skips pixels covered by other windows of the family (dialogs, menus)
+   *  and keeps the previous pixels there, so nothing leaks into the picture. */
+  void refresh_gdi_capture(capture_t &cap, const std::vector<RECT> &occluders) {
     const auto now = std::chrono::steady_clock::now();
     if (cap.gdi && now - cap.gdi_last < std::chrono::milliseconds(33)) {
       return;
@@ -2998,25 +3010,36 @@ float4 ps(VSOut i) : SV_Target {
     }
     HDC screen = GetDC(nullptr);
     HDC mem = CreateCompatibleDC(screen);
-    BITMAPINFO bmi {};
-    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-    bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h;  // top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    void *bits = nullptr;
-    HBITMAP dib = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (cap.dib && (cap.dib_w != w || cap.dib_h != h)) {
+      DeleteObject(cap.dib);
+      cap.dib = nullptr;
+      cap.dib_bits = nullptr;
+    }
+    if (!cap.dib) {
+      BITMAPINFO bmi {};
+      bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+      bmi.bmiHeader.biWidth = w;
+      bmi.bmiHeader.biHeight = -h;  // top-down
+      bmi.bmiHeader.biPlanes = 1;
+      bmi.bmiHeader.biBitCount = 32;
+      bmi.bmiHeader.biCompression = BI_RGB;
+      cap.dib = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &cap.dib_bits, nullptr, 0);
+      cap.dib_w = w;
+      cap.dib_h = h;
+    }
     bool ok = false;
-    if (dib && bits) {
-      HGDIOBJ old = SelectObject(mem, dib);
+    if (cap.dib && cap.dib_bits) {
+      HGDIOBJ old = SelectObject(mem, cap.dib);
       if (cap.gdi && !cap.screen_copy) {
         ok = PrintWindow(cap.hwnd, mem, PW_RENDERFULLCONTENT) != 0;
       } else {
-        // Seeding a window WGC has not delivered for yet: layered windows
-        // (UpdateLayeredWindow) render nothing through PrintWindow, so copy
-        // what is on the host screen at its rectangle instead.
+        // Leave the pixels under other family windows as they were.
+        for (const RECT &o : occluders) {
+          RECT local {o.left - cap.rect.left, o.top - cap.rect.top, o.right - cap.rect.left, o.bottom - cap.rect.top};
+          ExcludeClipRect(mem, local.left, local.top, local.right, local.bottom);
+        }
         ok = BitBlt(mem, 0, 0, w, h, screen, cap.rect.left, cap.rect.top, SRCCOPY | CAPTUREBLT) != 0;
+        SelectClipRgn(mem, nullptr);
       }
       GdiFlush();
       if (ok) {
@@ -3024,16 +3047,13 @@ float4 ps(VSOut i) : SV_Target {
         if (!cap.gdi && cap.latest) {
           ok = false;  // WGC got there first
         } else if (ensure_latest_texture(cap, static_cast<UINT>(w), static_cast<UINT>(h))) {
-          _context->UpdateSubresource(cap.latest.get(), 0, nullptr, bits, static_cast<UINT>(w) * 4, 0);
+          _context->UpdateSubresource(cap.latest.get(), 0, nullptr, cap.dib_bits, static_cast<UINT>(w) * 4, 0);
           LARGE_INTEGER qpc {};
           QueryPerformanceCounter(&qpc);
           cap.latest_qpc = static_cast<uint64_t>(qpc.QuadPart);
         }
       }
       SelectObject(mem, old);
-    }
-    if (dib) {
-      DeleteObject(dib);
     }
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
@@ -3143,7 +3163,12 @@ float4 ps(VSOut i) : SV_Target {
         mark_dirty();
       }
       for (auto &cap : gdi_refresh) {
-        refresh_gdi_capture(*cap);
+        std::vector<RECT> occluders;
+        for (const auto &p : popups) {
+          RECT x {};
+          if (p.hwnd != cap->hwnd && IntersectRect(&x, &p.rect, &cap->rect)) occluders.push_back(p.rect);
+        }
+        refresh_gdi_capture(*cap, occluders);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(8));
     }

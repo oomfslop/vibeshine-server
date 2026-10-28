@@ -730,6 +730,31 @@ namespace host_windows {
         RECT frame {};
         if (FAILED(DwmGetWindowAttribute(pin->hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)))) continue;
         const POINT want = pin->origin;
+        // The window's dialogs are windows of their own on the client; on the
+        // host their position means nothing, but on top of the parent they
+        // would shadow the parent's picture (its layered parts are copied from
+        // the screen). Park them beside the parent: to its right, else below,
+        // within the parent's display.
+        if (HMONITOR mon = MonitorFromWindow(pin->hwnd, MONITOR_DEFAULTTONEAREST)) {
+          MONITORINFO mi {};
+          mi.cbSize = sizeof(mi);
+          if (GetMonitorInfoW(mon, &mi)) {
+            LONG right_y = frame.top, below_x = frame.left;
+            for (const auto &p : app_window_layout::popup_windows(pin->hwnd)) {
+              if (!p.dialog) continue;
+              RECT x {};
+              if (!IntersectRect(&x, &p.rect, &frame)) continue;
+              const LONG w = p.rect.right - p.rect.left, h = p.rect.bottom - p.rect.top;
+              if (frame.right + 8 + w <= mi.rcWork.right && right_y + h <= mi.rcWork.bottom) {
+                move_frame_to(p.hwnd, static_cast<int>(frame.right + 8), static_cast<int>(right_y));
+                right_y += h + 8;
+              } else if (frame.bottom + 8 + h <= mi.rcWork.bottom && below_x + w <= mi.rcWork.right) {
+                move_frame_to(p.hwnd, static_cast<int>(below_x), static_cast<int>(frame.bottom + 8));
+                below_x += w + 8;
+              }
+            }
+          }
+        }
         if (!MonitorFromPoint(POINT {want.x + 8, want.y + 8}, MONITOR_DEFAULTTONULL)) {
           // The display we parked on is gone (virtual display removed):
           // re-park on whatever the window landed on.
