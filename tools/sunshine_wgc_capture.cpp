@@ -2476,9 +2476,12 @@ public:
     uint64_t latest_qpc = 0;
     std::optional<bool> cursor_applied;
     std::atomic<bool> closed {false};
-    bool gdi = false;  ///< PrintWindow fallback (WGC refused the window)
+    bool gdi = false;  ///< not captured by WGC: PrintWindow, or a screen copy for layered windows
+    bool screen_copy = false;  ///< WS_EX_LAYERED: only the screen has its pixels (WGC/PrintWindow give blanks)
     bool dialog = false;  ///< owned window with a caption
     bool inline_part = false;  ///< drawn in place over the parent, no slot
+    bool seeded = false;  ///< first picture taken with PrintWindow because WGC delivered nothing yet
+    std::chrono::steady_clock::time_point created = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point gdi_last {};
   };
 
@@ -2881,6 +2884,15 @@ float4 ps(VSOut i) : SV_Target {
     cap->hwnd = hwnd;
     cap->is_target = is_target;
     app_window_layout::frame_rect(hwnd, cap->rect);
+    if (!is_target && (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED) && _format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+      // Layered popups (UpdateLayeredWindow skins, some tooltips) have no
+      // redirection surface: WGC and PrintWindow return blanks for them.
+      // Their pixels exist only on screen, so copy them from there.
+      cap->gdi = true;
+      cap->screen_copy = true;
+      BOOST_LOG(info) << "App-window capture: popup 0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec << " is layered; copying it from the screen";
+      return cap;
+    }
     try {
       auto factory = winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
       GraphicsCaptureItem item = nullptr;
@@ -2976,7 +2988,7 @@ float4 ps(VSOut i) : SV_Target {
   /** PrintWindow a GDI-fallback popup into its frame texture (layout thread). */
   void refresh_gdi_capture(capture_t &cap) {
     const auto now = std::chrono::steady_clock::now();
-    if (now - cap.gdi_last < std::chrono::milliseconds(33)) {
+    if (cap.gdi && now - cap.gdi_last < std::chrono::milliseconds(33)) {
       return;
     }
     cap.gdi_last = now;
@@ -2998,11 +3010,20 @@ float4 ps(VSOut i) : SV_Target {
     bool ok = false;
     if (dib && bits) {
       HGDIOBJ old = SelectObject(mem, dib);
-      ok = PrintWindow(cap.hwnd, mem, PW_RENDERFULLCONTENT) != 0;
+      if (cap.gdi && !cap.screen_copy) {
+        ok = PrintWindow(cap.hwnd, mem, PW_RENDERFULLCONTENT) != 0;
+      } else {
+        // Seeding a window WGC has not delivered for yet: layered windows
+        // (UpdateLayeredWindow) render nothing through PrintWindow, so copy
+        // what is on the host screen at its rectangle instead.
+        ok = BitBlt(mem, 0, 0, w, h, screen, cap.rect.left, cap.rect.top, SRCCOPY | CAPTUREBLT) != 0;
+      }
       GdiFlush();
       if (ok) {
         std::lock_guard ctx_lock(_ctx_mutex);
-        if (ensure_latest_texture(cap, static_cast<UINT>(w), static_cast<UINT>(h))) {
+        if (!cap.gdi && cap.latest) {
+          ok = false;  // WGC got there first
+        } else if (ensure_latest_texture(cap, static_cast<UINT>(w), static_cast<UINT>(h))) {
           _context->UpdateSubresource(cap.latest.get(), 0, nullptr, bits, static_cast<UINT>(w) * 4, 0);
           LARGE_INTEGER qpc {};
           QueryPerformanceCounter(&qpc);
@@ -3082,6 +3103,14 @@ float4 ps(VSOut i) : SV_Target {
           order.push_back(cap);
           layout.emplace_back(p.hwnd, p.rect);
           if (cap->gdi) {
+            gdi_refresh.push_back(cap);
+          } else if (!cap->seeded && !cap->latest &&
+                     std::chrono::steady_clock::now() - cap->created > std::chrono::milliseconds(150)) {
+            // WGC only delivers once the window presents something new; a
+            // popup painted before we started capturing (layered skin parts,
+            // static bars) would stay blank until it repaints. Take its
+            // current picture once; WGC takes over from the next repaint.
+            cap->seeded = true;
             gdi_refresh.push_back(cap);
           }
         }
