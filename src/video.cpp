@@ -3364,7 +3364,7 @@ namespace video {
         return true;
       };
 
-      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &video::effective_display_cursor);
+      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, producer_config.hide_cursor ? &video::cursor_never : &video::effective_display_cursor);
 
       if (artificial_reinit && status != platf::capture_e::error) {
         BOOST_LOG(debug) << "Capture restart: source=explicit-display-switch";
@@ -6104,7 +6104,7 @@ namespace video {
         return true;
       };
 
-      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, &video::effective_display_cursor);
+      auto status = disp->capture(push_captured_image_callback, pull_free_image_callback, synced_session_ctxs.front()->config.hide_cursor ? &video::cursor_never : &video::effective_display_cursor);
       // capture() terminalizes this display's geometry before returning. Make
       // the terminal mapping visible to every active synchronous session before
       // tearing down their encoder state or returning to the caller.

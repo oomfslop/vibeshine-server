@@ -90,6 +90,7 @@
 
 #include "process.h"
 #include "rtsp.h"
+#include "app_desk.h"
 #include "host_windows.h"
 #include "rtsp_pending_policy.h"
 #include "stream.h"
@@ -4146,11 +4147,6 @@ namespace nvhttp {
     if (!windows_request_allowed(response, request, "action")) return;
     const auto args = request->parse_query_string();
     const auto handle = parse_window_handle(get_arg(args, "hwnd", ""));
-    host_windows::op_e op;
-    if (!handle || !host_windows::parse_op(get_arg(args, "op", ""), op)) {
-      write_json(response, {{"status", false}, {"error", "hwnd and a valid op are required"}}, SimpleWeb::StatusCode::client_error_bad_request);
-      return;
-    }
     auto num = [&](const char *name) {
       try {
         return std::stoi(get_arg(args, name, "0"));
@@ -4158,8 +4154,134 @@ namespace nvhttp {
         return 0;
       }
     };
+    const auto op_name = get_arg(args, "op", "");
+    if (handle && (op_name == "adopt" || op_name == "release")) {
+      // Desk ops: move the window onto / off the client's desk.
+      const auto uuid = resolve_client_identity_from_request(request).uuid;
+      const bool ok = op_name == "adopt" ? app_desk::adopt(uuid, handle, num("x"), num("y")) : app_desk::release(uuid, handle);
+      write_json(response, {{"status", ok}}, ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_not_found);
+      return;
+    }
+    host_windows::op_e op;
+    if (!handle || !host_windows::parse_op(op_name, op)) {
+      write_json(response, {{"status", false}, {"error", "hwnd and a valid op are required"}}, SimpleWeb::StatusCode::client_error_bad_request);
+      return;
+    }
     const bool ok = host_windows::action(handle, op, num("x"), num("y"), num("w"), num("h"));
     write_json(response, {{"status", ok}}, ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_not_found);
+  }
+
+  namespace {
+    nlohmann::json desk_json(const app_desk::desk_t &d) {
+      return {
+        {"display", d.display},
+        {"rect", {d.rect[0], d.rect[1], d.rect[2], d.rect[3]}},
+        {"fps", d.fps},
+        {"dpi", d.dpi},
+      };
+    }
+  }  // namespace
+
+  /**
+   * @brief The client's desk: `op=open&w&h&fps&dpi` creates (or retunes) its
+   * private display and answers with the display to stream; `op=close` puts
+   * every adopted window back and lets the display idle out.
+   */
+  void post_desk(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    if (!windows_request_allowed(response, request, "desk")) return;
+    const auto args = request->parse_query_string();
+    const auto uuid = resolve_client_identity_from_request(request).uuid;
+    const auto op = get_arg(args, "op", "");
+    auto num = [&](const char *name, int fallback) {
+      try {
+        const auto text = get_arg(args, name, "");
+        return text.empty() ? fallback : std::stoi(text);
+      } catch (...) {
+        return fallback;
+      }
+    };
+    if (op == "open") {
+      const auto desk = app_desk::open(uuid, num("w", 0), num("h", 0), num("fps", 60), num("dpi", 96));
+      if (!desk.valid) {
+        write_json(response, {{"status", false}, {"error", "the desk display could not be created"}}, SimpleWeb::StatusCode::server_error_service_unavailable);
+        return;
+      }
+      auto out = desk_json(desk);
+      out["status"] = true;
+      write_json(response, out);
+      return;
+    }
+    if (op == "close") {
+      app_desk::close(uuid);
+      write_json(response, {{"status", true}});
+      return;
+    }
+    if (op == "get") {
+      const auto desk = app_desk::get(uuid);
+      if (!desk) {
+        write_json(response, {{"status", false}}, SimpleWeb::StatusCode::client_error_not_found);
+        return;
+      }
+      auto out = desk_json(*desk);
+      out["status"] = true;
+      write_json(response, out);
+      return;
+    }
+    write_json(response, {{"status", false}, {"error", "op must be open, close or get"}}, SimpleWeb::StatusCode::client_error_bad_request);
+  }
+
+  /**
+   * @brief Long-poll of everything on the client's desk. With `etag` and
+   * `wait` the reply is held back (up to one second) until the layout changes.
+   */
+  void get_desk_layout(resp_https_t response, req_https_t request) {
+    if (!windows_request_allowed(response, request, "desk layout")) return;
+    const auto args = request->parse_query_string();
+    const auto uuid = resolve_client_identity_from_request(request).uuid;
+    int wait_ms = 0;
+    std::uint64_t etag = 0;
+    try {
+      wait_ms = std::clamp(std::stoi(get_arg(args, "wait", "0")), 0, 1000);
+      etag = std::stoull(get_arg(args, "etag", "0"));
+    } catch (...) {
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+    app_desk::layout_t layout;
+    for (;;) {
+      layout = app_desk::layout(uuid);
+      if (!layout.valid || layout.etag != etag || std::chrono::steady_clock::now() >= deadline) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    }
+    if (!layout.valid) {
+      write_json(response, {{"gone", true}}, SimpleWeb::StatusCode::client_error_not_found);
+      return;
+    }
+    nlohmann::json out {
+      {"windows", nlohmann::json::array()},
+      {"etag", std::to_string(layout.etag)},
+    };
+    for (const auto &w : layout.windows) {
+      char handle[32], owner[32];
+      snprintf(handle, sizeof(handle), "0x%llx", static_cast<unsigned long long>(w.handle));
+      snprintf(owner, sizeof(owner), "0x%llx", static_cast<unsigned long long>(w.owner));
+      out["windows"].push_back({
+        {"hwnd", handle},
+        {"owner", owner},
+        {"pid", w.pid},
+        {"process", w.process},
+        {"title", w.title},
+        {"kind", w.kind},
+        {"rect", {w.rect[0], w.rect[1], w.rect[2], w.rect[3]}},
+        {"state", w.state},
+        {"focused", w.focused},
+        {"caption", w.caption},
+        {"radius", w.radius},
+        {"z", w.z},
+        {"icon", w.icon_key},
+      });
+    }
+    write_json(response, out);
   }
 
   template<class T>
@@ -4594,20 +4716,30 @@ namespace nvhttp {
       window_handle = std::stoull(get_arg(args, "windowHandle", "0"), nullptr, 0);
     } catch (...) {
     }
-    if (!window_handle) return false;
+    const bool desk = get_arg(args, "desk", "0") == "1";
+    if (!window_handle && !desk) return false;
     tree.put("root.resume", 0);
     if (!identity.allow_windows || !host_windows::supported()) {
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "App-window streaming is not enabled for this device");
       return true;
     }
-    if (!host_windows::exists(window_handle)) {
+    std::optional<app_desk::desk_t> desk_info;
+    if (desk) {
+      desk_info = app_desk::get(identity.uuid);
+      if (!desk_info) {
+        tree.put("root.<xmlattr>.status_code", 404);
+        tree.put("root.<xmlattr>.status_message", "Open the desk (POST /actions/desk?op=open) before streaming it");
+        return true;
+      }
+    } else if (!host_windows::exists(window_handle)) {
       tree.put("root.<xmlattr>.status_code", 404);
       tree.put("root.<xmlattr>.status_message", "The requested window no longer exists");
       return true;
     }
     auto launch_session = make_launch_session(false, args, request, false, &identity, false, dispatch::include_request_identity_log_fields(trace_id));
     launch_session->window_handle = window_handle;
+    if (desk_info) launch_session->desk_display = desk_info->display;
     launch_session->role = remote_session::role_e::game;
     launch_session->role_generation = launch_session->id;
     launch_session->host_audio = false;
@@ -4622,8 +4754,13 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message", "RTSP pending session admission was rejected");
       return true;
     }
-    BOOST_LOG(info) << "App-window session admitted for client [" << identity.name << "] window 0x" << std::hex << window_handle << std::dec
-                    << " (" << launch_session->width << 'x' << launch_session->height << '@' << launch_session->fps << ")";
+    if (desk_info) {
+      BOOST_LOG(info) << "Desk session admitted for client [" << identity.name << "] display " << desk_info->display
+                      << " (" << launch_session->width << 'x' << launch_session->height << '@' << launch_session->fps << ")";
+    } else {
+      BOOST_LOG(info) << "App-window session admitted for client [" << identity.name << "] window 0x" << std::hex << window_handle << std::dec
+                      << " (" << launch_session->width << 'x' << launch_session->height << '@' << launch_session->fps << ")";
+    }
     tree.put("root.<xmlattr>.status_code", 200);
     tree.put("root.sessionUrl0", std::format("{}{}:{}", launch_session->rtsp_url_scheme, net::addr_to_url_escaped_string(request->local_endpoint().address()), static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))));
     tree.put("root.gamesession", 1);
@@ -6838,6 +6975,12 @@ launch_session->exact_target_hold.reset();
     };
     https_server.resource["^/actions/window$"]["POST"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
       run_on_blocking_pool(layout_route_pool, [response, request] { post_host_window_action(response, request); });
+    };
+    https_server.resource["^/actions/desk$"]["POST"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
+      run_on_blocking_pool(layout_route_pool, [response, request] { post_desk(response, request); });
+    };
+    https_server.resource["^/actions/desk-layout$"]["GET"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
+      run_on_blocking_pool(layout_route_pool, [response, request] { get_desk_layout(response, request); });
     };
     https_server.resource["^/power-actions/v1$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
       run_discovery_nvhttp([response, request] { get_power_action_capabilities(response, request); });

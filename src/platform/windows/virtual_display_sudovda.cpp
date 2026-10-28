@@ -4685,6 +4685,10 @@ namespace VDISPLAY_SUDOVDA {
     bool all_removed = true;
     for (const auto &guid : all_guids) {
       GUID native_guid = uuid_to_guid(guid);
+      if (VDISPLAY::is_virtual_display_protected(native_guid)) {
+        BOOST_LOG(debug) << "Keeping protected virtual display with GUID " << guid.string();
+        continue;
+      }
       BOOST_LOG(debug) << "Removing virtual display with GUID " << guid.string();
       if (!VDISPLAY_SUDOVDA::removeVirtualDisplay(native_guid)) {
         all_removed = false;

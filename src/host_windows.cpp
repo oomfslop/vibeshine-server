@@ -192,6 +192,20 @@ namespace host_windows {
     return out[2] > 0 && out[3] > 0;
   }
 
+  std::string icon_key(std::uint64_t handle) {
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    if (!IsWindow(hwnd)) return {};
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (HICON icon = window_icon_handle(hwnd)) {
+      char key[48];
+      snprintf(key, sizeof(key), "%llx-%lu", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(icon)), static_cast<unsigned long>(pid));
+      return key;
+    }
+    if (!process_image(pid).empty()) return "exe-" + std::to_string(pid);
+    return {};
+  }
+
   std::vector<window_info_t> list() {
     std::vector<window_info_t> out;
     const HWND foreground = GetForegroundWindow();
@@ -1111,6 +1125,10 @@ namespace host_windows {
   }
 
   std::string icon_png(std::uint64_t) {
+    return {};
+  }
+
+  std::string icon_key(std::uint64_t) {
     return {};
   }
 

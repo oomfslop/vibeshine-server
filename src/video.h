@@ -32,6 +32,7 @@ namespace video {
    *  out of the capture; the tray/hotkey toggle (display_cursor) still wins. */
   void add_cursor_hide_request(int delta);
   extern bool effective_display_cursor;
+  inline bool cursor_never = false;  ///< capture flag of producers that never show the host cursor
 
   /* Encoding configuration requested by remote client */
   struct config_t {
@@ -77,6 +78,9 @@ namespace video {
     // Input-only sessions use an in-memory black producer without desktop capture.
     capture_source_e capture_source {capture_source_e::active_output};
     std::optional<std::string> capture_output;
+    // Leave the host cursor out of this producer's capture (exact outputs with
+    // a producer of their own: app-window desks draw the client's cursor).
+    bool hide_cursor = false;
     // Recheck the exact platform binding before each native capture open/reopen.
     // This callback also retains the target through the producer/GPU lifetime.
     std::function<bool()> capture_target_valid;

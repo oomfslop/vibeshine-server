@@ -112,6 +112,7 @@ namespace rtsp_stream {
     // App-window streaming: capture only this top-level window (HWND); 0 = normal session.
     std::uint64_t window_handle = 0;
     bool hide_cursor = false;  ///< client draws its own cursor: leave the host cursor out of the capture
+    std::string desk_display;  ///< desk session: capture this display (the client's desk) instead of a window
     std::string virtual_display_catalog_error;
     bool client_display_mode_override;
     // Exact refresh requested by a per-client display-mode override, expressed

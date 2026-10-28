@@ -3944,8 +3944,10 @@ namespace stream {
       session->client_display_refresh_millihz = launch_session.client_display_refresh_millihz;
       session->secondary_game_client = launch_session.secondary_game_client;
       session->remote_role = launch_session.role;
-      session->app_window = launch_session.window_handle != 0;
-      session->hide_cursor = launch_session.hide_cursor;
+      session->app_window = launch_session.window_handle != 0 || !launch_session.desk_display.empty();
+      // A desk has a producer of its own and hides the cursor there; only
+      // shared-display sessions need the process-wide request.
+      session->hide_cursor = launch_session.hide_cursor && launch_session.desk_display.empty();
       if (session->hide_cursor) video::add_cursor_hide_request(1);
       session->remote_role_generation = launch_session.role_generation;
       session->monitor_profile_uuid = launch_session.monitor_profile_uuid;
@@ -3998,7 +4000,14 @@ namespace stream {
           session->config.monitor.capture_output.reset();
           break;
       }
-      if (launch_session.window_handle) {
+      if (!launch_session.desk_display.empty()) {
+        // Desk session: the client's private display, captured like any
+        // monitor but on a producer of its own, without audio or host cursor.
+        session->config.monitor.capture_source = video::capture_source_e::exact_output;
+        session->config.monitor.capture_output = launch_session.desk_display;
+        session->config.monitor.hide_cursor = true;
+        session->audio_disabled = true;
+      } else if (launch_session.window_handle) {
         // App-window session: private WGC capture of one window, no audio.
         session->config.monitor.capture_source = video::capture_source_e::window;
         session->config.monitor.capture_output = "hwnd:" + std::to_string(launch_session.window_handle);

@@ -17,6 +17,7 @@
 #include <icm.h>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -876,6 +877,35 @@ namespace VDISPLAY {
     auto borrowed_output_mutation = display_helper::borrow::native_mutation_scope_t::enter(display_helper::borrow::helper_process().load(std::memory_order_acquire));
     if (!borrowed_output_mutation) return false;
     return use_sunshine_driver() ? VDISPLAY_SUNSHINE::removeVirtualDisplay(guid) : VDISPLAY_SUDOVDA::removeVirtualDisplay(guid);
+  }
+
+  namespace {
+    std::mutex g_protected_mutex;
+    std::vector<std::pair<GUID, std::wstring>> g_protected_displays;
+  }  // namespace
+
+  void set_virtual_display_protected(const GUID &guid, const std::wstring &device_name, bool protect) {
+    std::lock_guard lock(g_protected_mutex);
+    auto it = std::find_if(g_protected_displays.begin(), g_protected_displays.end(), [&](const auto &entry) {
+      return IsEqualGUID(entry.first, guid);
+    });
+    if (protect && it == g_protected_displays.end()) g_protected_displays.emplace_back(guid, device_name);
+    else if (protect) it->second = device_name;
+    if (!protect && it != g_protected_displays.end()) g_protected_displays.erase(it);
+  }
+
+  bool is_virtual_display_protected(const GUID &guid) {
+    std::lock_guard lock(g_protected_mutex);
+    return std::any_of(g_protected_displays.begin(), g_protected_displays.end(), [&](const auto &entry) {
+      return IsEqualGUID(entry.first, guid);
+    });
+  }
+
+  bool is_virtual_display_protected(const std::wstring &device_name) {
+    std::lock_guard lock(g_protected_mutex);
+    return std::any_of(g_protected_displays.begin(), g_protected_displays.end(), [&](const auto &entry) {
+      return !entry.second.empty() && _wcsicmp(entry.second.c_str(), device_name.c_str()) == 0;
+    });
   }
 
   bool removeAllVirtualDisplays() {

@@ -48,7 +48,7 @@ namespace platf::virtual_display_cleanup {
         virtual_displays.begin(),
         virtual_displays.end(),
         [](const VDISPLAY::VirtualDisplayInfo &info) {
-          return info.is_active;
+          return info.is_active && !VDISPLAY::is_virtual_display_protected(info.device_name);
         }
       );
     }
@@ -59,7 +59,7 @@ namespace platf::virtual_display_cleanup {
         virtual_displays.begin(),
         virtual_displays.end(),
         [](const VDISPLAY::VirtualDisplayInfo &info) {
-          return info.is_active;
+          return info.is_active && !VDISPLAY::is_virtual_display_protected(info.device_name);
         }
       ));
     }

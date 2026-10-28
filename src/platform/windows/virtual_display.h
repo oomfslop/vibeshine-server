@@ -229,6 +229,12 @@ namespace VDISPLAY {
   void restorePhysicalHdrProfiles();
   bool removeVirtualDisplay(const GUID &guid);
   bool removeAllVirtualDisplays();
+  // Displays that outlive streams (app-window desks): removeAllVirtualDisplays
+  // and the cleanup's teardown accounting leave them alone; only an explicit
+  // removeVirtualDisplay(guid) takes them down.
+  void set_virtual_display_protected(const GUID &guid, const std::wstring &device_name, bool protect);
+  bool is_virtual_display_protected(const GUID &guid);
+  bool is_virtual_display_protected(const std::wstring &device_name);
   void schedule_virtual_display_recovery_monitor(const VirtualDisplayRecoveryParams &params);
   // Stop recovery for one ended display without removing or untracking it.
   void cancel_virtual_display_recovery_monitor(const GUID &guid);

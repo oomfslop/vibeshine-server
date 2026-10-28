@@ -51,6 +51,8 @@ namespace host_windows {
   std::vector<window_info_t> list();
   /** PNG bytes of the window's icon (large), empty when unavailable. */
   std::string icon_png(std::uint64_t handle);
+  /** Stable cache key of the window's icon ("" when none): equal keys mean equal pictures. */
+  std::string icon_key(std::uint64_t handle);
   /** x/y/w/h are used by move and resize (outer size). */
   bool action(std::uint64_t handle, op_e op, int x = 0, int y = 0, int w = 0, int h = 0);
   bool parse_op(const std::string &name, op_e &out);

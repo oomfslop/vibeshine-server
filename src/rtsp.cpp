@@ -207,6 +207,8 @@ namespace rtsp_stream {
     snapshot->exact_monitor_target = source.exact_monitor_target;
     snapshot->remote_capture_output = source.remote_capture_output;
     snapshot->window_handle = source.window_handle;
+    snapshot->desk_display = source.desk_display;
+    snapshot->hide_cursor = source.hide_cursor;
     snapshot->rtsp_source_address = source.rtsp_source_address;
     snapshot->gcm_key = source.gcm_key;
     snapshot->iv = source.iv;
