@@ -4194,8 +4194,22 @@ namespace nvhttp {
     for (;;) {
       layout = app_desk::layout(uuid);
       // When this snapshot became true, on the frames' clock: after the atlas
-      // took its slots, so no frame before it shows them
+      // took its slots, so no frame before it shows them. A picture that
+      // changed place is drawn there from one of the next compositions on;
+      // until then frames still have it (too) where it was (the atlas leaves
+      // it there a while), so the new places are dated a little later.
       taken = stream::video_clock_now();
+      if (layout.moved) {
+        const auto desk = app_desk::get(uuid);
+        const int fps = desk && desk->fps > 0 ? desk->fps : 60;
+        // (frames; "delay" overrides it for experiments)
+        double frames = 2.5;
+        try {
+          frames = std::clamp(std::stod(get_arg(args, "delay", "2.5")), 0.0, 30.0);
+        } catch (...) {
+        }
+        taken += static_cast<std::uint32_t>(90000 * frames / fps);
+      }
       if (!layout.valid || layout.etag != etag || std::chrono::steady_clock::now() >= deadline) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(4));
     }
@@ -4209,6 +4223,8 @@ namespace nvhttp {
       {"ts", taken},
       {"cursor", layout.cursor},
       {"atlas_us", layout.atlas_us},
+      {"hard_repacks", layout.hard_repacks},
+      {"ghosts", layout.ghosts},
     };
     for (const auto &w : layout.windows) {
       char handle[32], owner[32];

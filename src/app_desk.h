@@ -87,6 +87,9 @@ namespace app_desk {
     std::string cursor = "arrow";  ///< the host pointer's shape: arrow, ibeam, hand, we, ns, nwse, nesw, all, cross, no, wait, progress, help, uparrow
     std::uint64_t etag = 0;
     int atlas_us = 0;  ///< what syncing the atlas took (diagnostics)
+    bool moved = false;  ///< a picture changed place in the atlas
+    unsigned hard_repacks = 0;  ///< diagnostics
+    int ghosts = 0;
   };
   /** Everything visible on the desk right now. Caption-less popups that lie
    *  entirely inside their owner are omitted: they are already part of the

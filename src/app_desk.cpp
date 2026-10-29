@@ -1345,11 +1345,11 @@ namespace app_desk {
       // The parts of a window the user sees, in its frame: 32 px cells, each
       // shown unless one window above covers it whole or it is off the desk,
       // grown by a cell (a window moved or uncovered on the client has
-      // real pixels there before the host catches up), as at most eight
-      // rectangles. The atlas keeps these 1:1 when the window goes smaller.
+      // real pixels there before the host catches up), as 256 px tiles. The
+      // atlas keeps these 1:1 when the window goes smaller.
       auto visible_parts = [&](std::size_t i) {
         const auto &w = out.windows[i];
-        constexpr int cell = 32, grow = 1, most = 8;
+        constexpr int cell = 32, grow = 1;
         const int cols = (w.rect[2] + cell - 1) / cell, rows = (w.rect[3] + cell - 1) / cell;
         const int dw = desk.right - desk.left, dh = desk.bottom - desk.top;
         std::vector<char> shown(static_cast<std::size_t>(cols) * rows, 0), grown(shown.size(), 0);
@@ -1374,58 +1374,18 @@ namespace app_desk {
             }
           }
         }
-        // Runs of each row, stacked onto the same run of the row above
-        struct run_t {
-          int c0, c1, r0, r1;
-        };
-        std::vector<run_t> done, open;
-        for (int r = 0; r < rows; ++r) {
-          std::vector<run_t> next;
-          for (int c = 0; c < cols;) {
-            if (!grown[r * cols + c]) {
-              ++c;
-              continue;
-            }
-            int e = c;
-            while (e < cols && grown[r * cols + e]) ++e;
-            auto above = std::find_if(open.begin(), open.end(), [&](const run_t &o) {
-              return o.c0 == c && o.c1 == e;
-            });
-            if (above != open.end()) {
-              next.push_back({c, e, above->r0, r + 1});
-              open.erase(above);
-            } else {
-              next.push_back({c, e, r, r + 1});
-            }
-            c = e;
-          }
-          done.insert(done.end(), open.begin(), open.end());
-          open = std::move(next);
-        }
-        done.insert(done.end(), open.begin(), open.end());
-        auto area = [](const run_t &a) {
-          return static_cast<long long>(a.c1 - a.c0) * (a.r1 - a.r0);
-        };
-        while (done.size() > most) {
-          std::size_t bi = 0, bj = 1;
-          long long best = LLONG_MAX;
-          for (std::size_t a = 0; a < done.size(); ++a) {
-            for (std::size_t b = a + 1; b < done.size(); ++b) {
-              const run_t box {std::min(done[a].c0, done[b].c0), std::max(done[a].c1, done[b].c1), std::min(done[a].r0, done[b].r0), std::max(done[a].r1, done[b].r1)};
-              const long long extra = area(box) - area(done[a]) - area(done[b]);
-              if (extra < best) {
-                best = extra;
-                bi = a;
-                bj = b;
-              }
-            }
-          }
-          done[bi] = {std::min(done[bi].c0, done[bj].c0), std::max(done[bi].c1, done[bj].c1), std::min(done[bi].r0, done[bj].r0), std::max(done[bi].r1, done[bj].r1)};
-          done.erase(done.begin() + bj);
-        }
+        // As fixed tiles of the frame: what a move uncovers or covers changes
+        // only the tiles at the edge, the others keep their place in the atlas
+        constexpr int tile = 256 / cell;
         std::vector<RECT> parts;
-        for (const auto &d : done) {
-          parts.push_back({d.c0 * cell, d.r0 * cell, std::min(d.c1 * cell, w.rect[2]), std::min(d.r1 * cell, w.rect[3])});
+        for (int tr = 0; tr * tile < rows; ++tr) {
+          for (int tc = 0; tc * tile < cols; ++tc) {
+            bool any = false;
+            for (int r = tr * tile; r < std::min(rows, (tr + 1) * tile) && !any; ++r) {
+              for (int c = tc * tile; c < std::min(cols, (tc + 1) * tile) && !any; ++c) any = grown[r * cols + c];
+            }
+            if (any) parts.push_back({tc * tile * cell, tr * tile * cell, std::min((tc + 1) * tile * cell, w.rect[2]), std::min((tr + 1) * tile * cell, w.rect[3])});
+          }
         }
         return parts;
       };
@@ -1445,7 +1405,9 @@ namespace app_desk {
         sources.push_back({reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)), w.rect[2], w.rect[3], w.kind == "popup", priority, w.kind == "popup" ? std::vector<RECT> {} : visible_parts(i)});
       }
       const auto sync_start = std::chrono::steady_clock::now();
-      const auto slots = atlas->sync(sources);
+      const auto slots = atlas->sync(sources, &out.moved);
+      out.hard_repacks = atlas->hard_repacks();
+      out.ghosts = static_cast<int>(atlas->ghosts());
       out.atlas_us = static_cast<int>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - sync_start).count());
       for (const auto &slot : slots) {
         for (auto &w : out.windows) {

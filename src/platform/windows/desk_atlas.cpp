@@ -22,7 +22,12 @@ namespace desk_atlas {
     struct sync_request_t {
       const std::vector<source_t> *sources;
       std::vector<slot_t> *slots;
+      bool *moved;
     };
+
+    /** How long a thumbnail stays where a picture was: longer than a layout
+     *  takes to reach the client and its frames to be drawn */
+    constexpr auto ghost_time = std::chrono::milliseconds(150);
 
     /** Capacity for a window: a little room to grow in a live resize before
      *  it needs another slot (a step that outgrows its slot moves it). */
@@ -59,10 +64,12 @@ namespace desk_atlas {
     if (thread_.joinable()) thread_.join();
   }
 
-  std::vector<slot_t> atlas_t::sync(const std::vector<source_t> &sources) {
+  std::vector<slot_t> atlas_t::sync(const std::vector<source_t> &sources, bool *moved) {
     std::vector<slot_t> slots;
+    bool changed = false;
+    if (moved) *moved = false;
     if (!window_) return slots;
-    sync_request_t request {&sources, &slots};
+    sync_request_t request {&sources, &slots, moved ? moved : &changed};
     // The window's thread does the work: thumbnails and the backings it
     // paints change together, in the order the next composition shows them
     SendMessageW(window_, sync_message, 0, reinterpret_cast<LPARAM>(&request));
@@ -78,7 +85,7 @@ namespace desk_atlas {
       case sync_message:
         if (self) {
           auto *request = reinterpret_cast<sync_request_t *>(lparam);
-          *request->slots = self->apply(*request->sources);
+          *request->slots = self->apply(*request->sources, *request->moved);
         }
         return 0;
       case WM_PAINT: {
@@ -102,6 +109,8 @@ namespace desk_atlas {
         if (self) {
           for (auto &[source, item] : self->items_) self->release(item);
           self->items_.clear();
+          for (auto &r : self->retired_) DwmUnregisterThumbnail(r.thumb);
+          self->retired_.clear();
         }
         DestroyWindow(hwnd);
         return 0;
@@ -152,40 +161,109 @@ namespace desk_atlas {
   }
 
   void atlas_t::release(item_t &item) {
-    if (item.black) DwmUnregisterThumbnail(item.black);
-    if (item.white) DwmUnregisterThumbnail(item.white);
+    retire(item.black, item.black_at, false);
+    retire(item.white, item.white_at, true);
     item.black = item.white = nullptr;
-    for (auto &p : item.pieces) {
-      if (p.thumb) DwmUnregisterThumbnail(p.thumb);
-    }
+    for (auto &p : item.pieces) retire(p.thumb, p.cell, false);
     item.pieces.clear();
+  }
+
+  void atlas_t::retire(HTHUMBNAIL thumb, const cell_t &cell, bool white, HWND hwnd, int ox, int oy) {
+    if (thumb) retired_.push_back({thumb, cell, white, std::chrono::steady_clock::now() + ghost_time, hwnd, ox, oy});
+  }
+
+  /** The cells drawing this window 1:1 with its frame's origin at (ox, oy):
+   *  where they overlap, they show the very same pixels */
+  std::vector<atlas_t::cell_t> atlas_t::same_pixels(HWND hwnd, const item_t &item, int ox, int oy) const {
+    std::vector<cell_t> cells;
+    if (item.black && item.black_scale == 1.0 && item.black_at.x == ox && item.black_at.y == oy) cells.push_back(item.black_at);
+    for (const auto &p : item.pieces) {
+      const RECT m = margined(p.part, item);
+      if (p.thumb && p.cell.x - m.left == ox && p.cell.y - m.top == oy) cells.push_back(p.cell);
+    }
+    for (const auto &r : retired_) {
+      if (r.hwnd == hwnd && r.ox == ox && r.oy == oy) cells.push_back(r.cell);
+    }
+    return cells;
+  }
+
+  /** The cell is inside the atlas and overlaps only cells in `own` */
+  bool atlas_t::fits_over(const std::vector<cell_t> &taken, const cell_t &cell, const std::vector<cell_t> &own) const {
+    const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top;
+    if (cell.cw <= 0 || cell.x < 0 || cell.y < 0 || cell.x + cell.cw > W || cell.y + cell.ch > H) return false;
+    for (const auto &t : taken) {
+      if (!overlaps(cell.x, cell.y, cell.cw, cell.ch, t.x, t.y, t.cw, t.ch)) continue;
+      const bool mine = std::any_of(own.begin(), own.end(), [&](const cell_t &o) {
+        return o.x == t.x && o.y == t.y && o.cw == t.cw && o.ch == t.ch;
+      });
+      if (!mine) return false;
+    }
+    return true;
+  }
+
+  /** This very cell, if nothing taken overlaps it */
+  bool atlas_t::take(std::vector<cell_t> &taken, const cell_t &cell) const {
+    const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top;
+    if (cell.cw <= 0 || cell.x < 0 || cell.y < 0 || cell.x + cell.cw > W || cell.y + cell.ch > H) return false;
+    for (const auto &t : taken) {
+      if (overlaps(cell.x, cell.y, cell.cw, cell.ch, t.x, t.y, t.cw, t.ch)) return false;
+    }
+    taken.push_back(cell);
+    return true;
+  }
+
+  std::vector<atlas_t::cell_t> atlas_t::reserved() const {
+    std::vector<cell_t> cells;
+    for (const auto &r : retired_) cells.push_back(r.cell);
+    return cells;
   }
 
   /** The visible parts of a picture drawn smaller, each 1:1 in a cell of its
    *  own; a part with no room as a whole is split along its long side (the
    *  free space of a full atlas is in strips). With `required`, all of them
    *  or nothing. */
-  bool atlas_t::place_pieces(std::vector<cell_t> &taken, item_t &item, bool required) const {
-    constexpr int most = 64, smallest = 128;
+  bool atlas_t::place_pieces(std::vector<cell_t> &taken, HWND hwnd, item_t &item, bool required, bool soft) const {
+    constexpr int most = 192, smallest = 128;
     // Each part's cell holds a margin of real pixels around it, so filtering
     // and chroma at its edges never take in a neighbour's
     const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top;
-    std::size_t n = 0;
+    item.plan.clear();
+    // Where the window was drawn whole, its parts go to the very place they
+    // had in it: wherever they overlap what is (or was just) drawn there, the
+    // pixels are the same, so the switch shows in no frame
+    const bool aligned = item.full_at.cw > 0;
+    std::vector<cell_t> own = aligned ? same_pixels(hwnd, item, item.full_at.x, item.full_at.y) : std::vector<cell_t> {};
     if (item.scale < 1.0) {
       std::vector<RECT> parts(item.want.rbegin(), item.want.rend());  // a stack, first part on top
       while (!parts.empty()) {
         const RECT r = parts.back();
         parts.pop_back();
         const int w = r.right - r.left, h = r.bottom - r.top;
-        cell_t cell;
-        if (place(taken, capacity(w + 2 * piece_margin, W, false), capacity(h + 2 * piece_margin, H, false), cell)) {
-          if (item.pieces.size() <= n) item.pieces.emplace_back();
-          item.pieces[n].part = r;
-          item.pieces[n].cell = cell;
-          ++n;
+        // A part already drawn stays where it is (soft: its cell is taken
+        // for it already)
+        auto same = std::find_if(item.pieces.begin(), item.pieces.end(), [&](const piece_item_t &p) {
+          return p.thumb && EqualRect(&p.part, &r);
+        });
+        if (same != item.pieces.end() && (soft || take(taken, same->cell))) {
+          item.plan.push_back({r, same->cell});
           continue;
         }
-        if (std::max(w, h) >= 2 * smallest && n + parts.size() + 2 <= most) {
+        if (aligned) {
+          const RECT m = margined(r, item);
+          const cell_t at {item.full_at.x + m.left, item.full_at.y + m.top, capacity(w + 2 * piece_margin, W, false), capacity(h + 2 * piece_margin, H, false)};
+          if (fits_over(taken, at, own)) {
+            taken.push_back(at);
+            own.push_back(at);
+            item.plan.push_back({r, at});
+            continue;
+          }
+        }
+        cell_t cell;
+        if (place(taken, capacity(w + 2 * piece_margin, W, false), capacity(h + 2 * piece_margin, H, false), cell)) {
+          item.plan.push_back({r, cell});
+          continue;
+        }
+        if (std::max(w, h) >= 2 * smallest && item.plan.size() + parts.size() + 2 <= most) {
           RECT a = r, b = r;
           if (w >= h) a.right = b.left = r.left + w / 2 / 8 * 8;
           else a.bottom = b.top = r.top + h / 2 / 8 * 8;
@@ -196,7 +274,6 @@ namespace desk_atlas {
         if (required) return false;
       }
     }
-    for (std::size_t k = n; k < item.pieces.size(); ++k) item.pieces[k].cell = {};
     return true;
   }
 
@@ -205,39 +282,49 @@ namespace desk_atlas {
     return {std::max<LONG>(0, part.left - piece_margin), std::max<LONG>(0, part.top - piece_margin), std::min<LONG>(item.w, part.right + piece_margin), std::min<LONG>(item.h, part.bottom + piece_margin)};
   }
 
-  void atlas_t::show_pieces(HWND hwnd, item_t &item) {
+  /** Pieces as planned: parts already drawn in their cell stay, the rest get
+   *  thumbnails of their own; ones no longer planned are retired (hard:
+   *  dropped). Answers whether a picture changed place. */
+  bool atlas_t::show_pieces(HWND hwnd, item_t &item, bool hard) {
     const bool shown = item.black && item.cell.cw > 0;
-    for (auto &p : item.pieces) {
-      if (!shown || p.cell.cw <= 0) {
-        if (p.thumb) DwmUnregisterThumbnail(p.thumb);
-        p.thumb = nullptr;
-        p.cell = {};
-        continue;
-      }
-      if (!p.thumb) {
-        if (FAILED(DwmRegisterThumbnail(window_, hwnd, &p.thumb))) {
-          p.thumb = nullptr;
-          p.cell = {};
-          continue;
-        }
-        p.shown_part = {};
-      }
-      const RECT part = margined(p.part, item);
+    bool moved = false;
+    std::vector<piece_item_t> next;
+    std::vector<bool> kept(item.pieces.size(), false);
+    for (const auto &pl : shown ? item.plan : std::vector<plan_t> {}) {
+      const RECT part = margined(pl.part, item);
       const RECT source {item.source_offset.left + part.left, item.source_offset.top + part.top, item.source_offset.left + part.right, item.source_offset.top + part.bottom};
-      if (EqualRect(&source, &p.shown_part) && p.cell.x == p.shown_cell.x && p.cell.y == p.shown_cell.y) continue;
-      DWM_THUMBNAIL_PROPERTIES props {};
-      props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
-      props.rcDestination = {p.cell.x, p.cell.y, p.cell.x + (part.right - part.left), p.cell.y + (part.bottom - part.top)};
-      props.rcSource = source;
-      props.opacity = 255;
-      props.fVisible = TRUE;
-      props.fSourceClientAreaOnly = FALSE;
-      if (SUCCEEDED(DwmUpdateThumbnailProperties(p.thumb, &props))) {
-        p.shown_part = source;
-        p.shown_cell = p.cell;
+      piece_item_t p;
+      std::size_t k = 0;
+      while (k < item.pieces.size() && (kept[k] || !item.pieces[k].thumb || !EqualRect(&item.pieces[k].part, &pl.part) || item.pieces[k].cell.x != pl.cell.x || item.pieces[k].cell.y != pl.cell.y)) ++k;
+      if (k < item.pieces.size()) {
+        p = item.pieces[k];
+        kept[k] = true;
+      } else {
+        if (FAILED(DwmRegisterThumbnail(window_, hwnd, &p.thumb))) continue;
+        p.part = pl.part;
+        p.cell = pl.cell;
       }
+      if (!EqualRect(&source, &p.source)) {
+        DWM_THUMBNAIL_PROPERTIES props {};
+        props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
+        props.rcDestination = {p.cell.x, p.cell.y, p.cell.x + (part.right - part.left), p.cell.y + (part.bottom - part.top)};
+        props.rcSource = source;
+        props.opacity = 255;
+        props.fVisible = TRUE;
+        props.fSourceClientAreaOnly = FALSE;
+        if (SUCCEEDED(DwmUpdateThumbnailProperties(p.thumb, &props))) p.source = source;
+      }
+      next.push_back(p);
     }
-    while (!item.pieces.empty() && !item.pieces.back().thumb) item.pieces.pop_back();
+    for (std::size_t k = 0; k < item.pieces.size(); ++k) {
+      if (kept[k] || !item.pieces[k].thumb) continue;
+      moved = true;
+      const RECT m = margined(item.pieces[k].part, item);
+      if (hard) DwmUnregisterThumbnail(item.pieces[k].thumb);
+      else retire(item.pieces[k].thumb, item.pieces[k].cell, false, hwnd, item.pieces[k].cell.x - m.left, item.pieces[k].cell.y - m.top);
+    }
+    item.pieces = std::move(next);
+    return moved;
   }
 
   /** MaxRects, best short side fit: the free space is the atlas minus every
@@ -304,10 +391,19 @@ namespace desk_atlas {
     return SUCCEEDED(DwmUpdateThumbnailProperties(thumb, &p));
   }
 
-  std::vector<slot_t> atlas_t::apply(const std::vector<source_t> &sources) {
+  std::vector<slot_t> atlas_t::apply(const std::vector<source_t> &sources, bool &moved) {
     const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top;
+    moved = false;
+    // Thumbnails left where pictures were have served their time
+    const auto now = std::chrono::steady_clock::now();
+    const bool expired = std::erase_if(retired_, [&](const retired_t &r) {
+                           if (r.until > now) return false;
+                           DwmUnregisterThumbnail(r.thumb);
+                           return true;
+                         }) > 0;
     for (auto &[hwnd, item] : items_) item.used = false;
     std::vector<HWND> to_place, pieces_dirty;
+    bool hard = false;  ///< pictures that change place leave no thumbnail behind
     for (const auto &s : sources) {
       if (!s.hwnd || s.w <= 0 || s.h <= 0 || !IsWindow(s.hwnd)) continue;
       auto &item = items_[s.hwnd];
@@ -326,8 +422,8 @@ namespace desk_atlas {
         item.w = s.w;
         item.h = s.h;
         if (moved_origin) {
-          update_thumbnail(item.black, item.cell, item);
-          if (item.white) update_thumbnail(item.white, item.white_cell, item);
+          update_thumbnail(item.black, item.black_at, item);
+          if (item.white) update_thumbnail(item.white, item.white_at, item);
         }
       }
       item.w = s.w;
@@ -374,7 +470,8 @@ namespace desk_atlas {
         }
       }
     }
-    if (any_scaled && (removed || area < last_area_ * 0.97 || outranked)) {
+    // ...or when space left behind by moved pictures frees up
+    if (any_scaled && (removed || area < last_area_ * 0.97 || outranked || expired)) {
       to_place.clear();
       for (const auto &[hwnd, item] : items_) to_place.push_back(hwnd);
     }
@@ -391,16 +488,23 @@ namespace desk_atlas {
         }
         return 0;
       };
-      std::vector<cell_t> taken;
-      for (const auto &[hwnd, item] : items_) {
-        if (placing(hwnd) || !item.black) continue;
-        taken.push_back(item.cell);
-        if (item.has_white) taken.push_back(item.white_cell);
-        if (std::find(pieces_dirty.begin(), pieces_dirty.end(), hwnd) != pieces_dirty.end()) continue;
-        for (const auto &p : item.pieces) {
-          if (p.cell.cw > 0) taken.push_back(p.cell);
+      // Soft: every picture where it is now stays taken (moved, it is left
+      // there for a while), so new places never overlap old ones; a part or
+      // window that keeps its place reuses it. Hard (when soft does not
+      // fit): only the retired thumbnails' places, and moved pictures are
+      // dropped from where they were at once.
+      auto base = [&](bool soft) {
+        std::vector<cell_t> cells = reserved();
+        if (!soft) return cells;
+        for (const auto &[hwnd, item] : items_) {
+          if (item.black) cells.push_back(item.black_at);
+          if (item.white) cells.push_back(item.white_at);
+          for (const auto &p : item.pieces) cells.push_back(p.cell);
         }
-      }
+        return cells;
+      };
+      bool soft = true;
+      std::vector<cell_t> taken = base(true);
       std::sort(to_place.begin(), to_place.end(), [&](HWND a, HWND b) {
         return priority(a) > priority(b);
       });
@@ -411,12 +515,26 @@ namespace desk_atlas {
         const int cw = capacity(static_cast<int>(std::ceil(item.w * scale)), W, room), ch = capacity(static_cast<int>(std::ceil(item.h * scale)), H, room);
         std::vector<cell_t> trial = taken;
         cell_t cell, white;
-        if (!place(trial, cw, ch, cell)) return false;
-        if (item.has_white && !place(trial, cw, ch, white)) return false;
+        // Where it is drawn now, if that is still the size it needs
+        const bool same = item.black && item.black_at.cw == cw && item.black_at.ch == ch && item.black_scale == scale &&
+                          (!item.has_white || (item.white && item.white_at.cw == cw && item.white_at.ch == ch));
+        // Whole again where it was whole, over its own parts there
+        const bool back = !same && scale == 1.0 && !item.has_white && item.full_at.cw == cw && item.full_at.ch == ch &&
+                          fits_over(trial, item.full_at, same_pixels(hwnd, item, item.full_at.x, item.full_at.y));
+        if (same && (soft || (take(trial, item.black_at) && (!item.has_white || take(trial, item.white_at))))) {
+          cell = item.black_at;
+          white = item.white_at;
+        } else if (back) {
+          cell = item.full_at;
+          trial.push_back(cell);
+        } else {
+          if (!place(trial, cw, ch, cell)) return false;
+          if (item.has_white && !place(trial, cw, ch, white)) return false;
+        }
         item.scale = scale;
         if (pieces == 0) {
-          for (auto &p : item.pieces) p.cell = {};
-        } else if (!place_pieces(trial, item, pieces == 2)) {
+          item.plan.clear();
+        } else if (!place_pieces(trial, hwnd, item, pieces == 2, soft)) {
           return false;
         }
         taken = std::move(trial);
@@ -428,7 +546,7 @@ namespace desk_atlas {
       bool all = true;
       for (HWND hwnd : pieces_dirty) {
         std::vector<cell_t> trial = taken;
-        if (!place_pieces(trial, items_[hwnd], !items_[hwnd].loose)) {
+        if (!place_pieces(trial, hwnd, items_[hwnd], !items_[hwnd].loose, true)) {
           all = false;
           break;
         }
@@ -463,7 +581,7 @@ namespace desk_atlas {
         std::set<HWND> loose;
         long long loose_area = 0;  ///< of the loose pieces the last packing placed
         auto pack_all = [&] {
-          taken.clear();
+          taken = base(soft);
           loose_area = 0;
           std::sort(order.begin(), order.end(), [&](HWND a, HWND b) {
             return area(a) > area(b);
@@ -473,118 +591,158 @@ namespace desk_atlas {
           }
           for (auto h = by_priority.rbegin(); h != by_priority.rend(); ++h) {
             if (!loose.contains(*h)) continue;
-            place_pieces(taken, items_[*h], false);
-            for (const auto &p : items_[*h].pieces) {
-              if (p.cell.cw > 0) loose_area += static_cast<long long>(p.part.right - p.part.left) * (p.part.bottom - p.part.top);
-            }
+            place_pieces(taken, *h, items_[*h], false, soft);
+            for (const auto &p : items_[*h].plan) loose_area += static_cast<long long>(p.part.right - p.part.left) * (p.part.bottom - p.part.top);
           }
           return true;
         };
-        // Popups and the focused window are the last to give anything up
+        // Popups and the focused window are the last to give anything up;
+        // a focused window that hangs off the screen or is partly covered
+        // costs less as its visible parts (just as sharp) than whole
         auto top = [&](HWND h) {
-          return items_[h].has_white || priority(h) >= INT_MAX / 4;
+          const auto &it = items_[h];
+          if (it.has_white) return true;
+          if (priority(h) < INT_MAX / 4) return false;
+          long long shown = 0;
+          for (const auto &r : it.want) shown += static_cast<long long>(r.right - r.left) * (r.bottom - r.top);
+          return shown * 100 >= static_cast<long long>(it.w) * it.h * 85;
         };
+        // Soft first, all the way down to the smallest stand-ins (the visible
+        // parts stay sharp either way); only if even that does not fit, hard
         bool packed = false;
-        for (int round = 0; round < 64 && !packed; ++round) {
-          packed = pack_all();
-          if (packed) {
-            // Then the stand-ins of windows that went smaller as large as
-            // still fits (most visible first): what a move uncovers before
-            // its pieces come shows nearly sharp
-            const long long sharp = loose_area;
-            for (auto h = by_priority.rbegin(); h != by_priority.rend(); ++h) {
-              if (scales[*h] >= 1.0 || items_[*h].has_white || loose.contains(*h)) continue;
-              const double was = scales[*h];
-              for (double step : steps) {
-                if (step <= was + 1e-9) break;
-                scales[*h] = step;
-                if (pack_all() && loose_area >= sharp) break;
-                scales[*h] = was;
-              }
-            }
-            // The last trial may have failed: place everything as chosen
+        auto run = [&](bool soft_mode) {
+          soft = soft_mode;
+          for (HWND h : order) scales[h] = 1.0;
+          loose.clear();
+          packed = false;
+          for (int round = 0; round < 64 && !packed; ++round) {
             packed = pack_all();
-            break;
-          }
-          // Shrink a step the window showing the fewest pixels at its current
-          // scale: the loss spreads over the least visible windows instead
-          // of one window going very blurry
-          HWND pick = nullptr;
-          double least = 0;
-          for (int pass = 0; pass < 2 && !pick; ++pass) {
-            for (HWND h : by_priority) {
-              if (scales[h] <= steps[std::size(steps) - 1] || top(h) != (pass == 1)) continue;
-              const double shown = static_cast<double>(priority(h)) * scales[h];
-              if (!pick || shown < least) {
-                pick = h;
-                least = shown;
+            if (packed) {
+              // Then the stand-ins of windows that went smaller as large as
+              // still fits (most visible first): what a move uncovers before
+              // its pieces come shows nearly sharp
+              const long long sharp = loose_area;
+              for (auto h = by_priority.rbegin(); h != by_priority.rend(); ++h) {
+                if (scales[*h] >= 1.0 || items_[*h].has_white || loose.contains(*h)) continue;
+                const double was = scales[*h];
+                for (double step : steps) {
+                  if (step <= was + 1e-9) break;
+                  scales[*h] = step;
+                  if (pack_all() && loose_area >= sharp) break;
+                  scales[*h] = was;
+                }
               }
+              // The last trial may have failed: place everything as chosen
+              packed = pack_all();
+              break;
             }
-            if (pick || pass == 1) break;
-            // Every other window is as small as it goes: the least visible
-            // one's pieces go where room is left
-            for (HWND h : by_priority) {
-              if (!top(h) && !loose.contains(h) && scales[h] < 1.0 && !items_[h].want.empty()) {
-                loose.insert(h);
-                pick = h;
+            // Shrink a step the window showing the fewest pixels at its current
+            // scale: the loss spreads over the least visible windows instead
+            // of one window going very blurry
+            HWND pick = nullptr;
+            double least = 0;
+            for (int pass = 0; pass < 2 && !pick; ++pass) {
+              for (HWND h : by_priority) {
+                if (scales[h] <= steps[std::size(steps) - 1] || top(h) != (pass == 1)) continue;
+                const double shown = static_cast<double>(priority(h)) * scales[h];
+                if (!pick || shown < least) {
+                  pick = h;
+                  least = shown;
+                }
+              }
+              if (pick || pass == 1) break;
+              // Every other window is as small as it goes: the least visible
+              // one's pieces go where room is left
+              for (HWND h : by_priority) {
+                if (!top(h) && !loose.contains(h) && scales[h] < 1.0 && !items_[h].want.empty()) {
+                  loose.insert(h);
+                  pick = h;
+                  break;
+                }
+              }
+              if (pick) break;
+            }
+            if (!pick) break;
+            if (loose.contains(pick) && !top(pick) && scales[pick] <= steps[std::size(steps) - 1]) continue;
+            // A window's visible parts stay 1:1 (pieces), so the rest of it
+            // goes straight to a small stand-in; popups have no pieces
+            if (!items_[pick].has_white) {
+              scales[pick] = scales[pick] > 0.25 ? 0.25 : steps[std::size(steps) - 1];
+              continue;
+            }
+            for (std::size_t k = 0; k + 1 < std::size(steps); ++k) {
+              if (scales[pick] >= steps[k] - 1e-9) {
+                scales[pick] = steps[k + 1];
                 break;
               }
             }
-            if (pick) break;
           }
-          if (!pick) break;
-          if (loose.contains(pick) && !top(pick) && scales[pick] <= steps[std::size(steps) - 1]) continue;
-          // A window's visible parts stay 1:1 (pieces), so the rest of it
-          // goes straight to a small stand-in; popups have no pieces
-          if (!items_[pick].has_white) {
-            scales[pick] = scales[pick] > 0.25 ? 0.25 : steps[std::size(steps) - 1];
-            continue;
-          }
-          for (std::size_t k = 0; k + 1 < std::size(steps); ++k) {
-            if (scales[pick] >= steps[k] - 1e-9) {
-              scales[pick] = steps[k + 1];
-              break;
-            }
-          }
-        }
+        };
+        run(true);
+        if (!packed) run(false);
         to_place = order;
         for (auto &[hwnd, item] : items_) item.loose = loose.contains(hwnd);
         if (!packed) {
           // Not even then: what fits, pieces where they fit
-          taken.clear();
+          soft = false;
+          taken = base(false);
           for (HWND hwnd : order) {
             auto &item = items_[hwnd];
             if (!place_item(hwnd, item, scales[hwnd], 1)) {
               item.cell = {};
               item.white_cell = {};
-              for (auto &p : item.pieces) p.cell = {};
+              item.plan.clear();
             }
           }
         }
         BOOST_LOG(info) << "Desk atlas: repacked " << order.size() << " windows";
       }
+      hard = !soft;
+      if (hard) ++hard_repacks_;
+      // A picture that changed place gets a new thumbnail there; the old one
+      // stays where it was for a while (hard: goes now)
+      auto leave = [&](HWND hwnd, HTHUMBNAIL &thumb, const cell_t &at, bool white, bool whole) {
+        if (!thumb) return;
+        moved = true;
+        if (hard) DwmUnregisterThumbnail(thumb);
+        else retire(thumb, at, white, hwnd, whole ? at.x : INT_MIN, whole ? at.y : INT_MIN);
+        thumb = nullptr;
+      };
       for (HWND hwnd : to_place) {
         auto &item = items_[hwnd];
+        const auto same = [](const cell_t &a, const cell_t &b) {
+          return a.x == b.x && a.y == b.y && a.cw == b.cw && a.ch == b.ch;
+        };
+        if (item.cell.cw <= 0 || !same(item.black_at, item.cell) || item.black_scale != item.scale) leave(hwnd, item.black, item.black_at, false, item.black_scale == 1.0 && !item.has_white);
+        if (item.cell.cw <= 0 || !item.has_white || !same(item.white_at, item.white_cell)) leave(hwnd, item.white, item.white_at, true, false);
         if (item.cell.cw <= 0) continue;
-        if (!item.black && FAILED(DwmRegisterThumbnail(window_, hwnd, &item.black))) item.black = nullptr;
-        if (item.has_white && !item.white && FAILED(DwmRegisterThumbnail(window_, hwnd, &item.white))) item.white = nullptr;
-        if (!item.has_white && item.white) {
-          DwmUnregisterThumbnail(item.white);
-          item.white = nullptr;
+        if (!item.black && SUCCEEDED(DwmRegisterThumbnail(window_, hwnd, &item.black))) {
+          item.black_at = item.cell;
+          item.black_scale = item.scale;
+          if (item.scale == 1.0 && !item.has_white) item.full_at = item.cell;
+          update_thumbnail(item.black, item.cell, item);
         }
-        if (item.black) update_thumbnail(item.black, item.cell, item);
-        if (item.white) update_thumbnail(item.white, item.white_cell, item);
+        if (item.has_white && !item.white && SUCCEEDED(DwmRegisterThumbnail(window_, hwnd, &item.white))) {
+          item.white_at = item.white_cell;
+          update_thumbnail(item.white, item.white_cell, item);
+        }
       }
     }
 
-    for (auto &[hwnd, item] : items_) show_pieces(hwnd, item);
+    for (auto &[hwnd, item] : items_) moved = show_pieces(hwnd, item, hard) || moved;
+    // Dropped at once, nothing is left where pictures were: the new places
+    // hold from the next composition on, as precisely as that can be dated
+    if (hard) moved = false;
 
     // The white backings first in the frame order: painted now, synchronously
     std::vector<RECT> white;
     for (const auto &[hwnd, item] : items_) {
-      if (item.white && item.white_cell.cw > 0) {
-        white.push_back({item.white_cell.x, item.white_cell.y, item.white_cell.x + item.white_cell.cw, item.white_cell.y + item.white_cell.ch});
+      if (item.white && item.white_at.cw > 0) {
+        white.push_back({item.white_at.x, item.white_at.y, item.white_at.x + item.white_at.cw, item.white_at.y + item.white_at.ch});
       }
+    }
+    for (const auto &r : retired_) {
+      if (r.white) white.push_back({r.cell.x, r.cell.y, r.cell.x + r.cell.cw, r.cell.y + r.cell.ch});
     }
     const bool repaint = white.size() != white_.size() || !std::equal(white.begin(), white.end(), white_.begin(), [](const RECT &a, const RECT &b) {
                            return EqualRect(&a, &b);
@@ -595,6 +753,7 @@ namespace desk_atlas {
       UpdateWindow(window_);
     }
 
+    ghost_count_ = retired_.size();
     std::vector<slot_t> out;
     for (const auto &[hwnd, item] : items_) {
       if (!item.black || item.cell.cw <= 0) continue;

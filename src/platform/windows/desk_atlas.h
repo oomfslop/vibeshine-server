@@ -20,12 +20,20 @@
  * the parts of them the user sees go in 1:1 as well ("pieces", thumbnails of
  * just that part): what is on the client's screen never fills more than the
  * screen, which the atlas is larger than, so it stays sharp.
+ *
+ * A thumbnail is never moved: when a picture goes elsewhere in the atlas, a
+ * new thumbnail draws it there and the old one stays where it was for a
+ * while (nothing else is placed there meanwhile). A frame paired with the
+ * previous layout (the layout and the frames travel separately) then still
+ * finds the right pixels where that layout says.
  */
 #pragma once
 
 #include <windows.h>
 #include <dwmapi.h>
 
+#include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstdint>
 #include <map>
@@ -68,11 +76,22 @@ namespace desk_atlas {
 
     /** Show exactly these windows; answers where each one is drawn. Slots are
      *  kept while a window fits its slot. Changes take effect with the next
-     *  composition. */
-    std::vector<slot_t> sync(const std::vector<source_t> &sources);
+     *  composition; `moved` tells whether a picture changed place while its
+     *  old place stays drawn for a while. */
+    std::vector<slot_t> sync(const std::vector<source_t> &sources, bool *moved = nullptr);
 
     const RECT &monitor() const {
       return monitor_;
+    }
+
+    /** Diagnostics: repacks that could not leave pictures where they were,
+     *  and thumbnails left behind right now */
+    unsigned hard_repacks() const {
+      return hard_repacks_;
+    }
+
+    std::size_t ghosts() const {
+      return ghost_count_;
     }
 
   private:
@@ -82,9 +101,12 @@ namespace desk_atlas {
     struct piece_item_t {
       HTHUMBNAIL thumb = nullptr;
       RECT part {};  ///< in the frame
+      cell_t cell;  ///< where the thumbnail draws it
+      RECT source {};  ///< what the thumbnail was set to draw
+    };
+    struct plan_t {
+      RECT part {};
       cell_t cell;
-      RECT shown_part {};  ///< what the thumbnail was last set to
-      cell_t shown_cell;
     };
     struct item_t {
       HTHUMBNAIL black = nullptr, white = nullptr;
@@ -95,16 +117,34 @@ namespace desk_atlas {
       RECT source_offset {};  ///< frame origin inside the window rect
       bool used = false;
       std::vector<RECT> want;  ///< the visible parts, for pieces when drawn smaller
-      std::vector<piece_item_t> pieces;
+      std::vector<plan_t> plan;  ///< where its pieces are to go
+      std::vector<piece_item_t> pieces;  ///< where they are
+      cell_t black_at, white_at;  ///< where its thumbnails draw it
+      double black_scale = 1.0;  ///< the scale its thumbnail draws it at
+      cell_t full_at;  ///< where it was last drawn whole at 1:1 (its parts can go back there, pixel for pixel)
       bool loose = false;  ///< its pieces only where room is left
     };
 
+    struct retired_t {
+      HTHUMBNAIL thumb = nullptr;
+      cell_t cell;
+      bool white = false;  ///< keeps its white backing
+      std::chrono::steady_clock::time_point until;
+      HWND hwnd = nullptr;
+      int ox = INT_MIN, oy = INT_MIN;  ///< where it put the window's frame origin (1:1 pictures)
+    };
+
     static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+    void retire(HTHUMBNAIL thumb, const cell_t &cell, bool white, HWND hwnd = nullptr, int ox = INT_MIN, int oy = INT_MIN);
+    std::vector<cell_t> same_pixels(HWND hwnd, const item_t &item, int ox, int oy) const;
+    bool fits_over(const std::vector<cell_t> &taken, const cell_t &cell, const std::vector<cell_t> &own) const;
+    bool take(std::vector<cell_t> &taken, const cell_t &cell) const;
+    std::vector<cell_t> reserved() const;
     void run();
-    std::vector<slot_t> apply(const std::vector<source_t> &sources);
+    std::vector<slot_t> apply(const std::vector<source_t> &sources, bool &moved);
     bool place(std::vector<cell_t> &taken, int cw, int ch, cell_t &out) const;
-    bool place_pieces(std::vector<cell_t> &taken, item_t &item, bool required) const;
-    void show_pieces(HWND hwnd, item_t &item);
+    bool place_pieces(std::vector<cell_t> &taken, HWND hwnd, item_t &item, bool required, bool soft) const;
+    bool show_pieces(HWND hwnd, item_t &item, bool hard);
     static RECT margined(const RECT &part, const item_t &item);
     void release(item_t &item);
     void paint(HDC dc);
@@ -120,6 +160,9 @@ namespace desk_atlas {
     std::vector<RECT> white_;  ///< backings to paint (client coordinates)
     unsigned ticks_ = 0;
     double last_area_ = 0;  ///< what the windows asked for at the last sync
+    std::vector<retired_t> retired_;  ///< thumbnails left where they were, for a while
+    unsigned hard_repacks_ = 0;
+    std::size_t ghost_count_ = 0;
   };
 
 }  // namespace desk_atlas
