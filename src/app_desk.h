@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,10 @@ namespace app_desk {
    *  and DPI; creates or retunes the display. Takes a few seconds the first time. */
   desk_t open(const std::string &client_uuid, int w, int h, int fps, int dpi);
   std::optional<desk_t> get(const std::string &client_uuid);
+  /** Where absolute pointer input for this client's desk session goes: the
+   *  desk's origin relative to the virtual desktop's (the session captures
+   *  the atlas, of the same size). */
+  std::optional<std::pair<int, int>> input_origin(const std::string &client_uuid);
   /** Put every adopted window back and let the display go idle (it is removed
    *  after ten minutes without a desk). */
   void close(const std::string &client_uuid);

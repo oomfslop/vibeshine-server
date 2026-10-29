@@ -35,6 +35,7 @@ extern "C" {
 }
 
 // local includes
+#include "app_desk.h"
 #include "cbs.h"
 #include "capture_recovery.h"
 #include "config.h"
@@ -5578,6 +5579,14 @@ namespace video {
 
     if (auto geometry = display->input_geometry_snapshot()) {
       input::geometry::apply_snapshot_to_port(result, *geometry);
+    }
+    if (!config.desk_client.empty()) {
+      // Desk session: the picture is the atlas, the windows (and so the
+      // pointer) are on the desk
+      if (auto origin = app_desk::input_origin(config.desk_client)) {
+        result.offset_x = origin->first;
+        result.offset_y = origin->second;
+      }
     }
     return result;
   }

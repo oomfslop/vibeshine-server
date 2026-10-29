@@ -4020,6 +4020,7 @@ namespace stream {
         session->config.monitor.capture_source = video::capture_source_e::exact_output;
         session->config.monitor.capture_output = launch_session.desk_display;
         session->config.monitor.hide_cursor = true;
+        session->config.monitor.desk_client = launch_session.client_uuid;
         session->audio_disabled = true;
       }
       BOOST_LOG(info) << "Session capture source: role=" << static_cast<int>(launch_session.role)

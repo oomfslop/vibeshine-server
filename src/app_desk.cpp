@@ -21,6 +21,7 @@
   #include <memory>
   #include <cstring>
   #include <map>
+  #include <set>
   #include <mutex>
   #include <thread>
 
@@ -50,6 +51,9 @@ namespace app_desk {
       std::shared_ptr<desk_atlas::atlas_t> atlas_window;
       desk_t info;
       std::map<HWND, POINT> adopted;  ///< window -> frame origin before adoption
+      std::set<HWND> seen;  ///< app windows anywhere on the host at the last look (new ones are adopted)
+      bool seen_once = false;
+      std::chrono::steady_clock::time_point seen_at {};
       bool open = false;  ///< a client is using it (false = idle, kept for a while)
       std::chrono::steady_clock::time_point idle_since {};
       unsigned idle_generation = 0;
@@ -687,19 +691,22 @@ namespace app_desk {
     /** The host pointer's shape, by the system cursor it is (apps' own
      *  cursors are drawn as arrows): the client shows the Mac's equivalent. */
     std::string cursor_shape() {
+      // The pointer belongs to the interactive desktop: this request thread
+      // has to be on it to see the real cursor
+      platf::syncThreadDesktop();
       CURSORINFO ci {};
       ci.cbSize = sizeof(ci);
       if (!GetCursorInfo(&ci) || !ci.hCursor) return "arrow";
       static const struct {
-        LPCWSTR id;
+        WORD id;
         const char *name;
       } table[] = {
-        {IDC_ARROW, "arrow"}, {IDC_IBEAM, "ibeam"}, {IDC_HAND, "hand"}, {IDC_SIZEWE, "we"}, {IDC_SIZENS, "ns"},
-        {IDC_SIZENWSE, "nwse"}, {IDC_SIZENESW, "nesw"}, {IDC_SIZEALL, "all"}, {IDC_CROSS, "cross"}, {IDC_NO, "no"},
-        {IDC_WAIT, "wait"}, {IDC_APPSTARTING, "progress"}, {IDC_HELP, "help"}, {IDC_UPARROW, "uparrow"},
+        {32512, "arrow"}, {32513, "ibeam"}, {32649, "hand"}, {32644, "we"}, {32645, "ns"},  // IDC_ARROW, IBEAM, HAND, SIZEWE, SIZENS
+        {32642, "nwse"}, {32643, "nesw"}, {32646, "all"}, {32515, "cross"}, {32648, "no"},  // SIZENWSE, SIZENESW, SIZEALL, CROSS, NO
+        {32514, "wait"}, {32650, "progress"}, {32651, "help"}, {32516, "uparrow"},  // WAIT, APPSTARTING, HELP, UPARROW
       };
       for (const auto &c : table) {
-        if (ci.hCursor == LoadCursorW(nullptr, c.id)) return c.name;
+        if (ci.hCursor == LoadCursorW(nullptr, MAKEINTRESOURCEW(c.id))) return c.name;
       }
       return "arrow";
     }
@@ -827,6 +834,14 @@ namespace app_desk {
     return it->second.info;
   }
 
+  std::optional<std::pair<int, int>> input_origin(const std::string &client_uuid) {
+    std::lock_guard lock(g_mutex);
+    auto it = g_desks.find(client_uuid);
+    RECT rect {};
+    if (it == g_desks.end() || !find_monitor(it->second.device, &rect)) return std::nullopt;
+    return std::pair<int, int> {static_cast<int>(rect.left - GetSystemMetrics(SM_XVIRTUALSCREEN)), static_cast<int>(rect.top - GetSystemMetrics(SM_YVIRTUALSCREEN))};
+  }
+
   namespace {
     std::map<std::string, std::pair<int, unsigned>> g_sessions;  ///< client -> (live desk streams, generation)
   }
@@ -930,11 +945,32 @@ namespace app_desk {
     it->second.adopted[hwnd] = home_for(frame, rect);
     settle_dpi_change(hwnd, GetDpiForWindow(hwnd), frame);
     // First time: keep it inside the desk.
-    const LONG w = frame.right - frame.left, h = frame.bottom - frame.top;
+    const LONG fw = frame.right - frame.left, fh = frame.bottom - frame.top;
     const LONG dw = rect.right - rect.left, dh = rect.bottom - rect.top;
-    x = static_cast<int>(std::max<LONG>(0, std::min<LONG>(x, dw - std::min(w, dw))));
-    y = static_cast<int>(std::max<LONG>(0, std::min<LONG>(y, dh - std::min(h, dh))));
+    x = static_cast<int>(std::max<LONG>(0, std::min<LONG>(x, dw - std::min(fw, dw))));
+    y = static_cast<int>(std::max<LONG>(0, std::min<LONG>(y, dh - std::min(fh, dh))));
     move_frame_to(hwnd, rect.left + x, rect.top + y);
+    // Coming from a display of another DPI it is resized once it is here:
+    // then it goes back inside what the client shows (the work area), if it fits
+    const std::wstring device = it->second.device;
+    std::thread([hwnd, device] {
+      for (int i = 0; i < 8; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        RECT f {}, desk {};
+        HMONITOR mon = find_monitor(device, &desk);
+        if (!mon || !IsWindow(hwnd) || !app_window_layout::frame_rect(hwnd, f)) return;
+        MONITORINFO mi {};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(mon, &mi)) return;
+        const RECT &w = mi.rcWork;
+        const LONG fw = f.right - f.left, fh = f.bottom - f.top;
+        if (fw > w.right - w.left || fh > w.bottom - w.top) return;
+        if (f.right > w.right || f.bottom > w.bottom || f.left < w.left || f.top < w.top) {
+          move_frame_to(hwnd, std::clamp<LONG>(f.left, w.left, w.right - fw), std::clamp<LONG>(f.top, w.top, w.bottom - fh));
+          return;
+        }
+      }
+    }).detach();
     return true;
   }
 
@@ -1012,7 +1048,87 @@ namespace app_desk {
     return true;
   }
 
+  namespace {
+    /** A window an app on the desk opens (Ctrl-N, "open in new window")
+     *  lands where Windows puts it, usually on the host's own display: it
+     *  comes to the desk, cascaded from that app's front window, so it shows
+     *  on the client like the others. Only new windows of processes already
+     *  on the desk; looked for at most ten times a second. */
+    void adopt_new_windows(const std::string &client_uuid) {
+      RECT desk {}, work {};
+      std::set<DWORD> pids;
+      std::set<HWND> seen;
+      bool first = false;
+      std::map<DWORD, RECT> front_of;  // pid -> frame of its top-most window on the desk
+      {
+        std::lock_guard lock(g_mutex);
+        auto it = g_desks.find(client_uuid);
+        if (it == g_desks.end() || !it->second.open) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - it->second.seen_at < std::chrono::milliseconds(100)) return;
+        it->second.seen_at = now;
+        HMONITOR mon = find_monitor(it->second.device, &desk);
+        if (!mon) return;
+        MONITORINFO mi {};
+        mi.cbSize = sizeof(mi);
+        work = GetMonitorInfoW(mon, &mi) ? mi.rcWork : desk;
+        for (const auto &[hwnd, origin] : it->second.adopted) {
+          DWORD pid = 0;
+          if (IsWindow(hwnd) && GetWindowThreadProcessId(hwnd, &pid)) pids.insert(pid);
+        }
+        seen = it->second.seen;
+        first = !it->second.seen_once;
+      }
+      struct ctx_t {
+        std::vector<std::pair<HWND, DWORD>> windows;
+      } ctx;
+      EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || app_window_layout::is_cloaked(hwnd) || GetWindow(hwnd, GW_OWNER)) return TRUE;
+        if (GetWindowLongW(hwnd, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return TRUE;
+        if (GetWindowTextLengthW(hwnd) == 0) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == GetCurrentProcessId()) return TRUE;
+        reinterpret_cast<ctx_t *>(lp)->windows.push_back({hwnd, pid});
+        return TRUE;
+      },
+                  reinterpret_cast<LPARAM>(&ctx));
+      // Front-most desk window per process (EnumWindows goes top to bottom)
+      for (const auto &[hwnd, pid] : ctx.windows) {
+        RECT r {}, x {};
+        if (!front_of.contains(pid) && app_window_layout::frame_rect(hwnd, r) && IntersectRect(&x, &r, &desk)) front_of[pid] = r;
+      }
+      std::set<HWND> now_seen;
+      std::vector<std::pair<HWND, POINT>> to_adopt;
+      for (const auto &[hwnd, pid] : ctx.windows) {
+        now_seen.insert(hwnd);
+        if (first || seen.contains(hwnd) || !pids.contains(pid)) continue;
+        RECT r {}, x {};
+        if (!app_window_layout::frame_rect(hwnd, r) || IntersectRect(&x, &r, &desk)) continue;
+        auto base = front_of.find(pid);
+        if (base == front_of.end()) continue;
+        const LONG w = r.right - r.left, h = r.bottom - r.top;
+        LONG px = base->second.left + 48, py = base->second.top + 48;
+        px = std::clamp<LONG>(px, work.left, std::max<LONG>(work.left, work.right - w));
+        py = std::clamp<LONG>(py, work.top, std::max<LONG>(work.top, work.bottom - h));
+        to_adopt.push_back({hwnd, {px - desk.left, py - desk.top}});
+      }
+      {
+        std::lock_guard lock(g_mutex);
+        auto it = g_desks.find(client_uuid);
+        if (it == g_desks.end()) return;
+        it->second.seen = std::move(now_seen);
+        it->second.seen_once = true;
+      }
+      for (const auto &[hwnd, at] : to_adopt) {
+        BOOST_LOG(info) << "Desk: new window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec << " of an app on the desk; bringing it over";
+        adopt(client_uuid, reinterpret_cast<std::uintptr_t>(hwnd), at.x, at.y);
+      }
+    }
+  }  // namespace
+
   layout_t layout(const std::string &client_uuid) {
+    adopt_new_windows(client_uuid);
     layout_t out;
     RECT desk {};
     std::vector<HWND> adopted;
@@ -1158,10 +1274,41 @@ namespace app_desk {
     // Their pictures: a slot each in the atlas (the copy on white for popups,
     // whose transparency matters: menus with their shadows, tooltips)
     if (atlas) {
+      // Priority: how much of each window shows (stacking and positions
+      // mirror the client's, so this is what the client shows). When the
+      // atlas is full, windows hidden behind others go smaller first.
+      auto visible_area = [&](std::size_t i) {
+        const auto &w = out.windows[i];
+        constexpr int grid = 24;
+        int shown = 0;
+        for (int gy = 0; gy < grid; ++gy) {
+          for (int gx = 0; gx < grid; ++gx) {
+            const int px = w.rect[0] + (2 * gx + 1) * w.rect[2] / (2 * grid);
+            const int py = w.rect[1] + (2 * gy + 1) * w.rect[3] / (2 * grid);
+            bool covered = false;
+            for (std::size_t j = i + 1; j < out.windows.size() && !covered; ++j) {
+              const auto &o = out.windows[j];
+              covered = o.state != "minimized" && o.kind != "popup" && px >= o.rect[0] && py >= o.rect[1] && px < o.rect[0] + o.rect[2] && py < o.rect[1] + o.rect[3];
+            }
+            shown += covered ? 0 : 1;
+          }
+        }
+        return static_cast<int>(static_cast<long long>(w.rect[2]) * w.rect[3] * shown / (grid * grid));
+      };
       std::vector<desk_atlas::source_t> sources;
-      for (const auto &w : out.windows) {
+      for (std::size_t i = 0; i < out.windows.size(); ++i) {
+        const auto &w = out.windows[i];
         if (w.state == "minimized") continue;
-        sources.push_back({reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)), w.rect[2], w.rect[3], w.kind == "popup", w.z});
+        // The window the user works in (and its menus) stays sharp whatever
+        // covers it
+        const bool focused = w.focused || (w.kind == "popup" && w.owner && std::any_of(out.windows.begin(), out.windows.end(), [&](const window_t &o) {
+                                             return o.handle == w.owner && o.focused;
+                                           }));
+        // Popups (menus, tooltips) are what the user is reading: never the ones
+        // drawn smaller
+        const long long area = std::min<long long>(INT_MAX / 4, visible_area(i));
+        const int priority = static_cast<int>(area + (w.kind == "popup" ? INT_MAX / 2 : focused ? INT_MAX / 4 : 0));
+        sources.push_back({reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)), w.rect[2], w.rect[3], w.kind == "popup", priority});
       }
       for (const auto &slot : atlas->sync(sources)) {
         for (auto &w : out.windows) {
@@ -1218,6 +1365,10 @@ namespace app_desk {
   }
 
   void close(const std::string &) {}
+
+  std::optional<std::pair<int, int>> input_origin(const std::string &) {
+    return std::nullopt;
+  }
 
   bool park(const std::string &, std::uint64_t) {
     return false;

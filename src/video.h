@@ -81,6 +81,9 @@ namespace video {
     // Leave the host cursor out of this producer's capture (exact outputs with
     // a producer of their own: app-window desks draw the client's cursor).
     bool hide_cursor = false;
+    // Desk session (the client's uuid): the atlas is captured, but pointer
+    // input belongs on the desk, where the windows are (same size).
+    std::string desk_client;
     // Recheck the exact platform binding before each native capture open/reopen.
     // This callback also retains the target through the producer/GPU lifetime.
     std::function<bool()> capture_target_valid;

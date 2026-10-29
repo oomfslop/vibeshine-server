@@ -93,6 +93,7 @@ namespace desk_atlas {
     std::map<HWND, item_t> items_;
     std::vector<RECT> white_;  ///< backings to paint (client coordinates)
     unsigned ticks_ = 0;
+    double last_area_ = 0;  ///< what the windows asked for at the last sync
   };
 
 }  // namespace desk_atlas
