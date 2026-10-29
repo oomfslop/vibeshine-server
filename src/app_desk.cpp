@@ -89,25 +89,50 @@ namespace app_desk {
 
     /** Attach a (detached) display at the given mode, right of everything else,
      *  or switch an attached one to that mode. */
+    /** Where the desk goes: under the bottom-most of the host's other
+     *  displays, aligned to its left edge. Only its top edge then touches
+     *  another display, and a window the client lets hang off the desk's
+     *  left, right or bottom (as far as macOS lets a window go) stays on the
+     *  desk alone: beside a real display it would cross onto it and take its
+     *  DPI. Nothing goes above the desk's top (macOS keeps windows below its
+     *  menu bar). */
+    POINT desk_position(const std::wstring &device) {
+      struct ctx_t {
+        const std::wstring &device;
+        bool found = false;
+        RECT bottom_most {};
+      } ctx {device};
+      EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR mon, HDC, LPRECT, LPARAM lp) -> BOOL {
+        auto *c = reinterpret_cast<ctx_t *>(lp);
+        MONITORINFOEXW mi {};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(mon, &mi) || c->device == mi.szDevice) return TRUE;
+        if (!c->found || mi.rcMonitor.bottom > c->bottom_most.bottom) c->bottom_most = mi.rcMonitor;
+        c->found = true;
+        return TRUE;
+      },
+                          reinterpret_cast<LPARAM>(&ctx));
+      if (!ctx.found) return {0, 0};
+      return {ctx.bottom_most.left, ctx.bottom_most.bottom};
+    }
+
     void attach_display(const std::wstring &device, int w, int h, int fps) {
       DEVMODEW current {};
       current.dmSize = sizeof(current);
       const bool attached = EnumDisplaySettingsW(device.c_str(), ENUM_CURRENT_SETTINGS, &current) && current.dmPelsWidth > 0;
       DEVMODEW want {};
       want.dmSize = sizeof(want);
-      want.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+      want.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY | DM_POSITION;
       want.dmPelsWidth = w;
       want.dmPelsHeight = h;
       want.dmDisplayFrequency = static_cast<DWORD>(fps);
-      if (!attached) {
-        want.dmFields |= DM_POSITION;
-        want.dmPosition.x = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        want.dmPosition.y = 0;
-      }
+      const POINT at = desk_position(device);
+      want.dmPosition.x = at.x;
+      want.dmPosition.y = at.y;
       const LONG set = ChangeDisplaySettingsExW(device.c_str(), &want, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
       const LONG commit = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
       BOOST_LOG(info) << "Desk: " << (attached ? "retuned" : "attached") << " display " << utf_utils::to_utf8(device) << " to " << w << 'x' << h << '@' << fps
-                      << " (set=" << set << ", commit=" << commit << ')';
+                      << " at " << at.x << ',' << at.y << " (set=" << set << ", commit=" << commit << ')';
     }
 
     struct mode_t {
@@ -465,12 +490,13 @@ namespace app_desk {
           fps = mode->hz;
         }
       }
-      if (rect.right - rect.left != w || rect.bottom - rect.top != h || monitor_refresh_hz(desk.device.c_str()) != fps) {
-        // Different size or rate: retune the existing display.
+      const POINT at = desk_position(desk.device);
+      if (rect.right - rect.left != w || rect.bottom - rect.top != h || monitor_refresh_hz(desk.device.c_str()) != fps || rect.left != at.x || rect.top != at.y) {
+        // Different size, rate or place: retune the existing display.
         attach_display(desk.device, w, h, fps);
         for (int i = 0; i < 100; ++i) {
           std::this_thread::sleep_for(std::chrono::milliseconds(50));
-          if (find_monitor(desk.device, &rect) && rect.right - rect.left == w && rect.bottom - rect.top == h) break;
+          if (find_monitor(desk.device, &rect) && rect.right - rect.left == w && rect.bottom - rect.top == h && rect.left == at.x && rect.top == at.y) break;
         }
         present = find_monitor(desk.device, &rect);
       }
@@ -650,15 +676,13 @@ namespace app_desk {
     if (it->second.adopted.contains(hwnd)) {
       // Already on the desk: a plain move, as far off its edges as the Mac
       // lets a window go (a window flicked aside), so both keep agreeing on
-      // where it is. Left and right, at least half of it stays on the desk:
-      // a window mostly on the host's own display beside it would take that
-      // display's DPI. Nothing is below or above the desk; the top stays on
-      // it (macOS keeps title bars below the menu bar anyway).
+      // where it is. Nothing borders the desk but above (desk_position); a
+      // sliver stays on it so it remains the window's display.
       RECT frame {};
       if (app_window_layout::frame_rect(hwnd, frame)) {
         const LONG w = frame.right - frame.left;
         const LONG dw = rect.right - rect.left, dh = rect.bottom - rect.top;
-        x = static_cast<int>(std::clamp<LONG>(x, -(w / 2) + 1, std::max<LONG>(-(w / 2) + 1, dw - w / 2 - 1)));
+        x = static_cast<int>(std::clamp<LONG>(x, -(w - 8), std::max<LONG>(-(w - 8), dw - 8)));
         y = static_cast<int>(std::clamp<LONG>(y, 0, std::max<LONG>(0, dh - 8)));
       }
       move_frame_to(hwnd, rect.left + x, rect.top + y);
