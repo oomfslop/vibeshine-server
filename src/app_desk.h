@@ -23,6 +23,7 @@ namespace app_desk {
     bool valid = false;
     std::string display;  ///< GDI device name ("\\\\.\\DISPLAYn") of the desk, where the windows are
     std::string capture;  ///< the atlas display the session captures (thumbnails of the desk's windows)
+    int capture_size[2] {0, 0};  ///< its size: the stream's resolution
     int rect[4] {0, 0, 0, 0};  ///< the desk on the host's virtual screen: x, y, w, h
     int fps = 0;
     int dpi = 96;

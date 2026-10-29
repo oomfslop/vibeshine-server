@@ -229,6 +229,13 @@ namespace VDISPLAY {
   void restorePhysicalHdrProfiles();
   bool removeVirtualDisplay(const GUID &guid);
   bool removeAllVirtualDisplays();
+  // App-window desks: SudoVDA makes displays of any size (the Sunshine driver
+  // offers only its mode catalog before control protocol 3.8). Opened next to
+  // whichever driver streams use, with its watchdog fed; false when it is
+  // not installed or does not answer.
+  bool sudovdaReady();
+  std::optional<VirtualDisplayCreationResult> createSudovdaDisplay(const char *s_client_uid, const char *s_client_name, uint32_t width, uint32_t height, uint32_t fps, const GUID &guid);
+  bool removeSudovdaDisplay(const GUID &guid);
   // Displays that outlive streams (app-window desks): removeAllVirtualDisplays
   // and the cleanup's teardown accounting leave them alone; only an explicit
   // removeVirtualDisplay(guid) takes them down.

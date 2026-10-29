@@ -4105,6 +4105,7 @@ namespace nvhttp {
       return {
         {"display", d.display},
         {"capture", d.capture},
+        {"capture_size", {d.capture_size[0], d.capture_size[1]}},
         {"rect", {d.rect[0], d.rect[1], d.rect[2], d.rect[3]}},
         {"fps", d.fps},
         {"dpi", d.dpi},

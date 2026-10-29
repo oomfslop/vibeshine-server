@@ -38,12 +38,14 @@ namespace app_desk {
   namespace {
 
     struct vdisplay_t {
+      bool sudovda = false;  ///< made by SudoVDA (any size) rather than the Sunshine driver (its catalog)
       GUID guid {};
       std::wstring device;  ///< "\\\\.\\DISPLAYn"
       std::wstring monitor_path;  ///< device path the DPI scale is set through
     };
 
     struct desk_state_t {
+      bool sudovda = false;  ///< the desk display is SudoVDA's
       GUID guid {};
       std::wstring device;  ///< "\\\\.\\DISPLAYn"
       std::wstring monitor_path;  ///< device path the DPI scale is set through
@@ -488,14 +490,15 @@ namespace app_desk {
     /** Make sure this virtual display exists at the mode (the driver's
      *  nearest when it only has a catalog; w, h and fps then say what it
      *  got) and at the place `where` says. Creates it when missing. */
-    bool ensure_display(vdisplay_t &d, const std::string &id, const char *label, int &w, int &h, int &fps, bool custom,
+    bool ensure_display(vdisplay_t &d, const std::string &id, const char *label, int &w, int &h, int &fps, bool custom, bool sudovda,
                         const std::function<POINT()> &where, RECT &rect) {
       bool present = !d.device.empty() && find_monitor(d.device, &rect);
-      if (present && custom && (rect.right - rect.left != w || rect.bottom - rect.top != h)) {
-        // A different size needs a display created for it: recreate.
-        BOOST_LOG(info) << "Desk: recreating " << label << " for " << w << 'x' << h;
+      if (present && (d.sudovda != sudovda || (custom && (rect.right - rect.left != w || rect.bottom - rect.top != h)))) {
+        // A different size (or driver) needs a display created for it: recreate.
+        BOOST_LOG(info) << "Desk: recreating " << label << " for " << w << 'x' << h << (sudovda ? " (SudoVDA)" : "");
         VDISPLAY::set_virtual_display_protected(d.guid, d.device, false);
-        VDISPLAY::removeVirtualDisplay(d.guid);
+        if (d.sudovda) VDISPLAY::removeSudovdaDisplay(d.guid);
+        else VDISPLAY::removeVirtualDisplay(d.guid);
         d.device.clear();
         d.monitor_path.clear();
         present = false;
@@ -520,7 +523,7 @@ namespace app_desk {
         }
         return present;
       }
-      if (!VDISPLAY::ensure_driver_is_ready()) {
+      if (!sudovda && !VDISPLAY::ensure_driver_is_ready()) {
         BOOST_LOG(warning) << "Desk: no virtual display driver";
         return false;
       }
@@ -531,9 +534,15 @@ namespace app_desk {
       const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
       const auto uuid = VDISPLAY::virtualDisplayUuidFromStableId(id + "-" + std::to_string(stamp));
       std::memcpy(&d.guid, uuid.b8, sizeof(d.guid));
-      VDISPLAY::setWatchdogFeedingEnabled(true);
-      auto created = VDISPLAY::createVirtualDisplay(id.c_str(), label, nullptr, static_cast<uint32_t>(w), static_cast<uint32_t>(h), static_cast<uint32_t>(fps),
-                                                    d.guid, 0, false, 1, std::nullopt, false, true, true, custom);
+      std::optional<VDISPLAY::VirtualDisplayCreationResult> created;
+      if (sudovda) {
+        created = VDISPLAY::createSudovdaDisplay(id.c_str(), label, static_cast<uint32_t>(w), static_cast<uint32_t>(h), static_cast<uint32_t>(fps), d.guid);
+      } else {
+        VDISPLAY::setWatchdogFeedingEnabled(true);
+        created = VDISPLAY::createVirtualDisplay(id.c_str(), label, nullptr, static_cast<uint32_t>(w), static_cast<uint32_t>(h), static_cast<uint32_t>(fps),
+                                                 d.guid, 0, false, 1, std::nullopt, false, true, true, custom);
+      }
+      d.sudovda = sudovda;
       if (!created) {
         BOOST_LOG(warning) << "Desk: the virtual display driver could not create " << label << " at " << w << 'x' << h << '@' << fps;
         return false;
@@ -561,19 +570,30 @@ namespace app_desk {
       if (!present) {
         BOOST_LOG(warning) << "Desk: " << label << " did not come up at " << w << 'x' << h << '@' << fps;
         VDISPLAY::set_virtual_display_protected(d.guid, d.device, false);
-        VDISPLAY::removeVirtualDisplay(d.guid);
+        if (d.sudovda) VDISPLAY::removeSudovdaDisplay(d.guid);
+        else VDISPLAY::removeVirtualDisplay(d.guid);
         d.device.clear();
         d.monitor_path.clear();
         return false;
       }
-      BOOST_LOG(info) << "Desk: created " << label << ' ' << utf_utils::to_utf8(d.device) << ' ' << w << 'x' << h << '@' << fps;
+      // Some drivers attach a new display at a place of their own: put it where it belongs
+      const POINT at = where();
+      if (rect.left != at.x || rect.top != at.y) {
+        attach_display(d.device, w, h, fps, at);
+        for (int i = 0; i < 60; ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          if (find_monitor(d.device, &rect) && rect.left == at.x && rect.top == at.y) break;
+        }
+      }
+      BOOST_LOG(info) << "Desk: created " << label << ' ' << utf_utils::to_utf8(d.device) << ' ' << w << 'x' << h << '@' << fps << " at " << rect.left << ',' << rect.top;
       return true;
     }
 
     void remove_display(vdisplay_t &d) {
       if (d.device.empty()) return;
       VDISPLAY::set_virtual_display_protected(d.guid, d.device, false);
-      VDISPLAY::removeVirtualDisplay(d.guid);
+      if (d.sudovda) VDISPLAY::removeSudovdaDisplay(d.guid);
+      else VDISPLAY::removeVirtualDisplay(d.guid);
       d.device.clear();
       d.monitor_path.clear();
     }
@@ -715,19 +735,20 @@ namespace app_desk {
     void schedule_idle_removal(const std::string &client_uuid, unsigned generation) {
       std::thread([client_uuid, generation] {
         std::this_thread::sleep_for(std::chrono::minutes(10));
-        GUID guid {};
-        vdisplay_t atlas;
+        vdisplay_t desk, atlas;
         {
           std::lock_guard lock(g_mutex);
           auto it = g_desks.find(client_uuid);
           if (it == g_desks.end() || it->second.open || it->second.idle_generation != generation) return;
-          guid = it->second.guid;
+          desk.sudovda = it->second.sudovda;
+          desk.guid = it->second.guid;
+          desk.device = it->second.device;
           atlas = it->second.atlas;
           g_desks.erase(it);
         }
         remove_display(atlas);
-        VDISPLAY::set_virtual_display_protected(guid, {}, false);
-        if (VDISPLAY::removeVirtualDisplay(guid)) {
+        VDISPLAY::set_virtual_display_protected(desk.guid, {}, false);
+        if (desk.sudovda ? VDISPLAY::removeSudovdaDisplay(desk.guid) : VDISPLAY::removeVirtualDisplay(desk.guid)) {
           BOOST_LOG(info) << "Desk: removed the idle display of client " << client_uuid;
         } else {
           BOOST_LOG(warning) << "Desk: failed to remove the idle display of client " << client_uuid;
@@ -745,16 +766,23 @@ namespace app_desk {
     dpi = std::clamp(dpi, 96, 384);
     std::lock_guard lock(g_mutex);
     auto &desk = g_desks[client_uuid];
-    // Newer drivers expose exactly the requested mode; older ones only a catalog.
-    const bool custom = VDISPLAY::supportsRequestedResolutionCatalog();
+    // SudoVDA (or a Sunshine driver with requested resolutions) makes displays
+    // of exactly the size asked for; otherwise the driver's catalog decides.
+    const bool sudovda = VDISPLAY::sudovdaReady();
+    const bool custom = sudovda || VDISPLAY::supportsRequestedResolutionCatalog();
     auto ours = [&desk] {
       return std::vector<std::wstring> {desk.device, desk.atlas.device};
     };
-    vdisplay_t desk_display {desk.guid, desk.device, desk.monitor_path};
+    vdisplay_t desk_display;
+    desk_display.sudovda = desk.sudovda;
+    desk_display.guid = desk.guid;
+    desk_display.device = desk.device;
+    desk_display.monitor_path = desk.monitor_path;
     RECT rect {};
-    const bool desk_ok = ensure_display(desk_display, "vibeshine-desk-" + client_uuid, "the desk", w, h, fps, custom, [&] {
+    const bool desk_ok = ensure_display(desk_display, "vibeshine-desk-" + client_uuid, "the desk", w, h, fps, custom, sudovda, [&] {
       return desk_position(ours());
     }, rect);
+    desk.sudovda = desk_display.sudovda;
     desk.guid = desk_display.guid;
     desk.device = desk_display.device;
     desk.monitor_path = desk_display.monitor_path;
@@ -763,15 +791,27 @@ namespace app_desk {
       g_desks.erase(client_uuid);
       return {};
     }
-    // The atlas: the same mode, so the session streams the size the client expects
+    // The atlas, what the session streams: 3840x2160 whatever the desk. That
+    // is what the client's hardware decoder keeps up with at 120 fps (measured
+    // on Apple silicon: 4096x2304 decodes in 12 ms instead of 8 and adds ~2 ms
+    // glass to glass; taller shapes like 3056x2704 drop to software decoding,
+    // ~80 ms). With a catalog the desk's mode, which is 3840x2160 here too.
     int aw = w, ah = h, afps = fps;
+    if (custom) {
+      aw = 3840;
+      ah = 2160;
+    }
+    const int want_aw = aw, want_ah = ah;
     RECT atlas_rect {};
-    if (!ensure_display(desk.atlas, "vibeshine-atlas-" + client_uuid, "the atlas", aw, ah, afps, custom, [&] {
+    if (!ensure_display(desk.atlas, "vibeshine-atlas-" + client_uuid, "the atlas", aw, ah, afps, custom, sudovda, [&] {
           return atlas_position(ours());
-        }, atlas_rect) || aw != w || ah != h) {
-      BOOST_LOG(warning) << "Desk: no atlas display at " << w << 'x' << h << " (got " << aw << 'x' << ah << ')';
+        }, atlas_rect) || aw != want_aw || ah != want_ah) {
+      BOOST_LOG(warning) << "Desk: no atlas display at " << want_aw << 'x' << want_ah << " (got " << aw << 'x' << ah << ')';
       remove_display(desk.atlas);
-      vdisplay_t gone {desk.guid, desk.device, desk.monitor_path};
+      vdisplay_t gone;
+      gone.sudovda = desk.sudovda;
+      gone.guid = desk.guid;
+      gone.device = desk.device;
       remove_display(gone);
       g_desks.erase(client_uuid);
       return {};
@@ -810,6 +850,8 @@ namespace app_desk {
     if (find_monitor(desk.device, &rect)) reserve_work_area(client_uuid, rect, shown_w, shown_h);
     try {
       desk.info.capture = utf_utils::to_utf8(desk.atlas.device);
+      desk.info.capture_size[0] = aw;
+      desk.info.capture_size[1] = ah;
     } catch (...) {
     }
     find_monitor(desk.atlas.device, &atlas_rect);

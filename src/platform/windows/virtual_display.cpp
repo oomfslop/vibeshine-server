@@ -7,6 +7,7 @@
 #include "src/logging.h"
 #include "src/platform/windows/display_helper_coordinator.h"
 #include "src/platform/windows/misc.h"
+#include "src/process.h"
 
 #include <algorithm>
 #include <array>
@@ -659,8 +660,22 @@ namespace VDISPLAY_SUDOVDA {
 }  // namespace VDISPLAY_SUDOVDA
 
 namespace {
+  // Set while this thread works on a desk's SudoVDA display: everything it
+  // asks VDISPLAY (render adapter, removal...) goes to SudoVDA too
+  thread_local bool t_sudovda_scope = false;
+
+  struct sudovda_scope_t {
+    bool before = t_sudovda_scope;
+    sudovda_scope_t() {
+      t_sudovda_scope = true;
+    }
+    ~sudovda_scope_t() {
+      t_sudovda_scope = before;
+    }
+  };
+
   bool use_sunshine_driver() {
-    return config::video.dd.use_sunshine_virtual_display_driver;
+    return config::video.dd.use_sunshine_virtual_display_driver && !t_sudovda_scope;
   }
 }  // namespace
 
@@ -871,6 +886,38 @@ namespace VDISPLAY {
     if (!borrowed_output_mutation) return ;
     VDISPLAY_SUNSHINE::restorePhysicalHdrProfiles();
     VDISPLAY_SUDOVDA::restorePhysicalHdrProfiles();
+  }
+
+  bool sudovdaReady() {
+    sudovda_scope_t scope;
+    static std::mutex mutex;
+    static bool pinging = false;
+    std::lock_guard lock(mutex);
+    // The process-wide driver status is the streams' driver's: keep it
+    const auto before = proc::vDisplayDriverStatusSnapshot();
+    bool ok = VDISPLAY_SUDOVDA::openVDisplayDevice() == DRIVER_STATUS::OK;
+    if (!ok && VDISPLAY_SUDOVDA::ensure_driver_is_ready()) ok = VDISPLAY_SUDOVDA::openVDisplayDevice() == DRIVER_STATUS::OK;
+    if (ok && !pinging) {
+      pinging = VDISPLAY_SUDOVDA::startPingThread([] {
+        BOOST_LOG(warning) << "SudoVDA watchdog failed (app-window desks)";
+      });
+    }
+    if (ok) VDISPLAY_SUDOVDA::setWatchdogFeedingEnabled(true);
+    proc::setVDisplayDriverStatus(before.status, before.selection);
+    return ok && pinging;
+  }
+
+  std::optional<VirtualDisplayCreationResult> createSudovdaDisplay(const char *s_client_uid, const char *s_client_name, uint32_t width, uint32_t height, uint32_t fps, const GUID &guid) {
+    sudovda_scope_t scope;
+    const auto before = proc::vDisplayDriverStatusSnapshot();
+    auto result = VDISPLAY_SUDOVDA::createVirtualDisplay(s_client_uid, s_client_name, nullptr, width, height, fps, guid, 0, false, 1, std::nullopt, false, true, true);
+    proc::setVDisplayDriverStatus(before.status, before.selection);
+    return result;
+  }
+
+  bool removeSudovdaDisplay(const GUID &guid) {
+    sudovda_scope_t scope;
+    return VDISPLAY_SUDOVDA::removeVirtualDisplay(guid);
   }
 
   bool removeVirtualDisplay(const GUID &guid) {
