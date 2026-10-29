@@ -11,8 +11,13 @@
   #include <windows.h>
   #include <dwmapi.h>
 
+  #include <shellapi.h>
+
   #include <algorithm>
+  #include <atomic>
   #include <chrono>
+  #include <condition_variable>
+  #include <memory>
   #include <cstring>
   #include <map>
   #include <mutex>
@@ -277,6 +282,121 @@ namespace app_desk {
       return out;
     }
 
+    /** The part of the desk the client does not show (the driver's mode is
+     *  larger than the client's screen) taken out of the desk's work area,
+     *  the way a taskbar is: hidden app bars on its right and bottom edges.
+     *  Windows keeps menus, flyouts and tooltips inside the work area and
+     *  maximizes into it, so nothing lands where the client cannot see it. */
+    class work_area_reserve_t {
+    public:
+      work_area_reserve_t(const RECT &desk, int right, int bottom) {
+        thread_ = std::thread([this, desk, right, bottom] {
+          run(desk, right, bottom);
+        });
+        std::unique_lock lock(mutex_);
+        ready_.wait(lock, [this] {
+          return started_;
+        });
+      }
+
+      ~work_area_reserve_t() {
+        if (thread_id_) PostThreadMessageW(thread_id_, WM_QUIT, 0, 0);
+        if (thread_.joinable()) thread_.join();
+      }
+
+      bool same(const RECT &desk, int right, int bottom) const {
+        return EqualRect(&desk_, &desk) && right == right_ && bottom == bottom_;
+      }
+
+    private:
+      static constexpr UINT callback_message = WM_APP + 1;
+
+      static void place(HWND bar, UINT edge, const RECT &desk, int extent) {
+        APPBARDATA abd {sizeof(abd)};
+        abd.hWnd = bar;
+        abd.uEdge = edge;
+        abd.rc = desk;
+        if (edge == ABE_RIGHT) abd.rc.left = desk.right - extent;
+        else abd.rc.top = desk.bottom - extent;
+        SHAppBarMessage(ABM_QUERYPOS, &abd);
+        // The shell may have moved the inner edge for another bar: keep our extent
+        if (edge == ABE_RIGHT) abd.rc.left = abd.rc.right - extent;
+        else abd.rc.top = abd.rc.bottom - extent;
+        SHAppBarMessage(ABM_SETPOS, &abd);
+        SetWindowPos(bar, nullptr, abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left, abd.rc.bottom - abd.rc.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+      }
+
+      void run(const RECT &desk, int right, int bottom) {
+        desk_ = desk;
+        right_ = right;
+        bottom_ = bottom;
+        thread_id_ = GetCurrentThreadId();
+        MSG msg;
+        PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);  // the thread's queue, for WM_QUIT
+        WNDCLASSW wc {};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"VibeshineDeskReserve";
+        RegisterClassW(&wc);  // fails harmlessly when already registered
+        std::vector<std::pair<HWND, std::pair<UINT, int>>> bars;
+        for (auto [edge, extent] : {std::pair<UINT, int> {ABE_RIGHT, right}, std::pair<UINT, int> {ABE_BOTTOM, bottom}}) {
+          if (extent <= 0) continue;
+          // Never shown: an app bar reserves its edge whether visible or not,
+          // and a visible one would be in the picture
+          HWND bar = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, wc.hInstance, nullptr);
+          if (!bar) continue;
+          APPBARDATA abd {sizeof(abd)};
+          abd.hWnd = bar;
+          abd.uCallbackMessage = callback_message;
+          if (!SHAppBarMessage(ABM_NEW, &abd)) {
+            DestroyWindow(bar);
+            continue;
+          }
+          place(bar, edge, desk, extent);
+          bars.push_back({bar, {edge, extent}});
+        }
+        BOOST_LOG(info) << "Desk: reserved " << right << " px right and " << bottom << " px bottom of the desk's work area (" << bars.size() << " bars)";
+        {
+          std::lock_guard lock(mutex_);
+          started_ = true;
+        }
+        ready_.notify_all();
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+          if (msg.message == callback_message && msg.wParam == ABN_POSCHANGED) {
+            for (auto &[bar, spec] : bars) place(bar, spec.first, desk, spec.second);
+          }
+          TranslateMessage(&msg);
+          DispatchMessageW(&msg);
+        }
+        for (auto &[bar, spec] : bars) {
+          APPBARDATA abd {sizeof(abd)};
+          abd.hWnd = bar;
+          SHAppBarMessage(ABM_REMOVE, &abd);
+          DestroyWindow(bar);
+        }
+      }
+
+      std::thread thread_;
+      std::mutex mutex_;
+      std::condition_variable ready_;
+      bool started_ = false;
+      std::atomic<DWORD> thread_id_ {0};
+      RECT desk_ {};
+      int right_ = 0, bottom_ = 0;
+    };
+
+    std::map<std::string, std::unique_ptr<work_area_reserve_t>> g_reserves;  ///< client uuid -> its desk's reserve (under g_mutex)
+
+    void reserve_work_area(const std::string &client_uuid, const RECT &desk, int shown_w, int shown_h) {
+      const int right = std::max(0, static_cast<int>(desk.right - desk.left) - shown_w);
+      const int bottom = std::max(0, static_cast<int>(desk.bottom - desk.top) - shown_h);
+      auto &slot = g_reserves[client_uuid];
+      if (slot && slot->same(desk, right, bottom)) return;
+      slot.reset();
+      if (right > 0 || bottom > 0) slot = std::make_unique<work_area_reserve_t>(desk, right, bottom);
+    }
+
     /** Remove a desk's display once it has been idle long enough (detached thread). */
     void schedule_idle_removal(const std::string &client_uuid, unsigned generation) {
       std::thread([client_uuid, generation] {
@@ -303,6 +423,7 @@ namespace app_desk {
   desk_t open(const std::string &client_uuid, int w, int h, int fps, int dpi) {
     w = std::max(640, w & ~1);
     h = std::max(480, h & ~1);
+    const int shown_w = w, shown_h = h;  // the client's screen; the mode may be larger
     fps = std::clamp(fps, 24, 240);
     dpi = std::clamp(dpi, 96, 384);
     std::lock_guard lock(g_mutex);
@@ -417,6 +538,7 @@ namespace app_desk {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     hide_desk_taskbar(find_monitor(desk.device));
+    if (find_monitor(desk.device, &rect)) reserve_work_area(client_uuid, rect, shown_w, shown_h);
     BOOST_LOG(info) << "Desk: open " << desk.info.display << ' ' << desk.info.rect[2] << 'x' << desk.info.rect[3] << '@' << fps << " at " << desk.info.dpi << " dpi"
                     << (custom ? " (exact mode)" : " (catalog mode)");
     return desk.info;
@@ -490,6 +612,7 @@ namespace app_desk {
       }
     }
     it->second.adopted.clear();
+    g_reserves.erase(client_uuid);
     it->second.open = false;
     it->second.idle_since = std::chrono::steady_clock::now();
     schedule_idle_removal(client_uuid, ++it->second.idle_generation);

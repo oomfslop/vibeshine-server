@@ -12,7 +12,9 @@
   #include <dwmapi.h>
 
   #include <algorithm>
+  #include <chrono>
   #include <filesystem>
+  #include <thread>
 
   #include "platform/windows/image_convert.h"
   #include "platform/windows/utf_utils.h"
@@ -34,6 +36,7 @@ namespace host_windows {
       {"maximize", op_e::maximize},
       {"close", op_e::close},
       {"lower", op_e::lower},
+      {"dismiss", op_e::dismiss},
     };
     for (const auto &entry : table) {
       if (name == entry.name) {
@@ -46,6 +49,32 @@ namespace host_windows {
 
 #ifdef _WIN32
   namespace {
+    /** A visible menu of this process: a Win32 menu (#32768) or a XAML
+     *  popup host (Win11 context menus and flyouts). */
+    bool has_open_menu(DWORD pid) {
+      struct ctx_t {
+        DWORD pid;
+        bool found = false;
+      } ctx {pid};
+      EnumWindows([](HWND w, LPARAM lp) -> BOOL {
+        auto *c = reinterpret_cast<ctx_t *>(lp);
+        if (!IsWindowVisible(w)) return TRUE;
+        DWORD p = 0;
+        GetWindowThreadProcessId(w, &p);
+        if (p != c->pid) return TRUE;
+        wchar_t cls[64] {}, title[32] {};
+        GetClassNameW(w, cls, 64);
+        GetWindowTextW(w, title, 32);
+        if (wcscmp(cls, L"#32768") == 0 || wcscmp(title, L"PopupHost") == 0 || wcsstr(cls, L"PopupWindowSiteBridge") || wcscmp(cls, L"Xaml_WindowedPopupClass") == 0) {
+          c->found = true;
+          return FALSE;
+        }
+        return TRUE;
+      },
+                  reinterpret_cast<LPARAM>(&ctx));
+      return ctx.found;
+    }
+
     bool window_is_cloaked(HWND hwnd) {
       DWORD cloaked = 0;
       return SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked != 0;
@@ -429,6 +458,25 @@ namespace host_windows {
         return PostMessageW(hwnd, WM_CLOSE, 0, 0) != 0;
       case op_e::lower:
         return SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS) != 0;
+      case op_e::dismiss: {
+        // Escape closes one menu level, Win32 menus and XAML flyouts alike;
+        // sent only while the window's process has the focus and one of its
+        // menus is open, so it never reaches the app itself
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        for (int level = 0; level < 5; ++level) {
+          DWORD fg_pid = 0;
+          GetWindowThreadProcessId(GetForegroundWindow(), &fg_pid);
+          if (fg_pid != pid || !has_open_menu(pid)) return true;
+          INPUT esc[2] {};
+          esc[0].type = esc[1].type = INPUT_KEYBOARD;
+          esc[0].ki.wVk = esc[1].ki.wVk = VK_ESCAPE;
+          esc[1].ki.dwFlags = KEYEVENTF_KEYUP;
+          SendInput(2, esc, sizeof(INPUT));
+          std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        }
+        return !has_open_menu(pid);
+      }
     }
     return false;
   }

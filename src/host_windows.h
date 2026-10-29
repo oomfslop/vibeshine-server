@@ -39,6 +39,7 @@ namespace host_windows {
     maximize,
     close,
     lower,  ///< to the bottom of the z-order, without activating
+    dismiss,  ///< close the window's open menus (a click on its title bar does that on Windows)
   };
 
   bool supported();
