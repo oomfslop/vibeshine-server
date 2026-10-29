@@ -62,6 +62,7 @@ namespace desk_atlas {
     int x = 0, y = 0;  ///< where the window's frame starts in the atlas
     int w = 0, h = 0;  ///< its size there (the frame size times scale)
     int ax = -1, ay = -1;  ///< the copy on white, or -1
+    double white_scale = 1.0;  ///< its size relative to the copy on black
     double scale = 1.0;  ///< below 1 only when the atlas is too small for everything
     std::vector<piece_t> pieces;  ///< with a scale below 1: the visible parts, 1:1
   };
@@ -148,7 +149,7 @@ namespace desk_atlas {
     static RECT margined(const RECT &part, const item_t &item);
     void release(item_t &item);
     void paint(HDC dc);
-    bool update_thumbnail(HTHUMBNAIL thumb, const cell_t &cell, const item_t &item);
+    bool update_thumbnail(HTHUMBNAIL thumb, const cell_t &cell, const item_t &item, double ratio = 1.0);
 
     RECT monitor_ {};
     HWND window_ = nullptr;

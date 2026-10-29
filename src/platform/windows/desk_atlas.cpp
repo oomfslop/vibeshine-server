@@ -41,6 +41,13 @@ namespace desk_atlas {
 
     constexpr int piece_margin = 8;
 
+    /** The copy on white only carries alpha (soft at the edges anyway, the
+     *  inside opaque): half size, a quarter of the room */
+    constexpr double white_ratio = 0.5;
+    /** ...inset in its white cell, so filtering at its edges reads white
+     *  backing, not whatever is next to the cell */
+    constexpr int white_inset = 2;
+
     bool same_rects(const std::vector<RECT> &a, const std::vector<RECT> &b) {
       return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const RECT &x, const RECT &y) {
                return EqualRect(&x, &y);
@@ -377,13 +384,14 @@ namespace desk_atlas {
     return true;
   }
 
-  bool atlas_t::update_thumbnail(HTHUMBNAIL thumb, const cell_t &cell, const item_t &item) {
+  bool atlas_t::update_thumbnail(HTHUMBNAIL thumb, const cell_t &cell, const item_t &item, double ratio) {
     DWM_THUMBNAIL_PROPERTIES p {};
     p.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
-    p.rcDestination = {cell.x, cell.y, cell.x + cell.cw, cell.y + cell.ch};
+    const int inset = ratio < 1.0 ? white_inset : 0;
+    p.rcDestination = {cell.x + inset, cell.y + inset, cell.x + cell.cw - inset, cell.y + cell.ch - inset};
     // The capacity as source, from the frame's origin: 1:1 (or the slot's
     // scale), the window anchored top-left, its growth room left empty
-    const int sw = static_cast<int>(std::lround(cell.cw / item.scale)), sh = static_cast<int>(std::lround(cell.ch / item.scale));
+    const int sw = static_cast<int>(std::lround((cell.cw - 2 * inset) / (item.scale * ratio))), sh = static_cast<int>(std::lround((cell.ch - 2 * inset) / (item.scale * ratio)));
     p.rcSource = {item.source_offset.left, item.source_offset.top, item.source_offset.left + sw, item.source_offset.top + sh};
     p.opacity = 255;
     p.fVisible = TRUE;
@@ -415,7 +423,9 @@ namespace desk_atlas {
       const bool moved_origin = offset.left != item.source_offset.left || offset.top != item.source_offset.top;
       item.source_offset = offset;
       const bool fits = item.black && item.cell.cw > 0 && item.cell.cw >= static_cast<int>(std::ceil(s.w * item.scale)) &&
-                        item.cell.ch >= static_cast<int>(std::ceil(s.h * item.scale)) && item.has_white == s.alpha;
+                        item.cell.ch >= static_cast<int>(std::ceil(s.h * item.scale)) && item.has_white == s.alpha &&
+                        (!s.alpha || (item.white_cell.cw >= static_cast<int>(std::ceil(s.w * item.scale * white_ratio)) + 2 * white_inset &&
+                                      item.white_cell.ch >= static_cast<int>(std::ceil(s.h * item.scale * white_ratio)) + 2 * white_inset));
       const bool shrunk_far = item.black && item.scale == 1.0 && item.cell.cw > capacity(s.w, W, true) * 2 && item.cell.ch > capacity(s.h, H, true) * 2;
       if (!fits || shrunk_far) to_place.push_back(s.hwnd);
       else if (moved_origin || item.w != s.w || item.h != s.h) {
@@ -423,7 +433,7 @@ namespace desk_atlas {
         item.h = s.h;
         if (moved_origin) {
           update_thumbnail(item.black, item.black_at, item);
-          if (item.white) update_thumbnail(item.white, item.white_at, item);
+          if (item.white) update_thumbnail(item.white, item.white_at, item, white_ratio);
         }
       }
       item.w = s.w;
@@ -513,11 +523,12 @@ namespace desk_atlas {
         // Windows get a little room to grow (live resizes); popups never resize
         const bool room = !item.has_white;
         const int cw = capacity(static_cast<int>(std::ceil(item.w * scale)), W, room), ch = capacity(static_cast<int>(std::ceil(item.h * scale)), H, room);
+        const int wcw = capacity(static_cast<int>(std::ceil(item.w * scale * white_ratio)) + 2 * white_inset, W, false), wch = capacity(static_cast<int>(std::ceil(item.h * scale * white_ratio)) + 2 * white_inset, H, false);
         std::vector<cell_t> trial = taken;
         cell_t cell, white;
         // Where it is drawn now, if that is still the size it needs
         const bool same = item.black && item.black_at.cw == cw && item.black_at.ch == ch && item.black_scale == scale &&
-                          (!item.has_white || (item.white && item.white_at.cw == cw && item.white_at.ch == ch));
+                          (!item.has_white || (item.white && item.white_at.cw == wcw && item.white_at.ch == wch));
         // Whole again where it was whole, over its own parts there
         const bool back = !same && scale == 1.0 && !item.has_white && item.full_at.cw == cw && item.full_at.ch == ch &&
                           fits_over(trial, item.full_at, same_pixels(hwnd, item, item.full_at.x, item.full_at.y));
@@ -529,7 +540,7 @@ namespace desk_atlas {
           trial.push_back(cell);
         } else {
           if (!place(trial, cw, ch, cell)) return false;
-          if (item.has_white && !place(trial, cw, ch, white)) return false;
+          if (item.has_white && !place(trial, wcw, wch, white)) return false;
         }
         item.scale = scale;
         if (pieces == 0) {
@@ -724,7 +735,7 @@ namespace desk_atlas {
         }
         if (item.has_white && !item.white && SUCCEEDED(DwmRegisterThumbnail(window_, hwnd, &item.white))) {
           item.white_at = item.white_cell;
-          update_thumbnail(item.white, item.white_cell, item);
+          update_thumbnail(item.white, item.white_cell, item, white_ratio);
         }
       }
     }
@@ -765,8 +776,9 @@ namespace desk_atlas {
       s.h = static_cast<int>(std::lround(item.h * item.scale));
       s.scale = item.scale;
       if (item.white) {
-        s.ax = item.white_cell.x;
-        s.ay = item.white_cell.y;
+        s.ax = item.white_cell.x + white_inset;
+        s.ay = item.white_cell.y + white_inset;
+        s.white_scale = white_ratio;
       }
       for (const auto &p : item.pieces) {
         if (!p.thumb || p.cell.cw <= 0) continue;

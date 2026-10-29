@@ -1502,6 +1502,7 @@ namespace app_desk {
           w.slot[3] = slot.h;
           w.alpha_slot[0] = slot.ax;
           w.alpha_slot[1] = slot.ay;
+          w.alpha_scale = slot.white_scale;
           w.scale = slot.scale;
           w.pieces.clear();
           for (const auto &p : slot.pieces) w.pieces.push_back({p.x, p.y, p.w, p.h, p.ax, p.ay});
