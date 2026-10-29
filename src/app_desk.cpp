@@ -994,7 +994,8 @@ namespace app_desk {
     y = static_cast<int>(std::max<LONG>(0, std::min<LONG>(y, dh - std::min(fh, dh))));
     move_frame_to(hwnd, rect.left + x, rect.top + y);
     // Coming from a display of another DPI it is resized once it is here:
-    // then it goes back inside what the client shows (the work area), if it fits
+    // then it goes back inside what the client shows (the work area), made
+    // smaller if it has outgrown it, as macOS keeps windows within the screen
     const std::wstring device = it->second.device;
     std::thread([hwnd, device] {
       for (int i = 0; i < 8; ++i) {
@@ -1006,11 +1007,14 @@ namespace app_desk {
         mi.cbSize = sizeof(mi);
         if (!GetMonitorInfoW(mon, &mi)) return;
         const RECT &w = mi.rcWork;
-        const LONG fw = f.right - f.left, fh = f.bottom - f.top;
-        if (fw > w.right - w.left || fh > w.bottom - w.top) return;
-        if (f.right > w.right || f.bottom > w.bottom || f.left < w.left || f.top < w.top) {
-          move_frame_to(hwnd, std::clamp<LONG>(f.left, w.left, w.right - fw), std::clamp<LONG>(f.top, w.top, w.bottom - fh));
-          return;
+        const LONG ww = w.right - w.left, wh = w.bottom - w.top;
+        LONG fw = f.right - f.left, fh = f.bottom - f.top;
+        const bool shrink = fw > ww || fh > wh;
+        if (shrink || f.right > w.right || f.bottom > w.bottom || f.left < w.left || f.top < w.top) {
+          fw = std::min(fw, ww);
+          fh = std::min(fh, wh);
+          move_frame_to(hwnd, std::clamp<LONG>(f.left, w.left, w.right - fw), std::clamp<LONG>(f.top, w.top, w.bottom - fh), shrink ? fw : 0, shrink ? fh : 0);
+          if (!shrink) return;
         }
       }
     }).detach();
