@@ -15,6 +15,7 @@
   #include <shellapi.h>
 
   #include <algorithm>
+  #include <climits>
   #include <atomic>
   #include <chrono>
   #include <condition_variable>
@@ -1337,6 +1338,93 @@ namespace app_desk {
         }
         return static_cast<int>(static_cast<long long>(w.rect[2]) * w.rect[3] * shown / (grid * grid));
       };
+      // The parts of a window the user sees, in its frame: 32 px cells, each
+      // shown unless one window above covers it whole or it is off the desk,
+      // grown by two cells (a window moved or uncovered on the client has
+      // real pixels there before the host catches up), as at most eight
+      // rectangles. The atlas keeps these 1:1 when the window goes smaller.
+      auto visible_parts = [&](std::size_t i) {
+        const auto &w = out.windows[i];
+        constexpr int cell = 32, grow = 2, most = 8;
+        const int cols = (w.rect[2] + cell - 1) / cell, rows = (w.rect[3] + cell - 1) / cell;
+        const int dw = desk.right - desk.left, dh = desk.bottom - desk.top;
+        std::vector<char> shown(static_cast<std::size_t>(cols) * rows, 0), grown(shown.size(), 0);
+        for (int r = 0; r < rows; ++r) {
+          for (int c = 0; c < cols; ++c) {
+            const int x0 = w.rect[0] + c * cell, y0 = w.rect[1] + r * cell;
+            const int x1 = std::min(x0 + cell, w.rect[0] + w.rect[2]), y1 = std::min(y0 + cell, w.rect[1] + w.rect[3]);
+            if (x1 <= 0 || y1 <= 0 || x0 >= dw || y0 >= dh) continue;
+            bool covered = false;
+            for (std::size_t j = i + 1; j < out.windows.size() && !covered; ++j) {
+              const auto &o = out.windows[j];
+              covered = o.state != "minimized" && o.kind != "popup" && x0 >= o.rect[0] && y0 >= o.rect[1] && x1 <= o.rect[0] + o.rect[2] && y1 <= o.rect[1] + o.rect[3];
+            }
+            shown[r * cols + c] = !covered;
+          }
+        }
+        for (int r = 0; r < rows; ++r) {
+          for (int c = 0; c < cols; ++c) {
+            if (!shown[r * cols + c]) continue;
+            for (int gr = std::max(0, r - grow); gr <= std::min(rows - 1, r + grow); ++gr) {
+              for (int gc = std::max(0, c - grow); gc <= std::min(cols - 1, c + grow); ++gc) grown[gr * cols + gc] = 1;
+            }
+          }
+        }
+        // Runs of each row, stacked onto the same run of the row above
+        struct run_t {
+          int c0, c1, r0, r1;
+        };
+        std::vector<run_t> done, open;
+        for (int r = 0; r < rows; ++r) {
+          std::vector<run_t> next;
+          for (int c = 0; c < cols;) {
+            if (!grown[r * cols + c]) {
+              ++c;
+              continue;
+            }
+            int e = c;
+            while (e < cols && grown[r * cols + e]) ++e;
+            auto above = std::find_if(open.begin(), open.end(), [&](const run_t &o) {
+              return o.c0 == c && o.c1 == e;
+            });
+            if (above != open.end()) {
+              next.push_back({c, e, above->r0, r + 1});
+              open.erase(above);
+            } else {
+              next.push_back({c, e, r, r + 1});
+            }
+            c = e;
+          }
+          done.insert(done.end(), open.begin(), open.end());
+          open = std::move(next);
+        }
+        done.insert(done.end(), open.begin(), open.end());
+        auto area = [](const run_t &a) {
+          return static_cast<long long>(a.c1 - a.c0) * (a.r1 - a.r0);
+        };
+        while (done.size() > most) {
+          std::size_t bi = 0, bj = 1;
+          long long best = LLONG_MAX;
+          for (std::size_t a = 0; a < done.size(); ++a) {
+            for (std::size_t b = a + 1; b < done.size(); ++b) {
+              const run_t box {std::min(done[a].c0, done[b].c0), std::max(done[a].c1, done[b].c1), std::min(done[a].r0, done[b].r0), std::max(done[a].r1, done[b].r1)};
+              const long long extra = area(box) - area(done[a]) - area(done[b]);
+              if (extra < best) {
+                best = extra;
+                bi = a;
+                bj = b;
+              }
+            }
+          }
+          done[bi] = {std::min(done[bi].c0, done[bj].c0), std::max(done[bi].c1, done[bj].c1), std::min(done[bi].r0, done[bj].r0), std::max(done[bi].r1, done[bj].r1)};
+          done.erase(done.begin() + bj);
+        }
+        std::vector<RECT> parts;
+        for (const auto &d : done) {
+          parts.push_back({d.c0 * cell, d.r0 * cell, std::min(d.c1 * cell, w.rect[2]), std::min(d.r1 * cell, w.rect[3])});
+        }
+        return parts;
+      };
       std::vector<desk_atlas::source_t> sources;
       for (std::size_t i = 0; i < out.windows.size(); ++i) {
         const auto &w = out.windows[i];
@@ -1350,7 +1438,7 @@ namespace app_desk {
         // drawn smaller
         const long long area = std::min<long long>(INT_MAX / 4, visible_area(i));
         const int priority = static_cast<int>(area + (w.kind == "popup" ? INT_MAX / 2 : focused ? INT_MAX / 4 : 0));
-        sources.push_back({reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)), w.rect[2], w.rect[3], w.kind == "popup", priority});
+        sources.push_back({reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)), w.rect[2], w.rect[3], w.kind == "popup", priority, w.kind == "popup" ? std::vector<RECT> {} : visible_parts(i)});
       }
       for (const auto &slot : atlas->sync(sources)) {
         for (auto &w : out.windows) {
@@ -1362,6 +1450,8 @@ namespace app_desk {
           w.alpha_slot[0] = slot.ax;
           w.alpha_slot[1] = slot.ay;
           w.scale = slot.scale;
+          w.pieces.clear();
+          for (const auto &p : slot.pieces) w.pieces.push_back({p.x, p.y, p.w, p.h, p.ax, p.ay});
         }
       }
     }
@@ -1379,6 +1469,9 @@ namespace app_desk {
       for (int v : w.rect) mix(static_cast<std::uint32_t>(v));
       for (int v : w.slot) mix(static_cast<std::uint32_t>(v));
       for (int v : w.alpha_slot) mix(static_cast<std::uint32_t>(v));
+      for (const auto &p : w.pieces) {
+        for (int v : p) mix(static_cast<std::uint32_t>(v));
+      }
       mix(w.focused);
       mix(w.caption);
       mix(w.radius);

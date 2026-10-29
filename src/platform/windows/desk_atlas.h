@@ -15,6 +15,11 @@
  * The source rectangle of each thumbnail is the slot's capacity, larger than
  * the window: DWM then draws the window 1:1 from its top-left and leaves the
  * rest empty, so a window growing within its slot never shows scaled.
+ *
+ * When everything does not fit, the windows showing least go in smaller, and
+ * the parts of them the user sees go in 1:1 as well ("pieces", thumbnails of
+ * just that part): what is on the client's screen never fills more than the
+ * screen, which the atlas is larger than, so it stays sharp.
  */
 #pragma once
 
@@ -35,6 +40,12 @@ namespace desk_atlas {
     int w = 0, h = 0;  ///< the window's frame (DWM extended frame bounds) size
     bool alpha = false;  ///< also draw it on white, for exact transparency
     int priority = 0;  ///< higher keeps full size first when the atlas is full
+    std::vector<RECT> visible;  ///< the parts the user sees (frame coordinates), sharp even when the rest goes smaller
+  };
+
+  struct piece_t {
+    int x = 0, y = 0, w = 0, h = 0;  ///< the part, in the frame (1:1)
+    int ax = 0, ay = 0;  ///< where it is in the atlas
   };
 
   struct slot_t {
@@ -43,6 +54,7 @@ namespace desk_atlas {
     int w = 0, h = 0;  ///< its size there (the frame size times scale)
     int ax = -1, ay = -1;  ///< the copy on white, or -1
     double scale = 1.0;  ///< below 1 only when the atlas is too small for everything
+    std::vector<piece_t> pieces;  ///< with a scale below 1: the visible parts, 1:1
   };
 
   class atlas_t {
@@ -66,6 +78,13 @@ namespace desk_atlas {
     struct cell_t {
       int x = 0, y = 0, cw = 0, ch = 0;  ///< capacity rect (atlas client coordinates)
     };
+    struct piece_item_t {
+      HTHUMBNAIL thumb = nullptr;
+      RECT part {};  ///< in the frame
+      cell_t cell;
+      RECT shown_part {};  ///< what the thumbnail was last set to
+      cell_t shown_cell;
+    };
     struct item_t {
       HTHUMBNAIL black = nullptr, white = nullptr;
       cell_t cell, white_cell;
@@ -74,12 +93,16 @@ namespace desk_atlas {
       double scale = 1.0;
       RECT source_offset {};  ///< frame origin inside the window rect
       bool used = false;
+      std::vector<RECT> want;  ///< the visible parts, for pieces when drawn smaller
+      std::vector<piece_item_t> pieces;
     };
 
     static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
     void run();
     std::vector<slot_t> apply(const std::vector<source_t> &sources);
     bool place(std::vector<cell_t> &taken, int cw, int ch, cell_t &out) const;
+    bool place_pieces(std::vector<cell_t> &taken, item_t &item, bool required) const;
+    void show_pieces(HWND hwnd, item_t &item);
     void release(item_t &item);
     void paint(HDC dc);
     bool update_thumbnail(HTHUMBNAIL thumb, const cell_t &cell, const item_t &item);

@@ -33,6 +33,12 @@ namespace desk_atlas {
     bool overlaps(int x, int y, int w, int h, int ox, int oy, int ow, int oh) {
       return x < ox + ow && ox < x + w && y < oy + oh && oy < y + h;
     }
+
+    bool same_rects(const std::vector<RECT> &a, const std::vector<RECT> &b) {
+      return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const RECT &x, const RECT &y) {
+               return EqualRect(&x, &y);
+             });
+    }
   }  // namespace
 
   atlas_t::atlas_t(const RECT &monitor):
@@ -147,6 +153,66 @@ namespace desk_atlas {
     if (item.black) DwmUnregisterThumbnail(item.black);
     if (item.white) DwmUnregisterThumbnail(item.white);
     item.black = item.white = nullptr;
+    for (auto &p : item.pieces) {
+      if (p.thumb) DwmUnregisterThumbnail(p.thumb);
+    }
+    item.pieces.clear();
+  }
+
+  /** The visible parts of a picture drawn smaller, each 1:1 in a cell of its
+   *  own; with `required`, all of them or nothing. */
+  bool atlas_t::place_pieces(std::vector<cell_t> &taken, item_t &item, bool required) const {
+    const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top;
+    std::size_t n = 0;
+    if (item.scale < 1.0) {
+      for (const auto &r : item.want) {
+        cell_t cell;
+        if (!place(taken, capacity(r.right - r.left, W, false), capacity(r.bottom - r.top, H, false), cell)) {
+          if (required) return false;
+          continue;
+        }
+        if (item.pieces.size() <= n) item.pieces.emplace_back();
+        item.pieces[n].part = r;
+        item.pieces[n].cell = cell;
+        ++n;
+      }
+    }
+    for (std::size_t k = n; k < item.pieces.size(); ++k) item.pieces[k].cell = {};
+    return true;
+  }
+
+  void atlas_t::show_pieces(HWND hwnd, item_t &item) {
+    const bool shown = item.black && item.cell.cw > 0;
+    for (auto &p : item.pieces) {
+      if (!shown || p.cell.cw <= 0) {
+        if (p.thumb) DwmUnregisterThumbnail(p.thumb);
+        p.thumb = nullptr;
+        p.cell = {};
+        continue;
+      }
+      if (!p.thumb) {
+        if (FAILED(DwmRegisterThumbnail(window_, hwnd, &p.thumb))) {
+          p.thumb = nullptr;
+          p.cell = {};
+          continue;
+        }
+        p.shown_part = {};
+      }
+      const RECT source {item.source_offset.left + p.part.left, item.source_offset.top + p.part.top, item.source_offset.left + p.part.right, item.source_offset.top + p.part.bottom};
+      if (EqualRect(&source, &p.shown_part) && p.cell.x == p.shown_cell.x && p.cell.y == p.shown_cell.y) continue;
+      DWM_THUMBNAIL_PROPERTIES props {};
+      props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
+      props.rcDestination = {p.cell.x, p.cell.y, p.cell.x + (p.part.right - p.part.left), p.cell.y + (p.part.bottom - p.part.top)};
+      props.rcSource = source;
+      props.opacity = 255;
+      props.fVisible = TRUE;
+      props.fSourceClientAreaOnly = FALSE;
+      if (SUCCEEDED(DwmUpdateThumbnailProperties(p.thumb, &props))) {
+        p.shown_part = source;
+        p.shown_cell = p.cell;
+      }
+    }
+    while (!item.pieces.empty() && !item.pieces.back().thumb) item.pieces.pop_back();
   }
 
   /** MaxRects, best short side fit: the free space is the atlas minus every
@@ -216,7 +282,7 @@ namespace desk_atlas {
   std::vector<slot_t> atlas_t::apply(const std::vector<source_t> &sources) {
     const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top;
     for (auto &[hwnd, item] : items_) item.used = false;
-    std::vector<HWND> to_place;
+    std::vector<HWND> to_place, pieces_dirty;
     for (const auto &s : sources) {
       if (!s.hwnd || s.w <= 0 || s.h <= 0 || !IsWindow(s.hwnd)) continue;
       auto &item = items_[s.hwnd];
@@ -242,6 +308,15 @@ namespace desk_atlas {
       item.w = s.w;
       item.h = s.h;
       item.has_white = s.alpha;
+      std::vector<RECT> want;
+      if (!s.alpha) {
+        for (const auto &r : s.visible) {
+          const RECT c {std::max<LONG>(r.left, 0), std::max<LONG>(r.top, 0), std::min<LONG>(r.right, s.w), std::min<LONG>(r.bottom, s.h)};
+          if (c.right > c.left && c.bottom > c.top) want.push_back(c);
+        }
+      }
+      if (item.scale < 1.0 && item.black && item.cell.cw > 0 && !same_rects(want, item.want)) pieces_dirty.push_back(s.hwnd);
+      item.want = std::move(want);
     }
     bool removed = false;
     for (auto it = items_.begin(); it != items_.end();) {
@@ -279,8 +354,12 @@ namespace desk_atlas {
       for (const auto &[hwnd, item] : items_) to_place.push_back(hwnd);
     }
     last_area_ = area;
+    auto placing = [&](HWND h) {
+      return std::find(to_place.begin(), to_place.end(), h) != to_place.end();
+    };
+    std::erase_if(pieces_dirty, placing);
 
-    if (!to_place.empty()) {
+    if (!to_place.empty() || !pieces_dirty.empty()) {
       auto priority = [&](HWND h) {
         for (const auto &s : sources) {
           if (s.hwnd == h) return s.priority;
@@ -289,14 +368,18 @@ namespace desk_atlas {
       };
       std::vector<cell_t> taken;
       for (const auto &[hwnd, item] : items_) {
-        if (std::find(to_place.begin(), to_place.end(), hwnd) != to_place.end() || !item.black) continue;
+        if (placing(hwnd) || !item.black) continue;
         taken.push_back(item.cell);
         if (item.has_white) taken.push_back(item.white_cell);
+        if (std::find(pieces_dirty.begin(), pieces_dirty.end(), hwnd) != pieces_dirty.end()) continue;
+        for (const auto &p : item.pieces) {
+          if (p.cell.cw > 0) taken.push_back(p.cell);
+        }
       }
       std::sort(to_place.begin(), to_place.end(), [&](HWND a, HWND b) {
         return priority(a) > priority(b);
       });
-      auto place_item = [&](HWND hwnd, item_t &item, double scale) {
+      auto place_item = [&](HWND hwnd, item_t &item, double scale, bool pieces_required = true) {
         // Windows get a little room to grow (live resizes); popups never resize
         const bool room = !item.has_white;
         const int cw = capacity(static_cast<int>(std::ceil(item.w * scale)), W, room), ch = capacity(static_cast<int>(std::ceil(item.h * scale)), H, room);
@@ -304,6 +387,8 @@ namespace desk_atlas {
         cell_t cell, white;
         if (!place(trial, cw, ch, cell)) return false;
         if (item.has_white && !place(trial, cw, ch, white)) return false;
+        item.scale = scale;
+        if (!place_pieces(trial, item, pieces_required)) return false;
         taken = std::move(trial);
         item.cell = cell;
         item.white_cell = item.has_white ? white : cell_t {};
@@ -311,7 +396,15 @@ namespace desk_atlas {
         return true;
       };
       bool all = true;
-      for (HWND hwnd : to_place) {
+      for (HWND hwnd : pieces_dirty) {
+        std::vector<cell_t> trial = taken;
+        if (!place_pieces(trial, items_[hwnd], true)) {
+          all = false;
+          break;
+        }
+        taken = std::move(trial);
+      }
+      for (HWND hwnd : all ? to_place : std::vector<HWND> {}) {
         if (!place_item(hwnd, items_[hwnd], 1.0)) {
           all = false;
           break;
@@ -335,20 +428,37 @@ namespace desk_atlas {
           return static_cast<double>(it.w) * it.h * scales[h] * scales[h] * (it.has_white ? 2 : 1);
         };
         static const double steps[] = {1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.12};
-        bool packed = false;
-        for (int round = 0; round < 64 && !packed; ++round) {
+        auto pack_all = [&] {
           taken.clear();
           std::sort(order.begin(), order.end(), [&](HWND a, HWND b) {
             return area(a) > area(b);
           });
-          packed = true;
           for (HWND hwnd : order) {
-            if (!place_item(hwnd, items_[hwnd], scales[hwnd])) {
-              packed = false;
-              break;
-            }
+            if (!place_item(hwnd, items_[hwnd], scales[hwnd])) return false;
           }
-          if (packed) break;
+          return true;
+        };
+        bool packed = false;
+        for (int round = 0; round < 64 && !packed; ++round) {
+          packed = pack_all();
+          if (packed) {
+            // Then the stand-ins of windows that went smaller as large as
+            // still fits (most visible first): what a move uncovers before
+            // its pieces come shows nearly sharp
+            for (auto h = by_priority.rbegin(); h != by_priority.rend(); ++h) {
+              if (scales[*h] >= 1.0 || items_[*h].has_white) continue;
+              const double was = scales[*h];
+              for (double step : steps) {
+                if (step <= was + 1e-9) break;
+                scales[*h] = step;
+                if (pack_all()) break;
+                scales[*h] = was;
+              }
+            }
+            // The last trial may have failed: place everything as chosen
+            packed = pack_all();
+            break;
+          }
           // Shrink a step the window showing the fewest pixels at its current
           // scale: the loss spreads over the least visible windows instead
           // of one window going very blurry
@@ -363,6 +473,12 @@ namespace desk_atlas {
             }
           }
           if (!pick) break;
+          // A window's visible parts stay 1:1 (pieces), so the rest of it
+          // goes straight to a small stand-in; popups have no pieces
+          if (!items_[pick].has_white) {
+            scales[pick] = scales[pick] > 0.25 ? 0.25 : steps[std::size(steps) - 1];
+            continue;
+          }
           for (std::size_t k = 0; k + 1 < std::size(steps); ++k) {
             if (scales[pick] >= steps[k] - 1e-9) {
               scales[pick] = steps[k + 1];
@@ -372,11 +488,14 @@ namespace desk_atlas {
         }
         to_place = order;
         if (!packed) {
+          // Not even then: what fits, pieces where they fit
+          taken.clear();
           for (HWND hwnd : order) {
-            if (std::find_if(taken.begin(), taken.end(), [&](const cell_t &c) {
-                  return c.x == items_[hwnd].cell.x && c.y == items_[hwnd].cell.y;
-                }) == taken.end()) {
-              items_[hwnd].cell = {};
+            auto &item = items_[hwnd];
+            if (!place_item(hwnd, item, scales[hwnd], false)) {
+              item.cell = {};
+              item.white_cell = {};
+              for (auto &p : item.pieces) p.cell = {};
             }
           }
         }
@@ -395,6 +514,8 @@ namespace desk_atlas {
         if (item.white) update_thumbnail(item.white, item.white_cell, item);
       }
     }
+
+    for (auto &[hwnd, item] : items_) show_pieces(hwnd, item);
 
     // The white backings first in the frame order: painted now, synchronously
     std::vector<RECT> white;
@@ -425,6 +546,9 @@ namespace desk_atlas {
       if (item.white) {
         s.ax = item.white_cell.x;
         s.ay = item.white_cell.y;
+      }
+      for (const auto &p : item.pieces) {
+        if (p.thumb && p.cell.cw > 0) s.pieces.push_back({p.part.left, p.part.top, p.part.right - p.part.left, p.part.bottom - p.part.top, p.cell.x, p.cell.y});
       }
       out.push_back(s);
     }
