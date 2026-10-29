@@ -793,9 +793,15 @@ namespace app_desk {
       if (!IntersectRect(&x, &r, &c->desk)) return TRUE;
       wchar_t cls[64] {};
       GetClassNameW(hwnd, cls, 64);
-      static const wchar_t *shell[] = {L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", L"Windows.UI.Core.CoreWindow", L"XamlExplorerHostIslandWindow", L"IME"};
+      static const wchar_t *shell[] = {L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", L"Windows.UI.Core.CoreWindow", L"IME"};
       for (auto *s : shell) {
         if (wcscmp(cls, s) == 0) return TRUE;
+      }
+      // The shell's XAML hosts are its full-screen overlays (Alt-Tab, task
+      // view) but also real dialogs ("Open with"): only the overlays are left out
+      if (wcscmp(cls, L"XamlExplorerHostIslandWindow") == 0 && (r.right - r.left) * 10 >= (c->desk.right - c->desk.left) * 9 &&
+          (r.bottom - r.top) * 10 >= (c->desk.bottom - c->desk.top) * 9) {
+        return TRUE;
       }
       raw_t raw {hwnd, r, GetWindowLongW(hwnd, GWL_STYLE), GetWindowLongW(hwnd, GWL_EXSTYLE), GetWindow(hwnd, GW_OWNER), 0, 0};
       raw.tid = GetWindowThreadProcessId(hwnd, &raw.pid);
@@ -810,13 +816,21 @@ namespace app_desk {
     for (std::size_t i = 0; i < windows.size(); ++i) {
       const auto &w = windows[i];
       if (w.pid == self) continue;
-      const bool captioned = (w.style & WS_CAPTION) == WS_CAPTION;
+      // A window of its own: one with a caption, or an unowned one Alt-Tab
+      // would list (no tool window, activatable) of window size: dialogs and
+      // apps drawing their own frame ("Open with", frameless apps). Menus,
+      // tooltips and drop-downs are tool windows, owned, or no-activate.
+      const bool has_caption = (w.style & WS_CAPTION) == WS_CAPTION;
+      const auto frameless_window = [](const raw_t &r) {
+        return !r.owner && !(r.ex_style & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) && (r.rect.right - r.rect.left) >= 200 && (r.rect.bottom - r.rect.top) >= 150;
+      };
+      const bool captioned = has_caption || frameless_window(w);
       HWND owner = w.owner;
       if (!captioned && !owner) {
         // Unowned popup (Win32 menu, combo list): belongs to the top-level
         // window of its thread, if one is on the desk.
         for (const auto &o : windows) {
-          if (o.hwnd != w.hwnd && o.tid == w.tid && (o.style & WS_CAPTION) == WS_CAPTION && !o.owner) {
+          if (o.hwnd != w.hwnd && o.tid == w.tid && ((o.style & WS_CAPTION) == WS_CAPTION || frameless_window(o)) && !o.owner) {
             owner = o.hwnd;
             break;
           }
@@ -853,7 +867,7 @@ namespace app_desk {
       win.rect[3] = static_cast<int>(w.rect.bottom - w.rect.top);
       win.state = IsZoomed(w.hwnd) ? "maximized" : "normal";
       win.focused = w.hwnd == foreground;
-      if (captioned) {
+      if (has_caption) {
         RECT cr {};
         POINT co {0, 0};
         if (GetClientRect(w.hwnd, &cr) && ClientToScreen(w.hwnd, &co)) win.caption = static_cast<int>(std::max(0L, co.y - w.rect.top));
