@@ -648,15 +648,18 @@ namespace app_desk {
     RECT rect {};
     if (!find_monitor(it->second.device, &rect)) return false;
     if (it->second.adopted.contains(hwnd)) {
-      // Already on the desk: a plain move. Kept on the desk: past its edge
-      // the window would land on the host's own displays (the client shows
-      // the part of it that is on screen either way).
+      // Already on the desk: a plain move, as far off its edges as the Mac
+      // lets a window go (a window flicked aside), so both keep agreeing on
+      // where it is. Left and right, at least half of it stays on the desk:
+      // a window mostly on the host's own display beside it would take that
+      // display's DPI. Nothing is below or above the desk; the top stays on
+      // it (macOS keeps title bars below the menu bar anyway).
       RECT frame {};
       if (app_window_layout::frame_rect(hwnd, frame)) {
-        const LONG w = frame.right - frame.left, h = frame.bottom - frame.top;
+        const LONG w = frame.right - frame.left;
         const LONG dw = rect.right - rect.left, dh = rect.bottom - rect.top;
-        x = static_cast<int>(std::max<LONG>(0, std::min<LONG>(x, std::max<LONG>(0, dw - w))));
-        y = static_cast<int>(std::max<LONG>(0, std::min<LONG>(y, std::max<LONG>(0, dh - h))));
+        x = static_cast<int>(std::clamp<LONG>(x, -(w / 2) + 1, std::max<LONG>(-(w / 2) + 1, dw - w / 2 - 1)));
+        y = static_cast<int>(std::clamp<LONG>(y, 0, std::max<LONG>(0, dh - 8)));
       }
       move_frame_to(hwnd, rect.left + x, rect.top + y);
       return true;
