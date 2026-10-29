@@ -50,9 +50,9 @@ namespace app_desk {
   /** Out of the way while the client drags it: just past the desk's right
    *  edge, beyond what any client window shows. Adopt puts it back. */
   bool park(const std::string &client_uuid, std::uint64_t hwnd);
-  /** Stack the desk's windows in this order, top-most first, without
-   *  activating any (the client's window order is the truth). */
-  bool order(const std::string &client_uuid, const std::vector<std::uint64_t> &top_first);
+  /** Stack the desk's windows in this order, top-most first (the client's
+   *  window order is the truth); with focus, the first one is activated. */
+  bool order(const std::string &client_uuid, const std::vector<std::uint64_t> &top_first, bool focus);
 
   struct window_t {
     std::uint64_t handle = 0;

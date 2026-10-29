@@ -4153,7 +4153,7 @@ namespace nvhttp {
       while (std::getline(list, item, ',')) {
         if (auto h = parse_window_handle(item)) top_first.push_back(h);
       }
-      const bool ok = app_desk::order(uuid, top_first);
+      const bool ok = app_desk::order(uuid, top_first, get_arg(args, "focus", "0") == "1");
       write_json(response, {{"status", ok}}, ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_not_found);
       return;
     }

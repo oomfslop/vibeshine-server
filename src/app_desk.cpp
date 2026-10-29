@@ -538,26 +538,48 @@ namespace app_desk {
     return true;
   }
 
-  bool order(const std::string &client_uuid, const std::vector<std::uint64_t> &top_first) {
+  bool order(const std::string &client_uuid, const std::vector<std::uint64_t> &top_first, bool focus) {
     RECT desk {};
     {
       std::lock_guard lock(g_mutex);
       auto it = g_desks.find(client_uuid);
       if (it == g_desks.end() || !it->second.open || !find_monitor(it->second.device, &desk)) return false;
     }
-    HWND above = HWND_TOP;
-    int placed = 0;
+    std::vector<HWND> windows;
     for (auto handle : top_first) {
       auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
-      RECT r {};
-      if (!IsWindow(hwnd) || !GetWindowRect(hwnd, &r)) continue;
-      RECT x {};
-      if (!IntersectRect(&x, &r, &desk)) continue;  // only windows on the desk
-      SetWindowPos(hwnd, above, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-      above = hwnd;
-      ++placed;
+      RECT r {}, x {};
+      if (!IsWindow(hwnd) || !GetWindowRect(hwnd, &r) || !IntersectRect(&x, &r, &desk)) continue;  // only windows on the desk
+      if (IsHungAppWindow(hwnd)) continue;  // DeferWindowPos would wait for it
+      windows.push_back(hwnd);
     }
-    return placed > 0;
+    if (windows.empty()) return false;
+    // The client is the active app: its front window gets the focus in the
+    // same step, so the host never shows the new order with the old focus.
+    // (Unless it, a popup of it or its thread's menu has it already: a
+    // click got there first, and activating again would close its menu.)
+    if (focus) {
+      HWND top = windows.front(), fg = GetForegroundWindow();
+      const bool has = fg && (fg == top || GetAncestor(fg, GA_ROOTOWNER) == top ||
+                              GetWindowThreadProcessId(fg, nullptr) == GetWindowThreadProcessId(top, nullptr));
+      if (!has) host_windows::action(reinterpret_cast<std::uintptr_t>(top), host_windows::op_e::activate);
+    }
+    if (windows.size() < 2) return true;
+    // One batch, each window right below the one before it. The front one
+    // is not moved: raising a window above the foreground one is refused
+    // to a background process, and only the order among the desk's own
+    // windows matters (the desk is a display of its own). Separate
+    // SetWindowPos calls on windows of different threads applied in any
+    // order and could leave the stack half done.
+    HDWP batch = BeginDeferWindowPos(static_cast<int>(windows.size()) - 1);
+    for (std::size_t i = 1; batch && i < windows.size(); ++i) {
+      batch = DeferWindowPos(batch, windows[i], windows[i - 1], 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+    if (!batch || !EndDeferWindowPos(batch)) {
+      BOOST_LOG(info) << "App desk: stacking failed (" << GetLastError() << ')';
+      return false;
+    }
+    return true;
   }
 
   bool park(const std::string &client_uuid, std::uint64_t handle) {
@@ -772,7 +794,7 @@ namespace app_desk {
     return false;
   }
 
-  bool order(const std::string &, const std::vector<std::uint64_t> &) {
+  bool order(const std::string &, const std::vector<std::uint64_t> &, bool) {
     return false;
   }
 
