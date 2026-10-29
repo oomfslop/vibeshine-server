@@ -8,6 +8,7 @@
 #include "logging.h"
 
 #ifdef _WIN32
+  #include <winsock2.h>
   #include <windows.h>
   #include <dwmapi.h>
 
@@ -23,7 +24,11 @@
   #include <mutex>
   #include <thread>
 
+  #include <functional>
+
   #include "platform/windows/app_window_layout.h"
+  #include "platform/windows/desk_atlas.h"
+  #include "platform/windows/misc.h"
   #include "platform/windows/utf_utils.h"
   #include "platform/windows/virtual_display.h"
 
@@ -31,10 +36,18 @@ namespace app_desk {
 
   namespace {
 
+    struct vdisplay_t {
+      GUID guid {};
+      std::wstring device;  ///< "\\\\.\\DISPLAYn"
+      std::wstring monitor_path;  ///< device path the DPI scale is set through
+    };
+
     struct desk_state_t {
       GUID guid {};
       std::wstring device;  ///< "\\\\.\\DISPLAYn"
       std::wstring monitor_path;  ///< device path the DPI scale is set through
+      vdisplay_t atlas;  ///< the display the session captures: thumbnails of the desk's windows
+      std::shared_ptr<desk_atlas::atlas_t> atlas_window;
       desk_t info;
       std::map<HWND, POINT> adopted;  ///< window -> frame origin before adoption
       bool open = false;  ///< a client is using it (false = idle, kept for a while)
@@ -89,34 +102,58 @@ namespace app_desk {
 
     /** Attach a (detached) display at the given mode, right of everything else,
      *  or switch an attached one to that mode. */
-    /** Where the desk goes: under the bottom-most of the host's other
+    /** The host's own displays: every monitor but the desks' and atlases'. */
+    std::vector<RECT> own_monitors(const std::vector<std::wstring> &exclude) {
+      struct ctx_t {
+        const std::vector<std::wstring> &exclude;
+        std::vector<RECT> out;
+      } ctx {exclude, {}};
+      EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR mon, HDC, LPRECT, LPARAM lp) -> BOOL {
+        auto *c = reinterpret_cast<ctx_t *>(lp);
+        MONITORINFOEXW mi {};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(mon, &mi)) return TRUE;
+        for (const auto &d : c->exclude) {
+          if (!d.empty() && d == mi.szDevice) return TRUE;
+        }
+        c->out.push_back(mi.rcMonitor);
+        return TRUE;
+      },
+                          reinterpret_cast<LPARAM>(&ctx));
+      return ctx.out;
+    }
+
+    /** Where the desk goes: under the bottom-most of the host's own
      *  displays, aligned to its left edge. Only its top edge then touches
      *  another display, and a window the client lets hang off the desk's
      *  left, right or bottom (as far as macOS lets a window go) stays on the
      *  desk alone: beside a real display it would cross onto it and take its
      *  DPI. Nothing goes above the desk's top (macOS keeps windows below its
      *  menu bar). */
-    POINT desk_position(const std::wstring &device) {
-      struct ctx_t {
-        const std::wstring &device;
-        bool found = false;
-        RECT bottom_most {};
-      } ctx {device};
-      EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR mon, HDC, LPRECT, LPARAM lp) -> BOOL {
-        auto *c = reinterpret_cast<ctx_t *>(lp);
-        MONITORINFOEXW mi {};
-        mi.cbSize = sizeof(mi);
-        if (!GetMonitorInfoW(mon, &mi) || c->device == mi.szDevice) return TRUE;
-        if (!c->found || mi.rcMonitor.bottom > c->bottom_most.bottom) c->bottom_most = mi.rcMonitor;
-        c->found = true;
-        return TRUE;
-      },
-                          reinterpret_cast<LPARAM>(&ctx));
-      if (!ctx.found) return {0, 0};
-      return {ctx.bottom_most.left, ctx.bottom_most.bottom};
+    POINT desk_position(const std::vector<std::wstring> &exclude) {
+      const auto monitors = own_monitors(exclude);
+      if (monitors.empty()) return {0, 0};
+      const RECT *bottom_most = &monitors.front();
+      for (const auto &m : monitors) {
+        if (m.bottom > bottom_most->bottom) bottom_most = &m;
+      }
+      return {bottom_most->left, bottom_most->bottom};
     }
 
-    void attach_display(const std::wstring &device, int w, int h, int fps) {
+    /** Where the atlas goes: right of the right-most of the host's own
+     *  displays, at its top, away from the desk (under them): no window of
+     *  the desk crosses onto it. */
+    POINT atlas_position(const std::vector<std::wstring> &exclude) {
+      const auto monitors = own_monitors(exclude);
+      if (monitors.empty()) return {0, 0};
+      const RECT *right_most = &monitors.front();
+      for (const auto &m : monitors) {
+        if (m.right > right_most->right) right_most = &m;
+      }
+      return {right_most->right, right_most->top};
+    }
+
+    void attach_display(const std::wstring &device, int w, int h, int fps, POINT at) {
       DEVMODEW current {};
       current.dmSize = sizeof(current);
       const bool attached = EnumDisplaySettingsW(device.c_str(), ENUM_CURRENT_SETTINGS, &current) && current.dmPelsWidth > 0;
@@ -126,7 +163,6 @@ namespace app_desk {
       want.dmPelsWidth = w;
       want.dmPelsHeight = h;
       want.dmDisplayFrequency = static_cast<DWORD>(fps);
-      const POINT at = desk_position(device);
       want.dmPosition.x = at.x;
       want.dmPosition.y = at.y;
       const LONG set = ChangeDisplaySettingsExW(device.c_str(), &want, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
@@ -438,18 +474,203 @@ namespace app_desk {
       if (right > 0 || bottom > 0) slot = std::make_unique<work_area_reserve_t>(desk, right, bottom);
     }
 
+    /** Make sure this virtual display exists at the mode (the driver's
+     *  nearest when it only has a catalog; w, h and fps then say what it
+     *  got) and at the place `where` says. Creates it when missing. */
+    bool ensure_display(vdisplay_t &d, const std::string &id, const char *label, int &w, int &h, int &fps, bool custom,
+                        const std::function<POINT()> &where, RECT &rect) {
+      bool present = !d.device.empty() && find_monitor(d.device, &rect);
+      if (present && custom && (rect.right - rect.left != w || rect.bottom - rect.top != h)) {
+        // A different size needs a display created for it: recreate.
+        BOOST_LOG(info) << "Desk: recreating " << label << " for " << w << 'x' << h;
+        VDISPLAY::set_virtual_display_protected(d.guid, d.device, false);
+        VDISPLAY::removeVirtualDisplay(d.guid);
+        d.device.clear();
+        d.monitor_path.clear();
+        present = false;
+      }
+      if (present) {
+        if (!custom) {
+          if (auto mode = pick_mode(d.device, w, h, fps)) {
+            w = mode->w;
+            h = mode->h;
+            fps = mode->hz;
+          }
+        }
+        const POINT at = where();
+        if (rect.right - rect.left != w || rect.bottom - rect.top != h || monitor_refresh_hz(d.device.c_str()) != fps || rect.left != at.x || rect.top != at.y) {
+          // Different size, rate or place: retune the existing display.
+          attach_display(d.device, w, h, fps, at);
+          for (int i = 0; i < 100; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (find_monitor(d.device, &rect) && rect.right - rect.left == w && rect.bottom - rect.top == h && rect.left == at.x && rect.top == at.y) break;
+          }
+          present = find_monitor(d.device, &rect);
+        }
+        return present;
+      }
+      if (!VDISPLAY::ensure_driver_is_ready()) {
+        BOOST_LOG(warning) << "Desk: no virtual display driver";
+        return false;
+      }
+      // A fresh monitor identity every time: Windows "remembers window
+      // locations based on monitor connection" and would otherwise drag
+      // windows that once sat on it back onto it when it reappears, with
+      // placements scaled by whatever DPI it had then.
+      const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+      const auto uuid = VDISPLAY::virtualDisplayUuidFromStableId(id + "-" + std::to_string(stamp));
+      std::memcpy(&d.guid, uuid.b8, sizeof(d.guid));
+      VDISPLAY::setWatchdogFeedingEnabled(true);
+      auto created = VDISPLAY::createVirtualDisplay(id.c_str(), label, nullptr, static_cast<uint32_t>(w), static_cast<uint32_t>(h), static_cast<uint32_t>(fps),
+                                                    d.guid, 0, false, 1, std::nullopt, false, true, true, custom);
+      if (!created) {
+        BOOST_LOG(warning) << "Desk: the virtual display driver could not create " << label << " at " << w << 'x' << h << '@' << fps;
+        return false;
+      }
+      d.device = created->display_name.value_or(L"");
+      VDISPLAY::set_virtual_display_protected(d.guid, d.device, true);
+      if (created->monitor_device_path) d.monitor_path = *created->monitor_device_path;
+      // The driver brings it up detached or at a default mode: attach it at ours.
+      present = false;
+      bool picked = false;
+      for (int i = 0; i < 200 && !present; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (!d.device.empty() && !picked && !custom) {
+          if (auto mode = pick_mode(d.device, w, h, fps)) {
+            w = mode->w;
+            h = mode->h;
+            fps = mode->hz;
+            picked = true;
+          }
+        }
+        if (!d.device.empty() && (i == 10 || i == 60)) attach_display(d.device, w, h, fps, where());
+        present = !d.device.empty() && find_monitor(d.device, &rect) && rect.right - rect.left == w && rect.bottom - rect.top == h &&
+                  monitor_refresh_hz(d.device.c_str()) + 1 >= fps;
+      }
+      if (!present) {
+        BOOST_LOG(warning) << "Desk: " << label << " did not come up at " << w << 'x' << h << '@' << fps;
+        VDISPLAY::set_virtual_display_protected(d.guid, d.device, false);
+        VDISPLAY::removeVirtualDisplay(d.guid);
+        d.device.clear();
+        d.monitor_path.clear();
+        return false;
+      }
+      BOOST_LOG(info) << "Desk: created " << label << ' ' << utf_utils::to_utf8(d.device) << ' ' << w << 'x' << h << '@' << fps;
+      return true;
+    }
+
+    void remove_display(vdisplay_t &d) {
+      if (d.device.empty()) return;
+      VDISPLAY::set_virtual_display_protected(d.guid, d.device, false);
+      VDISPLAY::removeVirtualDisplay(d.guid);
+      d.device.clear();
+      d.monitor_path.clear();
+    }
+
+    /** Windows' own window management fights the client's: dragging to an
+     *  edge or hovering a maximize button (Snap Layouts) tiles windows on the
+     *  host behind the client's back. Off for the logged-in user while any
+     *  desk is open, as the Settings app turns it off; the user's values are
+     *  kept under HKCU\\Software\\Vibeshine\\DeskTweaks until restored, so a
+     *  crash restores them with the next desk. */
+    constexpr const wchar_t *tweaks_backup_key = L"Software\\Vibeshine\\DeskTweaks";
+    constexpr const wchar_t *explorer_advanced_key = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
+    constexpr const wchar_t *snap_values[] = {L"EnableSnapAssistFlyout", L"EnableSnapBar", L"SnapAssist"};
+    bool g_tweaked = false;
+
+    /** Runs `fn` with the logged-in user's HKCU open (we run as SYSTEM). */
+    void with_user_hive(const std::function<void(HKEY)> &fn) {
+      HANDLE token = platf::retrieve_users_token(false);
+      if (!token) {
+        BOOST_LOG(warning) << "Desk: no logged-in user for host tweaks";
+        return;
+      }
+      (void) platf::impersonate_current_user(token, [&] {
+        HKEY user = nullptr;
+        if (RegOpenCurrentUser(KEY_READ | KEY_WRITE, &user) == ERROR_SUCCESS) {
+          fn(user);
+          RegCloseKey(user);
+        }
+      });
+      CloseHandle(token);
+    }
+
+    bool read_dword(HKEY root, const wchar_t *key, const wchar_t *name, DWORD &out) {
+      DWORD size = sizeof(out);
+      return RegGetValueW(root, key, name, RRF_RT_REG_DWORD, nullptr, &out, &size) == ERROR_SUCCESS;
+    }
+
+    void write_dword(HKEY root, const wchar_t *key, const wchar_t *name, DWORD value) {
+      RegSetKeyValueW(root, key, name, REG_DWORD, &value, sizeof(value));
+    }
+
+    void announce_settings() {
+      DWORD_PTR result = 0;
+      SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETWINARRANGING, reinterpret_cast<LPARAM>(L"WindowMetrics"), SMTO_ABORTIFHUNG, 500, &result);
+      SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"TraySettings"), SMTO_ABORTIFHUNG, 500, &result);
+    }
+
+    void apply_host_tweaks() {
+      if (g_tweaked) return;
+      g_tweaked = true;
+      BOOL arranging = TRUE;
+      SystemParametersInfoW(SPI_GETWINARRANGING, 0, &arranging, 0);
+      with_user_hive([&](HKEY user) {
+        DWORD saved = 0;
+        if (!read_dword(user, tweaks_backup_key, L"Saved", saved)) {
+          // First time (or restored since): keep the user's values. "absent"
+          // values are remembered as such and deleted again on restore.
+          for (const wchar_t *name : snap_values) {
+            DWORD v = 0;
+            const bool present = read_dword(user, explorer_advanced_key, name, v);
+            write_dword(user, tweaks_backup_key, name, present ? v : 0xffffffffu);
+          }
+          write_dword(user, tweaks_backup_key, L"WinArranging", arranging ? 1 : 0);
+          write_dword(user, tweaks_backup_key, L"Saved", 1);
+        }
+        for (const wchar_t *name : snap_values) write_dword(user, explorer_advanced_key, name, 0);
+      });
+      const BOOL ok = SystemParametersInfoW(SPI_SETWINARRANGING, FALSE, nullptr, SPIF_SENDCHANGE);
+      announce_settings();
+      BOOST_LOG(info) << "Desk: window snapping off on the host while streaming windows (spi " << (ok ? "ok" : "failed") << ", was " << arranging << ')';
+    }
+
+    void restore_host_tweaks() {
+      if (!g_tweaked) return;
+      g_tweaked = false;
+      DWORD arranging = 1;
+      with_user_hive([&](HKEY user) {
+        DWORD saved = 0;
+        if (!read_dword(user, tweaks_backup_key, L"Saved", saved)) return;
+        for (const wchar_t *name : snap_values) {
+          DWORD v = 0xffffffffu;
+          read_dword(user, tweaks_backup_key, name, v);
+          if (v == 0xffffffffu) RegDeleteKeyValueW(user, explorer_advanced_key, name);
+          else write_dword(user, explorer_advanced_key, name, v);
+        }
+        read_dword(user, tweaks_backup_key, L"WinArranging", arranging);
+        RegDeleteKeyW(user, tweaks_backup_key);
+      });
+      SystemParametersInfoW(SPI_SETWINARRANGING, arranging ? TRUE : FALSE, nullptr, SPIF_SENDCHANGE);
+      announce_settings();
+      BOOST_LOG(info) << "Desk: window snapping restored on the host";
+    }
+
     /** Remove a desk's display once it has been idle long enough (detached thread). */
     void schedule_idle_removal(const std::string &client_uuid, unsigned generation) {
       std::thread([client_uuid, generation] {
         std::this_thread::sleep_for(std::chrono::minutes(10));
         GUID guid {};
+        vdisplay_t atlas;
         {
           std::lock_guard lock(g_mutex);
           auto it = g_desks.find(client_uuid);
           if (it == g_desks.end() || it->second.open || it->second.idle_generation != generation) return;
           guid = it->second.guid;
+          atlas = it->second.atlas;
           g_desks.erase(it);
         }
+        remove_display(atlas);
         VDISPLAY::set_virtual_display_protected(guid, {}, false);
         if (VDISPLAY::removeVirtualDisplay(guid)) {
           BOOST_LOG(info) << "Desk: removed the idle display of client " << client_uuid;
@@ -469,88 +690,38 @@ namespace app_desk {
     dpi = std::clamp(dpi, 96, 384);
     std::lock_guard lock(g_mutex);
     auto &desk = g_desks[client_uuid];
-    RECT rect {};
     // Newer drivers expose exactly the requested mode; older ones only a catalog.
     const bool custom = VDISPLAY::supportsRequestedResolutionCatalog();
-    bool present = !desk.device.empty() && find_monitor(desk.device, &rect);
-    if (present && custom && (rect.right - rect.left != w || rect.bottom - rect.top != h)) {
-      // A different size needs a display created for it: recreate.
-      BOOST_LOG(info) << "Desk: recreating the display for " << w << 'x' << h;
-      VDISPLAY::set_virtual_display_protected(desk.guid, desk.device, false);
-      VDISPLAY::removeVirtualDisplay(desk.guid);
-      desk.device.clear();
-      desk.monitor_path.clear();
-      present = false;
+    auto ours = [&desk] {
+      return std::vector<std::wstring> {desk.device, desk.atlas.device};
+    };
+    vdisplay_t desk_display {desk.guid, desk.device, desk.monitor_path};
+    RECT rect {};
+    const bool desk_ok = ensure_display(desk_display, "vibeshine-desk-" + client_uuid, "the desk", w, h, fps, custom, [&] {
+      return desk_position(ours());
+    }, rect);
+    desk.guid = desk_display.guid;
+    desk.device = desk_display.device;
+    desk.monitor_path = desk_display.monitor_path;
+    if (!desk_ok) {
+      remove_display(desk.atlas);
+      g_desks.erase(client_uuid);
+      return {};
     }
-    if (present) {
-      if (!custom) {
-        if (auto mode = pick_mode(desk.device, w, h, fps)) {
-          w = mode->w;
-          h = mode->h;
-          fps = mode->hz;
-        }
-      }
-      const POINT at = desk_position(desk.device);
-      if (rect.right - rect.left != w || rect.bottom - rect.top != h || monitor_refresh_hz(desk.device.c_str()) != fps || rect.left != at.x || rect.top != at.y) {
-        // Different size, rate or place: retune the existing display.
-        attach_display(desk.device, w, h, fps);
-        for (int i = 0; i < 100; ++i) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
-          if (find_monitor(desk.device, &rect) && rect.right - rect.left == w && rect.bottom - rect.top == h && rect.left == at.x && rect.top == at.y) break;
-        }
-        present = find_monitor(desk.device, &rect);
-      }
+    // The atlas: the same mode, so the session streams the size the client expects
+    int aw = w, ah = h, afps = fps;
+    RECT atlas_rect {};
+    if (!ensure_display(desk.atlas, "vibeshine-atlas-" + client_uuid, "the atlas", aw, ah, afps, custom, [&] {
+          return atlas_position(ours());
+        }, atlas_rect) || aw != w || ah != h) {
+      BOOST_LOG(warning) << "Desk: no atlas display at " << w << 'x' << h << " (got " << aw << 'x' << ah << ')';
+      remove_display(desk.atlas);
+      vdisplay_t gone {desk.guid, desk.device, desk.monitor_path};
+      remove_display(gone);
+      g_desks.erase(client_uuid);
+      return {};
     }
-    if (!present) {
-      if (!VDISPLAY::ensure_driver_is_ready()) {
-        BOOST_LOG(warning) << "Desk: no virtual display driver";
-        return {};
-      }
-      // A fresh monitor identity every time: Windows "remembers window
-      // locations based on monitor connection" and would otherwise drag
-      // windows that once sat on the desk back onto it when it reappears,
-      // with placements scaled by whatever DPI it had then.
-      const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-      const auto uuid = VDISPLAY::virtualDisplayUuidFromStableId("vibeshine-desk-" + client_uuid + "-" + std::to_string(stamp));
-      std::memcpy(&desk.guid, uuid.b8, sizeof(desk.guid));
-      VDISPLAY::setWatchdogFeedingEnabled(true);
-      auto created = VDISPLAY::createVirtualDisplay(("desk-" + client_uuid).c_str(), "App windows desk", nullptr,
-                                                    static_cast<uint32_t>(w), static_cast<uint32_t>(h), static_cast<uint32_t>(fps), desk.guid,
-                                                    0, false, 1, std::nullopt, false, true, true, custom);
-      if (!created) {
-        BOOST_LOG(warning) << "Desk: the virtual display driver could not create a " << w << 'x' << h << '@' << fps << " display";
-        g_desks.erase(client_uuid);
-        return {};
-      }
-      desk.device = created->display_name.value_or(L"");
-      VDISPLAY::set_virtual_display_protected(desk.guid, desk.device, true);
-      if (created->monitor_device_path) desk.monitor_path = *created->monitor_device_path;
-      // The driver brings it up detached or at a default mode: attach it at ours.
-      present = false;
-      bool picked = false;
-      for (int i = 0; i < 200 && !present; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        if (!desk.device.empty() && !picked && !custom) {
-          if (auto mode = pick_mode(desk.device, w, h, fps)) {
-            w = mode->w;
-            h = mode->h;
-            fps = mode->hz;
-            picked = true;
-          }
-        }
-        if (!desk.device.empty() && (i == 10 || i == 60)) attach_display(desk.device, w, h, fps);
-        present = !desk.device.empty() && find_monitor(desk.device, &rect) && rect.right - rect.left == w && rect.bottom - rect.top == h &&
-                  monitor_refresh_hz(desk.device.c_str()) + 1 >= fps;
-      }
-      if (!present) {
-        BOOST_LOG(warning) << "Desk: the display did not come up at " << w << 'x' << h << '@' << fps;
-        VDISPLAY::set_virtual_display_protected(desk.guid, desk.device, false);
-        VDISPLAY::removeVirtualDisplay(desk.guid);
-        g_desks.erase(client_uuid);
-        return {};
-      }
-      BOOST_LOG(info) << "Desk: created " << utf_utils::to_utf8(desk.device) << ' ' << w << 'x' << h << '@' << fps << " at " << dpi << " dpi for client " << client_uuid;
-    }
+    find_monitor(desk.device, &rect);  // the atlas may have shifted the layout
     desk.open = true;
     desk.info.valid = true;
     try {
@@ -580,9 +751,20 @@ namespace app_desk {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     hide_desk_taskbar(find_monitor(desk.device));
+    hide_desk_taskbar(find_monitor(desk.atlas.device));
     if (find_monitor(desk.device, &rect)) reserve_work_area(client_uuid, rect, shown_w, shown_h);
+    try {
+      desk.info.capture = utf_utils::to_utf8(desk.atlas.device);
+    } catch (...) {
+    }
+    find_monitor(desk.atlas.device, &atlas_rect);
+    if (!desk.atlas_window || !EqualRect(&desk.atlas_window->monitor(), &atlas_rect)) {
+      desk.atlas_window.reset();
+      desk.atlas_window = std::make_shared<desk_atlas::atlas_t>(atlas_rect);
+    }
+    apply_host_tweaks();
     BOOST_LOG(info) << "Desk: open " << desk.info.display << ' ' << desk.info.rect[2] << 'x' << desk.info.rect[3] << '@' << fps << " at " << desk.info.dpi << " dpi"
-                    << (custom ? " (exact mode)" : " (catalog mode)");
+                    << (custom ? " (exact mode)" : " (catalog mode)") << ", atlas " << desk.info.capture;
     return desk.info;
   }
 
@@ -655,7 +837,11 @@ namespace app_desk {
     }
     it->second.adopted.clear();
     g_reserves.erase(client_uuid);
+    it->second.atlas_window.reset();
     it->second.open = false;
+    bool any = false;
+    for (const auto &[uuid, d] : g_desks) any = any || d.open;
+    if (!any) restore_host_tweaks();
     it->second.idle_since = std::chrono::steady_clock::now();
     schedule_idle_removal(client_uuid, ++it->second.idle_generation);
   }
@@ -782,18 +968,22 @@ namespace app_desk {
     layout_t out;
     RECT desk {};
     std::vector<HWND> adopted;
-    HMONITOR desk_monitor = nullptr;
+    HMONITOR desk_monitor = nullptr, atlas_monitor = nullptr;
+    std::shared_ptr<desk_atlas::atlas_t> atlas;
     {
       std::lock_guard lock(g_mutex);
       auto it = g_desks.find(client_uuid);
       if (it == g_desks.end() || !it->second.open || !(desk_monitor = find_monitor(it->second.device, &desk))) return out;
       for (const auto &[hwnd, origin] : it->second.adopted) adopted.push_back(hwnd);
+      atlas = it->second.atlas_window;
+      atlas_monitor = find_monitor(it->second.atlas.device);
     }
     // Explorer shows it again now and then (display changes, restarts)
     static std::chrono::steady_clock::time_point last_tray_check {};
     if (std::chrono::steady_clock::now() - last_tray_check > std::chrono::seconds(2)) {
       last_tray_check = std::chrono::steady_clock::now();
       hide_desk_taskbar(desk_monitor);
+      hide_desk_taskbar(atlas_monitor);
     }
     out.valid = true;
     struct raw_t {
@@ -860,22 +1050,8 @@ namespace app_desk {
           }
         }
       }
-      if (!captioned) {
-        // Inside its owner it is already part of the owner's picture.
-        if (owner) {
-          for (const auto &o : windows) {
-            if (o.hwnd == owner) {
-              RECT x {};
-              if (w.rect.left >= o.rect.left && w.rect.top >= o.rect.top && w.rect.right <= o.rect.right && w.rect.bottom <= o.rect.bottom) {
-                owner = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1));  // marker: inline
-              }
-              (void) x;
-              break;
-            }
-          }
-          if (owner == reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1))) continue;
-        }
-      }
+      // (A popup inside its owner is listed too: a window's thumbnail never
+      // holds its popups, each is a window of its own.)
       window_t win;
       win.handle = reinterpret_cast<std::uintptr_t>(w.hwnd);
       win.owner = reinterpret_cast<std::uintptr_t>(owner);
@@ -931,6 +1107,27 @@ namespace app_desk {
       out.windows.insert(out.windows.begin(), std::move(win));
     }
     for (std::size_t i = 0; i < out.windows.size(); ++i) out.windows[i].z = static_cast<int>(i);
+    // Their pictures: a slot each in the atlas (the copy on white for popups,
+    // whose transparency matters: menus with their shadows, tooltips)
+    if (atlas) {
+      std::vector<desk_atlas::source_t> sources;
+      for (const auto &w : out.windows) {
+        if (w.state == "minimized") continue;
+        sources.push_back({reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)), w.rect[2], w.rect[3], w.kind == "popup", w.z});
+      }
+      for (const auto &slot : atlas->sync(sources)) {
+        for (auto &w : out.windows) {
+          if (w.handle != reinterpret_cast<std::uintptr_t>(slot.hwnd)) continue;
+          w.slot[0] = slot.x;
+          w.slot[1] = slot.y;
+          w.slot[2] = slot.w;
+          w.slot[3] = slot.h;
+          w.alpha_slot[0] = slot.ax;
+          w.alpha_slot[1] = slot.ay;
+          w.scale = slot.scale;
+        }
+      }
+    }
     // FNV-1a over what the client reacts to
     std::uint64_t h = 1469598103934665603ull;
     auto mix = [&h](std::uint64_t v) {
@@ -943,6 +1140,8 @@ namespace app_desk {
       mix(w.handle);
       mix(w.owner);
       for (int v : w.rect) mix(static_cast<std::uint32_t>(v));
+      for (int v : w.slot) mix(static_cast<std::uint32_t>(v));
+      for (int v : w.alpha_slot) mix(static_cast<std::uint32_t>(v));
       mix(w.focused);
       mix(w.caption);
       mix(w.radius);

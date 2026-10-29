@@ -20,7 +20,8 @@ namespace app_desk {
 
   struct desk_t {
     bool valid = false;
-    std::string display;  ///< GDI device name ("\\\\.\\DISPLAYn") the session captures
+    std::string display;  ///< GDI device name ("\\\\.\\DISPLAYn") of the desk, where the windows are
+    std::string capture;  ///< the atlas display the session captures (thumbnails of the desk's windows)
     int rect[4] {0, 0, 0, 0};  ///< the desk on the host's virtual screen: x, y, w, h
     int fps = 0;
     int dpi = 96;
@@ -68,6 +69,9 @@ namespace app_desk {
     int radius = 0;  ///< corner radius the OS applies (Windows 11: 8 DIP)
     int z = 0;  ///< stacking order, 0 = bottom-most
     std::string icon_key;
+    int slot[4] {0, 0, 0, 0};  ///< where its picture is in the captured atlas: x, y, w, h (0 size = none)
+    int alpha_slot[2] {-1, -1};  ///< the same picture on white (x, y), for exact alpha; -1 = opaque
+    double scale = 1.0;  ///< the picture's scale in the atlas (below 1 only when it is full)
   };
   struct layout_t {
     bool valid = false;

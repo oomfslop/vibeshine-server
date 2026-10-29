@@ -4104,6 +4104,7 @@ namespace nvhttp {
     nlohmann::json desk_json(const app_desk::desk_t &d) {
       return {
         {"display", d.display},
+        {"capture", d.capture},
         {"rect", {d.rect[0], d.rect[1], d.rect[2], d.rect[3]}},
         {"fps", d.fps},
         {"dpi", d.dpi},
@@ -4190,8 +4191,10 @@ namespace nvhttp {
     app_desk::layout_t layout;
     std::uint32_t taken = 0;
     for (;;) {
-      taken = stream::video_clock_now();  // when this snapshot was true, on the frames' clock
       layout = app_desk::layout(uuid);
+      // When this snapshot became true, on the frames' clock: after the atlas
+      // took its slots, so no frame before it shows them
+      taken = stream::video_clock_now();
       if (!layout.valid || layout.etag != etag || std::chrono::steady_clock::now() >= deadline) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(4));
     }
@@ -4222,6 +4225,9 @@ namespace nvhttp {
         {"radius", w.radius},
         {"z", w.z},
         {"icon", w.icon_key},
+        {"slot", {w.slot[0], w.slot[1], w.slot[2], w.slot[3]}},
+        {"alpha_slot", {w.alpha_slot[0], w.alpha_slot[1]}},
+        {"scale", w.scale},
       });
     }
     write_json(response, out);
@@ -4668,7 +4674,7 @@ namespace nvhttp {
       return true;
     }
     auto launch_session = make_launch_session(false, args, request, false, &identity, false, dispatch::include_request_identity_log_fields(trace_id));
-    launch_session->desk_display = desk_info->display;
+    launch_session->desk_display = desk_info->capture.empty() ? desk_info->display : desk_info->capture;
     launch_session->role = remote_session::role_e::game;
     launch_session->role_generation = launch_session->id;
     launch_session->host_audio = false;
