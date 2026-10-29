@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -95,6 +96,7 @@ namespace desk_atlas {
       bool used = false;
       std::vector<RECT> want;  ///< the visible parts, for pieces when drawn smaller
       std::vector<piece_item_t> pieces;
+      bool loose = false;  ///< its pieces only where room is left
     };
 
     static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
@@ -103,6 +105,7 @@ namespace desk_atlas {
     bool place(std::vector<cell_t> &taken, int cw, int ch, cell_t &out) const;
     bool place_pieces(std::vector<cell_t> &taken, item_t &item, bool required) const;
     void show_pieces(HWND hwnd, item_t &item);
+    static RECT margined(const RECT &part, const item_t &item);
     void release(item_t &item);
     void paint(HDC dc);
     bool update_thumbnail(HTHUMBNAIL thumb, const cell_t &cell, const item_t &item);

@@ -34,6 +34,8 @@ namespace desk_atlas {
       return x < ox + ow && ox < x + w && y < oy + oh && oy < y + h;
     }
 
+    constexpr int piece_margin = 8;
+
     bool same_rects(const std::vector<RECT> &a, const std::vector<RECT> &b) {
       return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const RECT &x, const RECT &y) {
                return EqualRect(&x, &y);
@@ -160,25 +162,47 @@ namespace desk_atlas {
   }
 
   /** The visible parts of a picture drawn smaller, each 1:1 in a cell of its
-   *  own; with `required`, all of them or nothing. */
+   *  own; a part with no room as a whole is split along its long side (the
+   *  free space of a full atlas is in strips). With `required`, all of them
+   *  or nothing. */
   bool atlas_t::place_pieces(std::vector<cell_t> &taken, item_t &item, bool required) const {
+    constexpr int most = 64, smallest = 128;
+    // Each part's cell holds a margin of real pixels around it, so filtering
+    // and chroma at its edges never take in a neighbour's
     const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top;
     std::size_t n = 0;
     if (item.scale < 1.0) {
-      for (const auto &r : item.want) {
+      std::vector<RECT> parts(item.want.rbegin(), item.want.rend());  // a stack, first part on top
+      while (!parts.empty()) {
+        const RECT r = parts.back();
+        parts.pop_back();
+        const int w = r.right - r.left, h = r.bottom - r.top;
         cell_t cell;
-        if (!place(taken, capacity(r.right - r.left, W, false), capacity(r.bottom - r.top, H, false), cell)) {
-          if (required) return false;
+        if (place(taken, capacity(w + 2 * piece_margin, W, false), capacity(h + 2 * piece_margin, H, false), cell)) {
+          if (item.pieces.size() <= n) item.pieces.emplace_back();
+          item.pieces[n].part = r;
+          item.pieces[n].cell = cell;
+          ++n;
           continue;
         }
-        if (item.pieces.size() <= n) item.pieces.emplace_back();
-        item.pieces[n].part = r;
-        item.pieces[n].cell = cell;
-        ++n;
+        if (std::max(w, h) >= 2 * smallest && n + parts.size() + 2 <= most) {
+          RECT a = r, b = r;
+          if (w >= h) a.right = b.left = r.left + w / 2 / 8 * 8;
+          else a.bottom = b.top = r.top + h / 2 / 8 * 8;
+          parts.push_back(b);
+          parts.push_back(a);
+          continue;
+        }
+        if (required) return false;
       }
     }
     for (std::size_t k = n; k < item.pieces.size(); ++k) item.pieces[k].cell = {};
     return true;
+  }
+
+  /** A part with its margin, inside the frame */
+  RECT atlas_t::margined(const RECT &part, const item_t &item) {
+    return {std::max<LONG>(0, part.left - piece_margin), std::max<LONG>(0, part.top - piece_margin), std::min<LONG>(item.w, part.right + piece_margin), std::min<LONG>(item.h, part.bottom + piece_margin)};
   }
 
   void atlas_t::show_pieces(HWND hwnd, item_t &item) {
@@ -198,11 +222,12 @@ namespace desk_atlas {
         }
         p.shown_part = {};
       }
-      const RECT source {item.source_offset.left + p.part.left, item.source_offset.top + p.part.top, item.source_offset.left + p.part.right, item.source_offset.top + p.part.bottom};
+      const RECT part = margined(p.part, item);
+      const RECT source {item.source_offset.left + part.left, item.source_offset.top + part.top, item.source_offset.left + part.right, item.source_offset.top + part.bottom};
       if (EqualRect(&source, &p.shown_part) && p.cell.x == p.shown_cell.x && p.cell.y == p.shown_cell.y) continue;
       DWM_THUMBNAIL_PROPERTIES props {};
       props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
-      props.rcDestination = {p.cell.x, p.cell.y, p.cell.x + (p.part.right - p.part.left), p.cell.y + (p.part.bottom - p.part.top)};
+      props.rcDestination = {p.cell.x, p.cell.y, p.cell.x + (part.right - part.left), p.cell.y + (part.bottom - part.top)};
       props.rcSource = source;
       props.opacity = 255;
       props.fVisible = TRUE;
@@ -379,7 +404,8 @@ namespace desk_atlas {
       std::sort(to_place.begin(), to_place.end(), [&](HWND a, HWND b) {
         return priority(a) > priority(b);
       });
-      auto place_item = [&](HWND hwnd, item_t &item, double scale, bool pieces_required = true) {
+      // pieces: 2 all of them or fail, 1 where they fit, 0 none (placed later)
+      auto place_item = [&](HWND hwnd, item_t &item, double scale, int pieces = 2) {
         // Windows get a little room to grow (live resizes); popups never resize
         const bool room = !item.has_white;
         const int cw = capacity(static_cast<int>(std::ceil(item.w * scale)), W, room), ch = capacity(static_cast<int>(std::ceil(item.h * scale)), H, room);
@@ -388,7 +414,11 @@ namespace desk_atlas {
         if (!place(trial, cw, ch, cell)) return false;
         if (item.has_white && !place(trial, cw, ch, white)) return false;
         item.scale = scale;
-        if (!place_pieces(trial, item, pieces_required)) return false;
+        if (pieces == 0) {
+          for (auto &p : item.pieces) p.cell = {};
+        } else if (!place_pieces(trial, item, pieces == 2)) {
+          return false;
+        }
         taken = std::move(trial);
         item.cell = cell;
         item.white_cell = item.has_white ? white : cell_t {};
@@ -398,7 +428,7 @@ namespace desk_atlas {
       bool all = true;
       for (HWND hwnd : pieces_dirty) {
         std::vector<cell_t> trial = taken;
-        if (!place_pieces(trial, items_[hwnd], true)) {
+        if (!place_pieces(trial, items_[hwnd], !items_[hwnd].loose)) {
           all = false;
           break;
         }
@@ -428,15 +458,31 @@ namespace desk_atlas {
           return static_cast<double>(it.w) * it.h * scales[h] * scales[h] * (it.has_white ? 2 : 1);
         };
         static const double steps[] = {1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.12};
+        // Windows whose pieces are taken only where room is left, after
+        // everything else (least visible windows, once nothing else gives)
+        std::set<HWND> loose;
+        long long loose_area = 0;  ///< of the loose pieces the last packing placed
         auto pack_all = [&] {
           taken.clear();
+          loose_area = 0;
           std::sort(order.begin(), order.end(), [&](HWND a, HWND b) {
             return area(a) > area(b);
           });
           for (HWND hwnd : order) {
-            if (!place_item(hwnd, items_[hwnd], scales[hwnd])) return false;
+            if (!place_item(hwnd, items_[hwnd], scales[hwnd], loose.contains(hwnd) ? 0 : 2)) return false;
+          }
+          for (auto h = by_priority.rbegin(); h != by_priority.rend(); ++h) {
+            if (!loose.contains(*h)) continue;
+            place_pieces(taken, items_[*h], false);
+            for (const auto &p : items_[*h].pieces) {
+              if (p.cell.cw > 0) loose_area += static_cast<long long>(p.part.right - p.part.left) * (p.part.bottom - p.part.top);
+            }
           }
           return true;
+        };
+        // Popups and the focused window are the last to give anything up
+        auto top = [&](HWND h) {
+          return items_[h].has_white || priority(h) >= INT_MAX / 4;
         };
         bool packed = false;
         for (int round = 0; round < 64 && !packed; ++round) {
@@ -445,13 +491,14 @@ namespace desk_atlas {
             // Then the stand-ins of windows that went smaller as large as
             // still fits (most visible first): what a move uncovers before
             // its pieces come shows nearly sharp
+            const long long sharp = loose_area;
             for (auto h = by_priority.rbegin(); h != by_priority.rend(); ++h) {
-              if (scales[*h] >= 1.0 || items_[*h].has_white) continue;
+              if (scales[*h] >= 1.0 || items_[*h].has_white || loose.contains(*h)) continue;
               const double was = scales[*h];
               for (double step : steps) {
                 if (step <= was + 1e-9) break;
                 scales[*h] = step;
-                if (pack_all()) break;
+                if (pack_all() && loose_area >= sharp) break;
                 scales[*h] = was;
               }
             }
@@ -464,15 +511,29 @@ namespace desk_atlas {
           // of one window going very blurry
           HWND pick = nullptr;
           double least = 0;
-          for (HWND h : by_priority) {
-            if (scales[h] <= steps[std::size(steps) - 1]) continue;
-            const double shown = static_cast<double>(priority(h)) * scales[h];
-            if (!pick || shown < least) {
-              pick = h;
-              least = shown;
+          for (int pass = 0; pass < 2 && !pick; ++pass) {
+            for (HWND h : by_priority) {
+              if (scales[h] <= steps[std::size(steps) - 1] || top(h) != (pass == 1)) continue;
+              const double shown = static_cast<double>(priority(h)) * scales[h];
+              if (!pick || shown < least) {
+                pick = h;
+                least = shown;
+              }
             }
+            if (pick || pass == 1) break;
+            // Every other window is as small as it goes: the least visible
+            // one's pieces go where room is left
+            for (HWND h : by_priority) {
+              if (!top(h) && !loose.contains(h) && scales[h] < 1.0 && !items_[h].want.empty()) {
+                loose.insert(h);
+                pick = h;
+                break;
+              }
+            }
+            if (pick) break;
           }
           if (!pick) break;
+          if (loose.contains(pick) && !top(pick) && scales[pick] <= steps[std::size(steps) - 1]) continue;
           // A window's visible parts stay 1:1 (pieces), so the rest of it
           // goes straight to a small stand-in; popups have no pieces
           if (!items_[pick].has_white) {
@@ -487,12 +548,13 @@ namespace desk_atlas {
           }
         }
         to_place = order;
+        for (auto &[hwnd, item] : items_) item.loose = loose.contains(hwnd);
         if (!packed) {
           // Not even then: what fits, pieces where they fit
           taken.clear();
           for (HWND hwnd : order) {
             auto &item = items_[hwnd];
-            if (!place_item(hwnd, item, scales[hwnd], false)) {
+            if (!place_item(hwnd, item, scales[hwnd], 1)) {
               item.cell = {};
               item.white_cell = {};
               for (auto &p : item.pieces) p.cell = {};
@@ -548,7 +610,9 @@ namespace desk_atlas {
         s.ay = item.white_cell.y;
       }
       for (const auto &p : item.pieces) {
-        if (p.thumb && p.cell.cw > 0) s.pieces.push_back({p.part.left, p.part.top, p.part.right - p.part.left, p.part.bottom - p.part.top, p.cell.x, p.cell.y});
+        if (!p.thumb || p.cell.cw <= 0) continue;
+        const RECT part = margined(p.part, item);
+        s.pieces.push_back({p.part.left, p.part.top, p.part.right - p.part.left, p.part.bottom - p.part.top, p.cell.x + (p.part.left - part.left), p.cell.y + (p.part.top - part.top)});
       }
       out.push_back(s);
     }

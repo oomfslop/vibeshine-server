@@ -4208,6 +4208,7 @@ namespace nvhttp {
       {"etag", std::to_string(layout.etag)},
       {"ts", taken},
       {"cursor", layout.cursor},
+      {"atlas_us", layout.atlas_us},
     };
     for (const auto &w : layout.windows) {
       char handle[32], owner[32];

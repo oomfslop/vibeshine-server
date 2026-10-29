@@ -1340,12 +1340,12 @@ namespace app_desk {
       };
       // The parts of a window the user sees, in its frame: 32 px cells, each
       // shown unless one window above covers it whole or it is off the desk,
-      // grown by two cells (a window moved or uncovered on the client has
+      // grown by a cell (a window moved or uncovered on the client has
       // real pixels there before the host catches up), as at most eight
       // rectangles. The atlas keeps these 1:1 when the window goes smaller.
       auto visible_parts = [&](std::size_t i) {
         const auto &w = out.windows[i];
-        constexpr int cell = 32, grow = 2, most = 8;
+        constexpr int cell = 32, grow = 1, most = 8;
         const int cols = (w.rect[2] + cell - 1) / cell, rows = (w.rect[3] + cell - 1) / cell;
         const int dw = desk.right - desk.left, dh = desk.bottom - desk.top;
         std::vector<char> shown(static_cast<std::size_t>(cols) * rows, 0), grown(shown.size(), 0);
@@ -1440,7 +1440,10 @@ namespace app_desk {
         const int priority = static_cast<int>(area + (w.kind == "popup" ? INT_MAX / 2 : focused ? INT_MAX / 4 : 0));
         sources.push_back({reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)), w.rect[2], w.rect[3], w.kind == "popup", priority, w.kind == "popup" ? std::vector<RECT> {} : visible_parts(i)});
       }
-      for (const auto &slot : atlas->sync(sources)) {
+      const auto sync_start = std::chrono::steady_clock::now();
+      const auto slots = atlas->sync(sources);
+      out.atlas_us = static_cast<int>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - sync_start).count());
+      for (const auto &slot : slots) {
         for (auto &w : out.windows) {
           if (w.handle != reinterpret_cast<std::uintptr_t>(slot.hwnd)) continue;
           w.slot[0] = slot.x;
