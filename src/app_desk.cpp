@@ -311,20 +311,27 @@ namespace app_desk {
     private:
       static constexpr UINT callback_message = WM_APP + 1;
 
-      static void place(HWND bar, UINT edge, const RECT &desk, int extent) {
+      /** Our two bars meet in the bottom right corner: the bottom one ends
+       *  where the right one begins (left overlapping, the shell moves the
+       *  bottom bar up by the right one's width instead). The shell's
+       *  suggestion is asked for, as app bars must, but our rectangles are
+       *  exact: nothing else lives on the desk's edges. */
+      static void place(HWND bar, UINT edge, const RECT &desk, int extent, int right) {
         APPBARDATA abd {sizeof(abd)};
         abd.hWnd = bar;
         abd.uEdge = edge;
-        abd.rc = desk;
-        if (edge == ABE_RIGHT) abd.rc.left = desk.right - extent;
-        else abd.rc.top = desk.bottom - extent;
+        RECT want = desk;
+        if (edge == ABE_RIGHT) {
+          want.left = desk.right - extent;
+        } else {
+          want.top = desk.bottom - extent;
+          want.right = desk.right - right;
+        }
+        abd.rc = want;
         SHAppBarMessage(ABM_QUERYPOS, &abd);
-        // The shell may have moved the inner edge for another bar: keep our extent
-        if (edge == ABE_RIGHT) abd.rc.left = abd.rc.right - extent;
-        else abd.rc.top = abd.rc.bottom - extent;
+        abd.rc = want;
         SHAppBarMessage(ABM_SETPOS, &abd);
-        SetWindowPos(bar, nullptr, abd.rc.left, abd.rc.top, abd.rc.right - abd.rc.left, abd.rc.bottom - abd.rc.top,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(bar, nullptr, want.left, want.top, want.right - want.left, want.bottom - want.top, SWP_NOZORDER | SWP_NOACTIVATE);
       }
 
       void run(const RECT &desk, int right, int bottom) {
@@ -353,18 +360,27 @@ namespace app_desk {
             DestroyWindow(bar);
             continue;
           }
-          place(bar, edge, desk, extent);
+          place(bar, edge, desk, extent, right);
           bars.push_back({bar, {edge, extent}});
         }
-        BOOST_LOG(info) << "Desk: reserved " << right << " px right and " << bottom << " px bottom of the desk's work area (" << bars.size() << " bars)";
+        BOOST_LOG(info) << "Desk: reserving " << right << " px right and " << bottom << " px bottom of the desk's work area (" << bars.size() << " bars)";
+        SetTimer(nullptr, 0, 1000, nullptr);  // the shell applies it in a moment: report what it became
         {
           std::lock_guard lock(mutex_);
           started_ = true;
         }
         ready_.notify_all();
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+          if (msg.message == WM_TIMER && !msg.hwnd) {
+            KillTimer(nullptr, msg.wParam);
+            MONITORINFO mi {sizeof(mi)};
+            GetMonitorInfoW(MonitorFromRect(&desk, MONITOR_DEFAULTTONEAREST), &mi);
+            BOOST_LOG(info) << "Desk: work area " << mi.rcWork.left << ',' << mi.rcWork.top << ' ' << mi.rcWork.right - mi.rcWork.left << 'x'
+                            << mi.rcWork.bottom - mi.rcWork.top << " of " << desk.right - desk.left << 'x' << desk.bottom - desk.top;
+            continue;
+          }
           if (msg.message == callback_message && msg.wParam == ABN_POSCHANGED) {
-            for (auto &[bar, spec] : bars) place(bar, spec.first, desk, spec.second);
+            for (auto &[bar, spec] : bars) place(bar, spec.first, desk, spec.second, right);
           }
           TranslateMessage(&msg);
           DispatchMessageW(&msg);
