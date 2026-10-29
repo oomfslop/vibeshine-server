@@ -713,11 +713,16 @@ namespace app_desk {
      *  cursors are drawn as arrows): the client shows the Mac's equivalent. */
     std::string cursor_shape() {
       // The pointer belongs to the interactive desktop: this request thread
-      // has to be on it to see the real cursor
+      // has to be on it to see the real cursor, and back on its own after
+      // (with a UAC prompt up the interactive desktop is the secure one, and
+      // the windows are on ours)
+      const HDESK own = GetThreadDesktop(GetCurrentThreadId());
       platf::syncThreadDesktop();
       CURSORINFO ci {};
       ci.cbSize = sizeof(ci);
-      if (!GetCursorInfo(&ci) || !ci.hCursor) return "arrow";
+      const bool got = GetCursorInfo(&ci) && ci.hCursor;
+      if (own) SetThreadDesktop(own);
+      if (!got) return "arrow";
       static const struct {
         WORD id;
         const char *name;
@@ -887,6 +892,7 @@ namespace app_desk {
 
   namespace {
     std::map<std::string, std::pair<int, unsigned>> g_sessions;  ///< client -> (live desk streams, generation)
+    std::atomic<int> g_shift_x {0}, g_shift_y {0};  ///< see pointer_shift()
   }
 
   void session_started(const std::string &client_uuid) {
@@ -918,6 +924,8 @@ namespace app_desk {
   }
 
   void close(const std::string &client_uuid) {
+    g_shift_x = 0;
+    g_shift_y = 0;
     std::lock_guard lock(g_mutex);
     auto it = g_desks.find(client_uuid);
     if (it == g_desks.end()) return;
@@ -1149,12 +1157,19 @@ namespace app_desk {
       std::vector<std::pair<HWND, POINT>> to_adopt;
       for (const auto &[hwnd, pid] : ctx.windows) {
         now_seen.insert(hwnd);
-        if (first || seen.contains(hwnd) || !pids.contains(pid)) continue;
+        // An elevation prompt (UAC not on the secure desktop) is the client's
+        // business wherever it opens: it comes over, in the middle
+        const bool prompt = _stricmp(process_name(pid).c_str(), "consent.exe") == 0;
+        if (seen.contains(hwnd) || (!prompt && (first || !pids.contains(pid)))) continue;
         RECT r {}, x {};
         if (!app_window_layout::frame_rect(hwnd, r) || IntersectRect(&x, &r, &desk)) continue;
+        const LONG w = r.right - r.left, h = r.bottom - r.top;
+        if (prompt) {
+          to_adopt.push_back({hwnd, {std::max<LONG>(0, (work.right - work.left - w) / 2) + work.left - desk.left, std::max<LONG>(0, (work.bottom - work.top - h) / 2) + work.top - desk.top}});
+          continue;
+        }
         auto base = front_of.find(pid);
         if (base == front_of.end()) continue;
-        const LONG w = r.right - r.left, h = r.bottom - r.top;
         LONG px = base->second.left + 48, py = base->second.top + 48;
         px = std::clamp<LONG>(px, work.left, std::max<LONG>(work.left, work.right - w));
         py = std::clamp<LONG>(py, work.top, std::max<LONG>(work.top, work.bottom - h));
@@ -1173,6 +1188,75 @@ namespace app_desk {
       }
     }
   }  // namespace
+
+  namespace {
+    struct secure_prompt_t {
+      HWND hwnd = nullptr;
+      RECT rect {};  ///< where it is (screen)
+    };
+
+    /** The prompt on the secure desktop while that is where input goes
+     *  (UAC): moved to `to` (screen), where the session's capture sees it. */
+    std::optional<secure_prompt_t> secure_prompt(POINT to) {
+      HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_ENUMERATE | DESKTOP_WRITEOBJECTS | GENERIC_READ | GENERIC_WRITE);
+      if (!input) return std::nullopt;
+      wchar_t name[64] {};
+      DWORD needed = 0;
+      GetUserObjectInformationW(input, UOI_NAME, name, sizeof(name), &needed);
+      if (_wcsicmp(name, L"Default") == 0) {
+        CloseDesktop(input);
+        return std::nullopt;
+      }
+      std::optional<secure_prompt_t> found;
+      // A thread of its own: only a thread without windows can join the
+      // secure desktop
+      std::thread([&] {
+        if (!SetThreadDesktop(input)) return;
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        struct ctx_t {
+          HWND best = nullptr;
+          long long area = 0;
+        } ctx;
+        // The largest visible window that is not a backdrop covering its display
+        EnumDesktopWindows(
+          input,
+          [](HWND hwnd, LPARAM lp) -> BOOL {
+            if (!IsWindowVisible(hwnd)) return TRUE;
+            RECT r {};
+            if (!GetWindowRect(hwnd, &r)) return TRUE;
+            MONITORINFO mi {};
+            mi.cbSize = sizeof(mi);
+            if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return TRUE;
+            const long long w = r.right - r.left, h = r.bottom - r.top;
+            if (w <= 0 || h <= 0 || (w >= (mi.rcMonitor.right - mi.rcMonitor.left) * 9 / 10 && h >= (mi.rcMonitor.bottom - mi.rcMonitor.top) * 9 / 10)) return TRUE;
+            auto *c = reinterpret_cast<ctx_t *>(lp);
+            if (w * h > c->area) {
+              c->best = hwnd;
+              c->area = w * h;
+            }
+            return TRUE;
+          },
+          reinterpret_cast<LPARAM>(&ctx)
+        );
+        if (!ctx.best) return;
+        RECT r {};
+        if (FAILED(DwmGetWindowAttribute(ctx.best, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)))) GetWindowRect(ctx.best, &r);
+        if (r.left != to.x || r.top != to.y) {
+          RECT win {};
+          GetWindowRect(ctx.best, &win);
+          SetWindowPos(ctx.best, HWND_TOPMOST, to.x - (r.left - win.left), to.y - (r.top - win.top), 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+          if (FAILED(DwmGetWindowAttribute(ctx.best, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)))) GetWindowRect(ctx.best, &r);
+        }
+        found = secure_prompt_t {ctx.best, r};
+      }).join();
+      CloseDesktop(input);
+      return found;
+    }
+  }  // namespace
+
+  std::pair<int, int> pointer_shift() {
+    return {g_shift_x.load(), g_shift_y.load()};
+  }
 
   layout_t layout(const std::string &client_uuid) {
     adopt_new_windows(client_uuid);
@@ -1424,6 +1508,57 @@ namespace app_desk {
         }
       }
     }
+    // A UAC prompt: the secure desktop is what the displays show now, our
+    // atlas included. The prompt is brought onto the atlas display and shown
+    // as a dialog in the middle of the client's screen; the pointer goes to
+    // it there; the other windows keep their last picture meanwhile.
+    {
+      static std::chrono::steady_clock::time_point checked {};
+      static std::optional<secure_prompt_t> prompt;
+      MONITORINFO ami {};
+      ami.cbSize = sizeof(ami);
+      if (atlas_monitor && GetMonitorInfoW(atlas_monitor, &ami)) {
+        if (std::chrono::steady_clock::now() - checked > std::chrono::milliseconds(100)) {
+          checked = std::chrono::steady_clock::now();
+          prompt = secure_prompt({ami.rcMonitor.left + 16, ami.rcMonitor.top + 16});
+        }
+      } else {
+        prompt.reset();
+      }
+      if (prompt) {
+        const int w = prompt->rect.right - prompt->rect.left, h = prompt->rect.bottom - prompt->rect.top;
+        const int dw = desk.right - desk.left, dh = desk.bottom - desk.top;
+        for (auto &win : out.windows) {
+          win.slot[2] = win.slot[3] = 0;
+          win.alpha_slot[0] = win.alpha_slot[1] = -1;
+          win.pieces.clear();
+          win.focused = false;
+        }
+        window_t d;
+        d.handle = reinterpret_cast<std::uintptr_t>(prompt->hwnd);
+        d.kind = "dialog";
+        d.title = "User Account Control";
+        d.process = "consent.exe";
+        d.rect[0] = std::max(0, (dw - w) / 2);
+        d.rect[1] = std::max(0, (dh - h) / 2);
+        d.rect[2] = w;
+        d.rect[3] = h;
+        d.state = "normal";
+        d.focused = true;
+        d.radius = 8;
+        d.slot[0] = prompt->rect.left - ami.rcMonitor.left;
+        d.slot[1] = prompt->rect.top - ami.rcMonitor.top;
+        d.slot[2] = w;
+        d.slot[3] = h;
+        d.z = static_cast<int>(out.windows.size());
+        out.windows.push_back(std::move(d));
+        g_shift_x = prompt->rect.left - (desk.left + std::max(0, (dw - w) / 2));
+        g_shift_y = prompt->rect.top - (desk.top + std::max(0, (dh - h) / 2));
+      } else {
+        g_shift_x = 0;
+        g_shift_y = 0;
+      }
+    }
     // FNV-1a over what the client reacts to
     std::uint64_t h = 1469598103934665603ull;
     auto mix = [&h](std::uint64_t v) {
@@ -1472,6 +1607,10 @@ namespace app_desk {
 
   std::optional<std::pair<int, int>> input_origin(const std::string &) {
     return std::nullopt;
+  }
+
+  std::pair<int, int> pointer_shift() {
+    return {0, 0};
   }
 
   bool park(const std::string &, std::uint64_t) {

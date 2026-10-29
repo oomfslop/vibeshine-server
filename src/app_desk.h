@@ -38,6 +38,9 @@ namespace app_desk {
    *  desk's origin relative to the virtual desktop's (the session captures
    *  the atlas, of the same size). */
   std::optional<std::pair<int, int>> input_origin(const std::string &client_uuid);
+  /** Added to where absolute pointer input goes while a secure-desktop prompt
+   *  (UAC) is up: it is shown where the client draws it, but is elsewhere. */
+  std::pair<int, int> pointer_shift();
   /** Put every adopted window back and let the display go idle (it is removed
    *  after ten minutes without a desk). */
   void close(const std::string &client_uuid);

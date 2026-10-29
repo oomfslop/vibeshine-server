@@ -21,6 +21,7 @@ extern "C" {
 #include <boost/endian/buffers.hpp>
 
 // local includes
+#include "app_desk.h"
 #include "config.h"
 #include "globals.h"
 #include "video.h"
@@ -135,7 +136,9 @@ namespace input {
     }
 
     void move_absolute(const mouse_input::viewport_t &viewport, mouse_input::absolute_position_t position) override {
-      const platf::touch_port_t port {viewport.offset_x, viewport.offset_y, viewport.width, viewport.height};
+      // A desk's secure-desktop prompt is drawn elsewhere than it is
+      const auto [shift_x, shift_y] = app_desk::pointer_shift();
+      const platf::touch_port_t port {viewport.offset_x + shift_x, viewport.offset_y + shift_y, viewport.width, viewport.height};
       platf::abs_mouse(_input, port, position.x, position.y);
     }
 
