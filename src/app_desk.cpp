@@ -215,14 +215,21 @@ namespace app_desk {
       return best;
     }
 
-    void move_frame_to(HWND hwnd, int x, int y) {
+    /** Put the window's frame (DWM bounds, without the invisible resize
+     *  borders) at x, y and, with w and h, give it that size in the same
+     *  step: a resize from the left or top never shows the window shifted. */
+    void move_frame_to(HWND hwnd, int x, int y, int w = 0, int h = 0) {
       RECT frame {}, win {};
-      int dx = 0, dy = 0;
+      int dx = 0, dy = 0, dw = 0, dh = 0;
       if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) && GetWindowRect(hwnd, &win)) {
         dx = frame.left - win.left;
         dy = frame.top - win.top;
+        dw = (win.right - win.left) - (frame.right - frame.left);
+        dh = (win.bottom - win.top) - (frame.bottom - frame.top);
       }
-      SetWindowPos(hwnd, nullptr, x - dx, y - dy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+      const bool sized = w > 0 && h > 0;
+      SetWindowPos(hwnd, nullptr, x - dx, y - dy, sized ? w + dw : 0, sized ? h + dh : 0,
+                   (sized ? 0 : SWP_NOSIZE) | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
     }
 
     /** A window that crosses to a display of another DPI gets WM_DPICHANGED
@@ -576,7 +583,7 @@ namespace app_desk {
     constexpr const wchar_t *tweaks_backup_key = L"Software\\Vibeshine\\DeskTweaks";
     constexpr const wchar_t *explorer_advanced_key = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
     constexpr const wchar_t *snap_values[] = {L"EnableSnapAssistFlyout", L"EnableSnapBar", L"SnapAssist"};
-    bool g_tweaked = false;
+    std::atomic<bool> g_tweaked {false};
 
     /** Runs `fn` with the logged-in user's HKCU open (we run as SYSTEM). */
     void with_user_hive(const std::function<void(HKEY)> &fn) {
@@ -610,7 +617,28 @@ namespace app_desk {
       SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"TraySettings"), SMTO_ABORTIFHUNG, 500, &result);
     }
 
+    std::mutex g_tweak_mutex;  ///< apply/restore run one at a time, off the caller's thread
+
+    void apply_host_tweaks_now();
+    void restore_host_tweaks_now();
+
+    // The settings broadcast takes seconds when some window is slow to
+    // answer: never on the request that opens or closes a desk
     void apply_host_tweaks() {
+      std::thread([] {
+        std::lock_guard lock(g_tweak_mutex);
+        apply_host_tweaks_now();
+      }).detach();
+    }
+
+    void restore_host_tweaks() {
+      std::thread([] {
+        std::lock_guard lock(g_tweak_mutex);
+        restore_host_tweaks_now();
+      }).detach();
+    }
+
+    void apply_host_tweaks_now() {
       if (g_tweaked) return;
       g_tweaked = true;
       BOOL arranging = TRUE;
@@ -635,7 +663,7 @@ namespace app_desk {
       BOOST_LOG(info) << "Desk: window snapping off on the host while streaming windows (spi " << (ok ? "ok" : "failed") << ", was " << arranging << ')';
     }
 
-    void restore_host_tweaks() {
+    void restore_host_tweaks_now() {
       if (!g_tweaked) return;
       g_tweaked = false;
       DWORD arranging = 1;
@@ -654,6 +682,26 @@ namespace app_desk {
       SystemParametersInfoW(SPI_SETWINARRANGING, arranging ? TRUE : FALSE, nullptr, SPIF_SENDCHANGE);
       announce_settings();
       BOOST_LOG(info) << "Desk: window snapping restored on the host";
+    }
+
+    /** The host pointer's shape, by the system cursor it is (apps' own
+     *  cursors are drawn as arrows): the client shows the Mac's equivalent. */
+    std::string cursor_shape() {
+      CURSORINFO ci {};
+      ci.cbSize = sizeof(ci);
+      if (!GetCursorInfo(&ci) || !ci.hCursor) return "arrow";
+      static const struct {
+        LPCWSTR id;
+        const char *name;
+      } table[] = {
+        {IDC_ARROW, "arrow"}, {IDC_IBEAM, "ibeam"}, {IDC_HAND, "hand"}, {IDC_SIZEWE, "we"}, {IDC_SIZENS, "ns"},
+        {IDC_SIZENWSE, "nwse"}, {IDC_SIZENESW, "nesw"}, {IDC_SIZEALL, "all"}, {IDC_CROSS, "cross"}, {IDC_NO, "no"},
+        {IDC_WAIT, "wait"}, {IDC_APPSTARTING, "progress"}, {IDC_HELP, "help"}, {IDC_UPARROW, "uparrow"},
+      };
+      for (const auto &c : table) {
+        if (ci.hCursor == LoadCursorW(nullptr, c.id)) return c.name;
+      }
+      return "arrow";
     }
 
     /** Remove a desk's display once it has been idle long enough (detached thread). */
@@ -851,7 +899,7 @@ namespace app_desk {
     return !g_desks.empty();
   }
 
-  bool adopt(const std::string &client_uuid, std::uint64_t handle, int x, int y) {
+  bool adopt(const std::string &client_uuid, std::uint64_t handle, int x, int y, int w, int h) {
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
     if (!IsWindow(hwnd)) return false;
     std::lock_guard lock(g_mutex);
@@ -866,12 +914,12 @@ namespace app_desk {
       // sliver stays on it so it remains the window's display.
       RECT frame {};
       if (app_window_layout::frame_rect(hwnd, frame)) {
-        const LONG w = frame.right - frame.left;
+        const LONG fw = w > 0 ? w : frame.right - frame.left;
         const LONG dw = rect.right - rect.left, dh = rect.bottom - rect.top;
-        x = static_cast<int>(std::clamp<LONG>(x, -(w - 8), std::max<LONG>(-(w - 8), dw - 8)));
+        x = static_cast<int>(std::clamp<LONG>(x, -(fw - 8), std::max<LONG>(-(fw - 8), dw - 8)));
         y = static_cast<int>(std::clamp<LONG>(y, 0, std::max<LONG>(0, dh - 8)));
       }
-      move_frame_to(hwnd, rect.left + x, rect.top + y);
+      move_frame_to(hwnd, rect.left + x, rect.top + y, w, h);
       return true;
     }
     if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
@@ -1150,6 +1198,8 @@ namespace app_desk {
       for (unsigned char c : w.title) mix(c);
       for (unsigned char c : w.kind) mix(c);
     }
+    out.cursor = cursor_shape();
+    for (unsigned char c : out.cursor) mix(c);
     out.etag = h ? h : 1;
     return out;
   }
@@ -1185,7 +1235,7 @@ namespace app_desk {
     return false;
   }
 
-  bool adopt(const std::string &, std::uint64_t, int, int) {
+  bool adopt(const std::string &, std::uint64_t, int, int, int, int) {
     return false;
   }
 

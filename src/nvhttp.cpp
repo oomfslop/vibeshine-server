@@ -4085,7 +4085,7 @@ namespace nvhttp {
     if (handle && (op_name == "adopt" || op_name == "release" || op_name == "park")) {
       // Desk ops: move the window onto / off the client's desk.
       const auto uuid = resolve_client_identity_from_request(request).uuid;
-      const bool ok = op_name == "adopt"   ? app_desk::adopt(uuid, handle, num("x"), num("y")) :
+      const bool ok = op_name == "adopt"   ? app_desk::adopt(uuid, handle, num("x"), num("y"), num("w"), num("h")) :
                       op_name == "release" ? app_desk::release(uuid, handle) :
                                              app_desk::park(uuid, handle);
       write_json(response, {{"status", ok}}, ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_not_found);
@@ -4206,6 +4206,7 @@ namespace nvhttp {
       {"windows", nlohmann::json::array()},
       {"etag", std::to_string(layout.etag)},
       {"ts", taken},
+      {"cursor", layout.cursor},
     };
     for (const auto &w : layout.windows) {
       char handle[32], owner[32];

@@ -46,7 +46,7 @@ namespace app_desk {
 
   /** Move a host window onto the desk at desk-relative (x, y); its original
    *  place is remembered and restored by release/close. */
-  bool adopt(const std::string &client_uuid, std::uint64_t hwnd, int x, int y);
+  bool adopt(const std::string &client_uuid, std::uint64_t hwnd, int x, int y, int w = 0, int h = 0);
   bool release(const std::string &client_uuid, std::uint64_t hwnd);
   /** Out of the way while the client drags it: just past the desk's right
    *  edge, beyond what any client window shows. Adopt puts it back. */
@@ -76,6 +76,7 @@ namespace app_desk {
   struct layout_t {
     bool valid = false;
     std::vector<window_t> windows;  ///< bottom-most first
+    std::string cursor = "arrow";  ///< the host pointer's shape: arrow, ibeam, hand, we, ns, nwse, nesw, all, cross, no, wait, progress, help, uparrow
     std::uint64_t etag = 0;
   };
   /** Everything visible on the desk right now. Caption-less popups that lie
