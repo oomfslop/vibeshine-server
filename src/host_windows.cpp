@@ -360,7 +360,7 @@ namespace host_windows {
         if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
         // No AttachThreadInput here: it blocks for as long as the foreground
         // window's thread is busy (a drag in progress) and this runs on a
-        // request worker. SwitchToThisWindow is the fallback the shell uses.
+        // request worker. SwitchToThisWindow is the shell's last resort.
         // A window disabled by its modal dialog cannot take focus; activating
         // it would only shuffle the z-order and leave the dialog behind it.
         // Activate the enabled popup of the chain instead (what Windows does
@@ -374,18 +374,20 @@ namespace host_windows {
         BringWindowToTop(focus);
         if (!ok || GetForegroundWindow() != focus) {
           // The foreground lock: only the process with the last input may
-          // set the foreground. A synthetic Alt tap makes that us (the
-          // standard workaround; Alt alone does nothing once focus moves).
-          INPUT alt[2] {};
-          alt[0].type = alt[1].type = INPUT_KEYBOARD;
-          alt[0].ki.wVk = alt[1].ki.wVk = VK_MENU;
-          alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
-          SendInput(2, alt, sizeof(INPUT));
+          // set the foreground. A synthetic tap of an unassigned key makes
+          // that us. (Not Alt: it puts the focused app in menu mode and
+          // can bring up the Alt-Tab peek, which draws the other windows
+          // as glass outlines.)
+          INPUT tap[2] {};
+          tap[0].type = tap[1].type = INPUT_KEYBOARD;
+          tap[0].ki.wVk = tap[1].ki.wVk = 0xE8;  // unassigned
+          tap[1].ki.dwFlags = KEYEVENTF_KEYUP;
+          SendInput(2, tap, sizeof(INPUT));
           ok = SetForegroundWindow(focus) != 0;
           BringWindowToTop(focus);
         }
         if (!ok || GetForegroundWindow() != focus) {
-          SwitchToThisWindow(focus, TRUE);
+          SwitchToThisWindow(focus, FALSE);  // TRUE plays the Alt-Tab switch (peek)
           ok = GetForegroundWindow() == focus;
         }
         if (!ok) {
