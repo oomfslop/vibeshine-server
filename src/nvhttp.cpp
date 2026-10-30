@@ -4139,7 +4139,10 @@ namespace nvhttp {
       }
     };
     if (op == "open") {
-      const auto desk = app_desk::open(uuid, num("w", 0), num("h", 0), num("fps", 60), num("dpi", 96));
+      app_desk::options_t options;
+      options.unfocused_divisor = num("unfocused", 1);
+      options.skip_covered = num("covered", 0) == 0;
+      const auto desk = app_desk::open(uuid, num("w", 0), num("h", 0), num("fps", 60), num("dpi", 96), options);
       if (!desk.valid) {
         write_json(response, {{"status", false}, {"error", "the desk display could not be created"}}, SimpleWeb::StatusCode::server_error_service_unavailable);
         return;
@@ -4230,6 +4233,11 @@ namespace nvhttp {
       {"cursor", layout.cursor},
       {"atlas_us", layout.atlas_us},
       {"seq", layout.seq},
+      {"pointer_lock", layout.pointer_lock ? [&] {
+         char handle[32];
+         snprintf(handle, sizeof(handle), "0x%llx", static_cast<unsigned long long>(layout.pointer_lock));
+         return std::string(handle);
+       }() : std::string()},
       {"hard_repacks", layout.hard_repacks},
       {"ghosts", layout.ghosts},
     };
@@ -4255,6 +4263,7 @@ namespace nvhttp {
         {"alpha_slot", {w.alpha_slot[0], w.alpha_slot[1]}},
         {"alpha_scale", w.alpha_scale},
         {"alpha_strips", w.alpha_strips},
+        {"stable", w.stable},
         {"scale", w.scale},
         {"pieces", w.pieces},
       });

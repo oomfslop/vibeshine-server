@@ -15,6 +15,7 @@
 
 // local includes
 #include "src/config.h"
+#include "desk_hold.h"
 #include "ipc/ipc_session.h"
 #include "ipc/misc_utils.h"
 #include "src/logging.h"
@@ -397,6 +398,9 @@ namespace platf::dxgi {
     // helper is free to publish the next frame as soon as we drop this mutex.
     _ipc_session->release();
     _frame_locked = false;
+
+    // (after the shared IPC mutex is released) Desk atlas: unfocused windows' regions at a lower frame rate
+    desk_hold::apply(device.get(), device_ctx.get(), d3d_img->capture_texture.get(), offset_x + GetSystemMetrics(SM_XVIRTUALSCREEN), offset_y + GetSystemMetrics(SM_YVIRTUALSCREEN), width, height, client_frame_rate);
 
     // The composition time; the send path refines it for RTP once the game's
     // present events have been delivered.

@@ -51,6 +51,7 @@ namespace desk_atlas {
     int priority = 0;  ///< higher keeps full size first when the atlas is full
     std::vector<RECT> visible;  ///< the parts the user sees (frame coordinates), sharp even when the rest goes smaller
     bool settled = true;  ///< a popup done with its opening animation (its inside is opaque by now)
+    int divisor = 1;  ///< drawn at 1/n of the frame rate (windows in the background)
   };
 
   struct piece_t {
@@ -84,7 +85,7 @@ namespace desk_atlas {
      *  kept while a window fits its slot. Changes take effect with the next
      *  composition; `moved` tells whether a picture changed place while its
      *  old place stays drawn for a while. */
-    std::vector<slot_t> sync(const std::vector<source_t> &sources, bool *moved = nullptr);
+    std::vector<slot_t> sync(const std::vector<source_t> &sources, bool *moved = nullptr, unsigned *seq = nullptr);
 
     const RECT &monitor() const {
       return monitor_;
@@ -130,6 +131,7 @@ namespace desk_atlas {
       cell_t cell;
       bool has_white = false;
       bool settled = true;
+      int divisor = 1;
       std::vector<std::pair<RECT, cell_t>> wplan;  ///< where the parts of its copy on white are to go
       std::vector<wpart_t> wparts;  ///< where they are
       int w = 0, h = 0;

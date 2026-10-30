@@ -25,6 +25,7 @@ extern "C" {
 // lib includes
 #include "display.h"
 #include "display_vram.h"
+#include "desk_hold.h"
 #include "misc.h"
 #ifdef SUNSHINE_ENABLE_NV_TRUEHDR
   #include "game_activity.h"
@@ -2721,6 +2722,8 @@ namespace platf::dxgi {
           }
 
           device_ctx->CopyResource(d3d_img->capture_texture.get(), src.get());
+          // Desk atlas: unfocused windows' regions at a lower frame rate
+          desk_hold::apply(device.get(), device_ctx.get(), d3d_img->capture_texture.get(), offset_x + GetSystemMetrics(SM_XVIRTUALSCREEN), offset_y + GetSystemMetrics(SM_YVIRTUALSCREEN), width, height, client_frame_rate);
           last_frame_variant = img;
           break;
         }

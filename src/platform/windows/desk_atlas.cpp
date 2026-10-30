@@ -4,6 +4,8 @@
  */
 #include "desk_atlas.h"
 
+#include "desk_hold.h"
+
 #include <dwmapi.h>
 
 #include <algorithm>
@@ -19,6 +21,8 @@ namespace desk_atlas {
     constexpr UINT sync_message = WM_APP + 7;
     constexpr UINT_PTR topmost_timer = 1;
     constexpr UINT_PTR refresh_timer = 2;
+    constexpr UINT_PTR hold_timer = 3;  ///< a frame for regions held at a lower rate
+    constexpr UINT hold_message = WM_APP + 8;
 
     /** Rows at the bottom no picture uses. They carry the frame's layout
      *  number: 16 blocks of 16 px, black or white, a 12-bit sequence and a
@@ -34,18 +38,16 @@ namespace desk_atlas {
       seq &= 0xfff;
       int bits = 0;
       for (int i = 0; i < 12; ++i) bits += (seq >> i) & 1;
-      return static_cast<std::uint16_t>(seq | ((bits & 0xf) << 12));
+      // The check is the inverted bit count: blank (all black) never checks
+      return static_cast<std::uint16_t>(seq | ((~bits & 0xf) << 12));
     }
 
     struct sync_request_t {
       const std::vector<source_t> *sources;
       std::vector<slot_t> *slots;
       bool *moved;
+      unsigned seq = 0;  ///< the layout number of these slots
     };
-
-    /** How long a thumbnail stays where a picture was: longer than a layout
-     *  takes to reach the client and its frames to be drawn */
-    constexpr auto ghost_time = std::chrono::milliseconds(150);
 
     /** Capacity for a window: a little room to grow in a live resize before
      *  it needs another slot (a step that outgrows its slot moves it). */
@@ -90,11 +92,12 @@ namespace desk_atlas {
   }
 
   atlas_t::~atlas_t() {
+    desk_hold::clear();
     if (window_) PostMessageW(window_, WM_CLOSE, 0, 0);
     if (thread_.joinable()) thread_.join();
   }
 
-  std::vector<slot_t> atlas_t::sync(const std::vector<source_t> &sources, bool *moved) {
+  std::vector<slot_t> atlas_t::sync(const std::vector<source_t> &sources, bool *moved, unsigned *seq) {
     std::vector<slot_t> slots;
     bool changed = false;
     if (moved) *moved = false;
@@ -103,6 +106,7 @@ namespace desk_atlas {
     // The window's thread does the work: thumbnails and the backings it
     // paints change together, in the order the next composition shows them
     SendMessageW(window_, sync_message, 0, reinterpret_cast<LPARAM>(&request));
+    if (seq) *seq = request.seq;
     return slots;
   }
 
@@ -116,6 +120,7 @@ namespace desk_atlas {
         if (self) {
           auto *request = reinterpret_cast<sync_request_t *>(lparam);
           *request->slots = self->apply(*request->sources, *request->moved);
+          request->seq = self->seq_;
         }
         return 0;
       case WM_PAINT: {
@@ -128,8 +133,8 @@ namespace desk_atlas {
       case WM_ERASEBKGND:
         return 1;
       case WM_TIMER:
-        if (wparam == refresh_timer) {
-          KillTimer(hwnd, refresh_timer);
+        if (wparam == refresh_timer || wparam == hold_timer) {
+          KillTimer(hwnd, wparam);
           if (self) {
             self->tick_ = !self->tick_;
             RECT client {};
@@ -144,6 +149,10 @@ namespace desk_atlas {
           // Nothing may cover the atlas: its display is the picture
           SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         }
+        return 0;
+      case hold_message:
+        // Capture thread: regions held back are due in wparam ms
+        SetTimer(hwnd, hold_timer, static_cast<UINT>(wparam), nullptr);
         return 0;
       case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
@@ -240,8 +249,11 @@ namespace desk_atlas {
     item.pieces.clear();
   }
 
-  void atlas_t::retire(HTHUMBNAIL thumb, const cell_t &cell, bool white, HWND hwnd, int ox, int oy) {
-    if (thumb) retired_.push_back({thumb, cell, white, std::chrono::steady_clock::now() + ghost_time, hwnd, ox, oy});
+  /** A thumbnail no picture uses any more: gone at once. Every frame carries
+   *  the number of its layout, and frames composed while thumbnails change
+   *  carry none, so no frame is ever drawn with cells it does not have. */
+  void atlas_t::retire(HTHUMBNAIL thumb, const cell_t &, bool, HWND, int, int) {
+    if (thumb) DwmUnregisterThumbnail(thumb);
   }
 
   /** The cells drawing this window 1:1 with its frame's origin at (ox, oy):
@@ -566,6 +578,7 @@ namespace desk_atlas {
       const bool moved_origin = offset.left != item.source_offset.left || offset.top != item.source_offset.top;
       item.source_offset = offset;
       item.settled = s.settled;
+      item.divisor = s.divisor;
       const bool fits = item.black && item.cell.cw > 0 && item.cell.cw >= static_cast<int>(std::ceil(s.w * item.scale)) &&
                         item.cell.ch >= static_cast<int>(std::ceil(s.h * item.scale)) && item.has_white == s.alpha &&
                         (!s.alpha || (item.w == s.w && item.h == s.h && item.wparts.size() == white_layout(item, item.scale).size()));
@@ -985,6 +998,25 @@ namespace desk_atlas {
       SetTimer(window_, refresh_timer, 40, nullptr);
     } else if (changing) {
       set_marker(false);
+    }
+    // (after the number changed, so a new layout's regions are taken current at once)
+    // Windows in the background at a lower frame rate: their cells
+    {
+      std::vector<desk_hold::region_t> regions;
+      std::uint64_t hsig = seq_;
+      for (const auto &[hwnd, item] : items_) {
+        hsig = (hsig ^ (static_cast<std::uint64_t>(item.w) << 20) ^ item.h) * 1099511628211ull;
+        if (item.divisor <= 1 || !item.black || item.cell.cw <= 0) continue;
+        regions.push_back({RECT {item.black_at.x, item.black_at.y, item.black_at.x + item.black_at.cw, item.black_at.y + item.black_at.ch}, item.divisor});
+        for (const auto &p : item.pieces) {
+          if (p.thumb && p.cell.cw > 0) regions.push_back({RECT {p.cell.x, p.cell.y, p.cell.x + p.cell.cw, p.cell.y + p.cell.ch}, item.divisor});
+        }
+      }
+      for (const auto &r : regions) hsig = (hsig ^ (static_cast<std::uint64_t>(r.rect.left) << 32 | static_cast<std::uint32_t>(r.rect.top)) ^ r.divisor) * 1099511628211ull;
+      HWND window = window_;
+      desk_hold::set(monitor_, hsig, std::move(regions), [window](int ms) {
+        PostMessageW(window, hold_message, static_cast<WPARAM>(ms), 0);
+      });
     }
     return out;
   }

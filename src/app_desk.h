@@ -30,9 +30,14 @@ namespace app_desk {
     int dpi = 96;
   };
 
+  struct options_t {
+    int unfocused_divisor = 1;  ///< windows other than the focused one (and its popups, dialogs) at 1/n of the frame rate: 1, 2, 4, 8
+    bool skip_covered = true;  ///< windows covered whole by others are not in the stream (the client keeps their last picture)
+  };
+
   /** Make sure the client's desk exists with this size (host px), refresh rate
    *  and DPI; creates or retunes the display. Takes a few seconds the first time. */
-  desk_t open(const std::string &client_uuid, int w, int h, int fps, int dpi);
+  desk_t open(const std::string &client_uuid, int w, int h, int fps, int dpi, const options_t &options = {});
   std::optional<desk_t> get(const std::string &client_uuid);
   /** Where absolute pointer input for this client's desk session goes: the
    *  desk's origin relative to the virtual desktop's (the session captures
@@ -83,13 +88,18 @@ namespace app_desk {
     int alpha_slot[2] {-1, -1};  ///< the same picture on white (x, y), for exact alpha; -1 = opaque
     double alpha_scale = 1.0;  ///< that copy's size relative to the picture
     std::vector<int> alpha_strips;
-    bool settled = true;  ///< done with an opening animation (popups)  ///< or as edges: width, then the atlas origin of top, bottom, left, right
+    bool settled = true;  ///< done with an opening animation (popups)
+    /** Its picture shows it fully painted at its current size (after a
+     *  resize the app needs a moment; until then the client keeps showing the
+     *  last picture that was) */
+    bool stable = true;  ///< or as edges: width, then the atlas origin of top, bottom, left, right
     double scale = 1.0;  ///< the picture's scale in the atlas (below 1 only when it is full)
     std::vector<std::array<int, 6>> pieces;  ///< with a scale below 1: the parts the user sees 1:1 (x, y, w, h in the frame; x, y in the atlas)
   };
   struct layout_t {
     bool valid = false;
     std::vector<window_t> windows;  ///< bottom-most first
+    std::uintptr_t pointer_lock = 0;  ///< the window that has confined the pointer to itself (games), or 0
     std::string cursor = "arrow";  ///< the host pointer's shape: arrow, ibeam, hand, we, ns, nwse, nesw, all, cross, no, wait, progress, help, uparrow
     std::uint64_t etag = 0;
     int atlas_us = 0;  ///< what syncing the atlas took (diagnostics)
