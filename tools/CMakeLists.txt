@@ -117,6 +117,13 @@ target_compile_options(sunshine_wgc_capture PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
 # Owns a global shortcut in the interactive user's session; the machine host
 # validates the exact child and console session before accepting its IPC.
+# What can be launched, as the signed-in user sees it (Start menu apps with
+# icons, PATH programs): run as that user by the app launcher, JSON on stdout
+add_executable(vibeshine_launchables launchables.cpp)
+target_link_libraries(vibeshine_launchables PRIVATE ole32 shell32 shlwapi windowscodecs uuid)
+target_compile_definitions(vibeshine_launchables PRIVATE _WIN32_WINNT=0x0A00 UNICODE _UNICODE)
+target_link_options(vibeshine_launchables PRIVATE -municode)
+
 add_executable(sunshine_end_stream_hotkey end_stream_hotkey.cpp)
 target_link_libraries(sunshine_end_stream_hotkey PRIVATE user32 wtsapi32)
 target_compile_definitions(sunshine_end_stream_hotkey PRIVATE _WIN32_WINNT=0x0602)

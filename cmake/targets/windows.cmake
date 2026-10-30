@@ -106,7 +106,7 @@ add_custom_command(
 add_custom_target(build_playnite_plugin DEPENDS ${SUNSHINE_PLAYNITE_PLUGIN_OUTPUT_FILES})
 add_dependencies(sunshine build_playnite_plugin)
 
-add_dependencies(sunshine sunshine_end_stream_hotkey)
+add_dependencies(sunshine sunshine_end_stream_hotkey vibeshine_launchables)
 
 # Ensure the Windows display helper is built and placed next to the Sunshine binary
 # so the runtime launcher can find it reliably.

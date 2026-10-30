@@ -38,6 +38,7 @@
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
+#include <Simple-Web-Server/crypto.hpp>
 #include <Simple-Web-Server/server_http.hpp>
 
 // local includes
@@ -92,6 +93,7 @@
 #include "process.h"
 #include "rtsp.h"
 #include "app_desk.h"
+#include "app_launcher.h"
 #include "host_windows.h"
 #include "rtsp_pending_policy.h"
 #include "stream.h"
@@ -4005,6 +4007,52 @@ namespace nvhttp {
     }
   }  // namespace
 
+  /** The app launcher: what can be launched (Start menu apps, PATH programs) */
+  void get_launchables(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    if (!windows_request_allowed(response, request, "launcher")) return;
+    const auto args = request->parse_query_string();
+    const auto list = app_launcher::list(get_arg(args, "refresh", "0") == "1");
+    nlohmann::json out = {{"status", list.ok}, {"apps", nlohmann::json::array()}, {"commands", nlohmann::json::array()}};
+    for (const auto &a : list.apps) out["apps"].push_back({{"name", a.name}, {"id", a.id}, {"icon", a.icon_key}});
+    for (const auto &c : list.commands) out["commands"].push_back({{"name", c.name}, {"path", c.path}});
+    write_json(response, out, list.ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::server_error_service_unavailable);
+  }
+
+  /** Icons of the launcher's apps, many at once (keys=k1,k2,..): {"key": "<PNG, base64>"} */
+  void get_launchable_icons(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    if (!windows_request_allowed(response, request, "launcher icons")) return;
+    const auto args = request->parse_query_string();
+    const auto keys = get_arg(args, "keys", "");
+    nlohmann::json out = nlohmann::json::object();
+    size_t start = 0;
+    while (start < keys.size()) {
+      size_t end = keys.find(',', start);
+      if (end == std::string::npos) end = keys.size();
+      const auto key = keys.substr(start, end - start);
+      start = end + 1;
+      if (const auto png = app_launcher::icon_png(key)) {
+        out[key] = SimpleWeb::Crypto::Base64::encode(*png);
+      }
+    }
+    write_json(response, out);
+  }
+
+  /** Launch an app of the list (id=) or a command line (command=) as the user */
+  void post_launch(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    if (!windows_request_allowed(response, request, "launch")) return;
+    const auto args = request->parse_query_string();
+    const auto id = get_arg(args, "id", "");
+    const auto command = get_arg(args, "command", "");
+    std::string error;
+    const bool ok = !id.empty() ? app_launcher::launch_app(id, error) : app_launcher::launch_command(command, error);
+    nlohmann::json out = {{"status", ok}};
+    if (!ok) out["error"] = error;
+    write_json(response, out, ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_bad_request);
+  }
+
   void get_host_windows(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
     if (!windows_request_allowed(response, request, "list")) return;
@@ -6950,6 +6998,15 @@ launch_session->exact_target_hold.reset();
     };
     https_server.resource["^/actions/window-icon$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
       run_discovery_nvhttp([response, request] { get_host_window_icon(response, request); });
+    };
+    https_server.resource["^/actions/launchables$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
+      run_discovery_nvhttp([response, request] { get_launchables(response, request); });
+    };
+    https_server.resource["^/actions/launchable-icons$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
+      run_discovery_nvhttp([response, request] { get_launchable_icons(response, request); });
+    };
+    https_server.resource["^/actions/launch$"]["POST"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
+      run_on_blocking_pool(layout_route_pool, [response, request] { post_launch(response, request); });
     };
     // Window queries and actions never touch the launch/resume gate: a slow
     // host window must not make launches answer "busy" or hold other requests.

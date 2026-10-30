@@ -112,6 +112,7 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/power_action.cpp"
         "${CMAKE_SOURCE_DIR}/src/host_windows.cpp"
         "${CMAKE_SOURCE_DIR}/src/app_desk.cpp"
+        "${CMAKE_SOURCE_DIR}/src/app_launcher.cpp"
         "${CMAKE_SOURCE_DIR}/src/app_desk.h"
         "${CMAKE_SOURCE_DIR}/src/power_action.h"
         "${CMAKE_SOURCE_DIR}/src/power_action_http.h"
