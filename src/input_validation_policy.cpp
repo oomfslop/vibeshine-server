@@ -67,7 +67,7 @@ namespace input::validation {
         case SS_CONTROLLER_BATTERY_MAGIC:
           return packet_size_bounds_t {sizeof(SS_CONTROLLER_BATTERY_PACKET), sizeof(SS_CONTROLLER_BATTERY_PACKET)};
         case SS_TRACKPAD_MAGIC:
-          return packet_size_bounds_t {sizeof(SS_TRACKPAD_PACKET), sizeof(SS_TRACKPAD_PACKET)};
+          return packet_size_bounds_t {SS_TRACKPAD_PACKET_UNTIMED_SIZE, sizeof(SS_TRACKPAD_PACKET)};
         default:
           return std::nullopt;
       }

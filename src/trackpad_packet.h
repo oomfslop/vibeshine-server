@@ -30,7 +30,11 @@ typedef struct _SS_TRACKPAD_PACKET {
   netfloat width;  ///< the touchpad's physical size, in millimeters
   netfloat height;
   SS_TRACKPAD_CONTACT contacts[SS_TRACKPAD_MAX_CONTACTS];
+  uint32_t timestamp;  ///< when the fingers were there, client ms (any base); absent from the first clients' packets
 } SS_TRACKPAD_PACKET, *PSS_TRACKPAD_PACKET;
 
   #pragma pack(pop)
+
+  /// The first clients' packets end before `timestamp`
+  #define SS_TRACKPAD_PACKET_UNTIMED_SIZE (sizeof(SS_TRACKPAD_PACKET) - sizeof(uint32_t))
 #endif

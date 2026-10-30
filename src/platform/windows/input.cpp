@@ -866,6 +866,8 @@ namespace platf {
       POINT at {};  ///< himetric
     };
     std::array<trackpad_slot_t, 5> trackpadSlots {};
+    DWORD trackpadClockOffset {};  ///< client ms to this machine's tick count, set as each gesture starts
+    DWORD trackpadLastTime {};
   };
 
   /**
@@ -1164,10 +1166,22 @@ namespace platf {
       at[k] = {std::lround(c.x * raw->trackpadWidth), std::lround(c.y * raw->trackpadHeight)};
     }
 
+    // Timed by when the fingers were there on the client, not by when the
+    // frame got here: the network delivers frames in bursts (and a lost one
+    // late), and Windows takes a flick's speed, and the inertia after it,
+    // from these times. A gesture's first frame sets the clocks against
+    // each other.
+    DWORD time = GetTickCount();
+    if (trackpad.timestamp != 0) {
+      if (!any_down) raw->trackpadClockOffset = time - trackpad.timestamp;
+      time = trackpad.timestamp + raw->trackpadClockOffset;
+    }
+    if (any_down && static_cast<LONG>(time - raw->trackpadLastTime) <= 0) time = raw->trackpadLastTime + 1;
+    raw->trackpadLastTime = time;
+
     // One frame: the fingers down now, and those lifting (at their last place)
     POINTER_TYPE_INFO frame[5] {};
     UINT32 count = 0;
-    const DWORD time = GetTickCount();
     for (std::size_t k = 0; k < slots.size(); ++k) {
       if (!now[k] && !slots[k].down) continue;
       auto &info = frame[count++];

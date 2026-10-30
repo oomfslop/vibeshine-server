@@ -1172,6 +1172,9 @@ namespace input {
       return;
     }
     platf::trackpad_input_t trackpad {};
+    // (the size field counts what follows it)
+    const auto size = util::endian::big<std::uint32_t>(packet->header.size) + sizeof(std::uint32_t);
+    trackpad.timestamp = size >= sizeof(SS_TRACKPAD_PACKET) ? util::endian::little(packet->timestamp) : 0;
     trackpad.count = std::min<std::uint8_t>(packet->contactCount, SS_TRACKPAD_MAX_CONTACTS);
     trackpad.width = from_clamped_netfloat(packet->width, 1.0f, 1000.0f);
     trackpad.height = from_clamped_netfloat(packet->height, 1.0f, 1000.0f);

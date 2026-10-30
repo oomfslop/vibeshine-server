@@ -367,6 +367,7 @@ namespace platf {
     std::uint8_t count = 0;
     contact_t contacts[5] {};
     float width = 0, height = 0;  ///< the touchpad's size, in millimeters
+    std::uint32_t timestamp = 0;  ///< when the fingers were there, client ms (any base); 0: unknown
   };
 
   struct pen_input_t {
