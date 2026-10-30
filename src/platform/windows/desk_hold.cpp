@@ -21,6 +21,7 @@ namespace desk_hold {
 
     std::mutex g_mutex;
     spec_t g_spec;
+    stats_t g_stats;  ///< under g_mutex
 
     // The capture's state: its pixels kept, and when each region took them
     struct held_t {
@@ -75,11 +76,19 @@ namespace desk_hold {
     spec_t spec;
     {
       std::lock_guard lock(g_mutex);
+      ++g_stats.frames;
+      g_stats.x = x;
+      g_stats.y = y;
+      g_stats.w = w;
+      g_stats.h = h;
+      g_stats.fps = fps;
+      g_stats.regions = static_cast<int>(g_spec.regions.size());
       if (!g_spec.active || g_spec.monitor.left != x || g_spec.monitor.top != y || g_spec.monitor.right - g_spec.monitor.left != w ||
           g_spec.monitor.bottom - g_spec.monitor.top != h) {
         return;
       }
       spec = g_spec;
+      ++g_stats.matched;
     }
     if (!device || !ctx || !dst || fps <= 0) return;
     std::lock_guard held_lock(g_held_mutex);
@@ -133,8 +142,14 @@ namespace desk_hold {
       if (now - g_held.refreshed[i] >= interval) {
         ctx->CopySubresourceRegion(g_held.texture, 0, b.left, b.top, 0, dst, 0, &b);
         g_held.refreshed[i] = now;
+        std::lock_guard lock(g_mutex);
+        ++g_stats.refreshed;
       } else {
         ctx->CopySubresourceRegion(dst, 0, b.left, b.top, 0, g_held.texture, 0, &b);
+        {
+          std::lock_guard lock(g_mutex);
+          ++g_stats.held;
+        }
         next_due = std::min(next_due, g_held.refreshed[i] + interval);
       }
     }
@@ -144,6 +159,11 @@ namespace desk_hold {
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(next_due - now).count();
       spec.request_frame(static_cast<int>(std::max<long long>(1, ms + 1)));
     }
+  }
+
+  stats_t stats() {
+    std::lock_guard lock(g_mutex);
+    return g_stats;
   }
 
 }  // namespace desk_hold

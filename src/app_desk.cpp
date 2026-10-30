@@ -1530,7 +1530,7 @@ namespace app_desk {
     for (std::size_t i = 0; i < out.windows.size(); ++i) out.windows[i].z = static_cast<int>(i);
     // Painted at their size? After a resize a window is repainted right away
     // (Win32 apps paint synchronously on request; composition-based ones get
-    // two compositions), then counts as stable at that size.
+    // four compositions), then counts as stable at that size.
     {
       struct paint_t {
         int w = 0, h = 0;  ///< its size now
@@ -1572,8 +1572,9 @@ namespace app_desk {
                   return;
                 }
                 RedrawWindow(hwnd, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
-                DwmFlush();
-                DwmFlush();
+                // Composition-based apps (WinUI, XAML) render on their own
+                // thread a few compositions after they took the new size
+                for (int i = 0; i < 4; ++i) DwmFlush();
                 std::lock_guard l(paint_mutex);
                 auto &q = paints[hwnd];
                 if (q.w == tw && q.h == th) {

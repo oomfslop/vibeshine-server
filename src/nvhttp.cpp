@@ -72,6 +72,7 @@
 #include "single_flight.h"
 #include "state_storage_policy.h"
 #ifdef _WIN32
+  #include "platform/windows/desk_hold.h"
   #include "platform/windows/display.h"
   #include "platform/windows/display_target_borrow.h"
   #include "platform/windows/display_helper_request_policy.h"
@@ -4241,6 +4242,13 @@ namespace nvhttp {
       {"hard_repacks", layout.hard_repacks},
       {"ghosts", layout.ghosts},
     };
+#ifdef _WIN32
+    {
+      // Diagnostics: the lower frame rate of background windows at work
+      const auto h = desk_hold::stats();
+      out["hold"] = {{"frames", h.frames}, {"matched", h.matched}, {"held", h.held}, {"refreshed", h.refreshed}, {"rect", {h.x, h.y, h.w, h.h}}, {"fps", h.fps}, {"regions", h.regions}};
+    }
+#endif
     for (const auto &w : layout.windows) {
       char handle[32], owner[32];
       snprintf(handle, sizeof(handle), "0x%llx", static_cast<unsigned long long>(w.handle));

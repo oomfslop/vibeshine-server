@@ -40,4 +40,12 @@ namespace desk_hold {
    *  (x, y) w x h (virtual-desktop pixels), at `fps`. */
   void apply(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *dst, int x, int y, int w, int h, int fps);
 
+  /** Diagnostics: frames seen, frames matching the atlas, regions held back,
+   *  regions refreshed, and the last frame's display rect */
+  struct stats_t {
+    std::uint64_t frames = 0, matched = 0, held = 0, refreshed = 0;
+    int x = 0, y = 0, w = 0, h = 0, fps = 0, regions = 0;
+  };
+  stats_t stats();
+
 }  // namespace desk_hold
