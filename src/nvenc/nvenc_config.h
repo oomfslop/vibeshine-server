@@ -4,7 +4,11 @@
  */
 #pragma once
 
+#include <array>
+#include <cstdint>
+#include <functional>
 #include <string_view>
+#include <vector>
 
 namespace nvenc {
 
@@ -44,9 +48,19 @@ namespace nvenc {
   }
 
   /**
+   * @brief Per-region quality: fills `rects` with (x, y, w, h, qp delta) in
+   *        frame pixels and returns a number that changes when they do.
+   */
+  using region_qp_source = std::function<std::uint64_t(std::vector<std::array<int, 5>> &rects)>;
+
+  /**
    * @brief NVENC encoder configuration.
    */
   struct nvenc_config {
+    // Regions encoded at other quality than the rest (an app-window desk's
+    // background windows); empty: none. H.264 and HEVC only.
+    region_qp_source region_qp;
+
     // Quality preset from 1 to 7, higher is slower
     int quality_preset = 1;
 

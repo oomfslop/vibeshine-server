@@ -26,6 +26,7 @@
 
 #include <d3d11.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -55,6 +56,7 @@ namespace desk_hold {
     int divisor = 1;  ///< 1, or 2, 4, 8: that fraction of the frame rate
     HWND window = nullptr;  ///< whose picture it is
     int w = 0, h = 0;  ///< the window's frame size in the layout
+    bool background = false;  ///< a window the user is not working in (not focused, nor its dialogs and menus)
   };
 
   /** The regions of the atlas covering `monitor` (virtual-desktop pixels) in
@@ -67,6 +69,14 @@ namespace desk_hold {
   /** Capture thread: `dst` is the frame just captured of the display at
    *  (x, y) w x h (virtual-desktop pixels), at `fps`. */
   void apply(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *dst, int x, int y, int w, int h, int fps);
+
+  /** Background windows at lower quality: the encoder adds `qp_delta` to the
+   *  quantizer in their cells (0: same quality as the rest) */
+  void set_background_qp(int qp_delta);
+
+  /** For the encoder: the newest layout's background cells (x, y, w, h,
+   *  qp delta) and a number that changes when they do */
+  std::uint64_t background_cells(std::vector<std::array<int, 5>> &out);
 
   /** Diagnostics: frames seen, frames of the atlas, frames whose layout was
    *  known, regions held back, regions refreshed (lower rates), regions held

@@ -34,6 +34,7 @@ namespace desk_hold {
 
     std::mutex g_mutex;
     spec_t g_spec;
+    int g_background_qp = 0;  ///< under g_mutex
     stats_t g_stats;  ///< under g_mutex
 
     // A cell with one window's picture at one size
@@ -120,10 +121,33 @@ namespace desk_hold {
     g_spec.active = true;
   }
 
+  void set_background_qp(int qp_delta) {
+    std::lock_guard lock(g_mutex);
+    g_background_qp = std::clamp(qp_delta, 0, 20);
+  }
+
+  std::uint64_t background_cells(std::vector<std::array<int, 5>> &out) {
+    out.clear();
+    std::lock_guard lock(g_mutex);
+    if (!g_spec.active || g_spec.layouts.empty() || g_background_qp <= 0) return 0;
+    std::uint64_t sig = 1469598103934665603ull;
+    auto mix = [&sig](std::int64_t v) {
+      sig = (sig ^ static_cast<std::uint64_t>(v)) * 1099511628211ull;
+    };
+    mix(g_background_qp);
+    for (const auto &r : g_spec.layouts.back().regions) {
+      if (!r.background) continue;
+      out.push_back({r.rect.left, r.rect.top, r.rect.right - r.rect.left, r.rect.bottom - r.rect.top, g_background_qp});
+      for (int v : out.back()) mix(v);
+    }
+    return sig;
+  }
+
   void clear() {
     {
       std::lock_guard lock(g_mutex);
       g_spec = {};
+      g_background_qp = 0;
     }
     std::lock_guard lock(g_held_mutex);
     release_textures();

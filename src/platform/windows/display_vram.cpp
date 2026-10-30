@@ -26,6 +26,7 @@ extern "C" {
 #include "display.h"
 #include "display_vram.h"
 #include "desk_hold.h"
+#include "src/app_desk.h"
 #include "misc.h"
 #ifdef SUNSHINE_ENABLE_NV_TRUEHDR
   #include "game_activity.h"
@@ -59,6 +60,37 @@ static void free_frame(AVFrame *frame) {
 using frame_t = util::safe_ptr<AVFrame, free_frame>;
 
 namespace platf::dxgi {
+
+  namespace {
+    /** The encoder settings for a session: an app-window desk's own options
+     *  over the host's (Data saver: fewer bits for the same picture, and
+     *  background windows at lower quality) */
+    nvenc::nvenc_config desk_encoder_config(const ::video::config_t &client_config) {
+      auto nv = config::video.nv;
+      if (client_config.desk_client.empty()) return nv;
+      const auto options = app_desk::options(client_config.desk_client);
+      if (!options) return nv;
+      if (options->efficient) {
+        // A slower preset and a quarter-resolution pre-pass find cheaper ways
+        // to code each frame; a quality ceiling stops still areas from being
+        // refined further than the eye can tell (bits a slow link lacks)
+        nv.quality_preset = std::max(nv.quality_preset, 6);
+        nv.two_pass = nvenc::nvenc_two_pass::quarter_resolution;
+        nv.enable_min_qp = true;
+        nv.min_qp_h264 = std::max(nv.min_qp_h264, 24u);
+        nv.min_qp_hevc = std::max(nv.min_qp_hevc, 26u);
+        nv.min_qp_av1 = std::max(nv.min_qp_av1, 26u);
+      }
+      if (options->background_qp > 0) {
+        nv.region_qp = [](std::vector<std::array<int, 5>> &rects) {
+          return desk_hold::background_cells(rects);
+        };
+      }
+      BOOST_LOG(info) << "Desk encoder: preset " << nv.quality_preset << (options->efficient ? ", pre-pass, quality ceiling" : "")
+                      << (options->background_qp > 0 ? ", background windows +" + std::to_string(options->background_qp) + " QP" : "");
+      return nv;
+    }
+  }  // namespace
 
   namespace {
     std::atomic<int> g_active_native_amf_encoders {0};
@@ -2130,7 +2162,7 @@ namespace platf::dxgi {
 
       auto nvenc_colorspace = nvenc::nvenc_colorspace_from_sunshine_colorspace(colorspace);
       if (!nvenc_d3d->create_encoder(
-            config::video.nv,
+            desk_encoder_config(client_config),
             client_config,
             nvenc_colorspace,
             buffer_format,

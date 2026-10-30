@@ -52,6 +52,7 @@ namespace desk_atlas {
     std::vector<RECT> visible;  ///< the parts the user sees (frame coordinates), sharp even when the rest goes smaller
     bool settled = true;  ///< a popup done with its opening animation (its inside is opaque by now)
     int divisor = 1;  ///< drawn at 1/n of the frame rate (windows in the background)
+    bool background = false;  ///< not the window the user works in (nor its dialogs, menus)
   };
 
   struct piece_t {
@@ -132,6 +133,7 @@ namespace desk_atlas {
       bool has_white = false;
       bool settled = true;
       int divisor = 1;
+      bool background = false;
       std::vector<std::pair<RECT, cell_t>> wplan;  ///< where the parts of its copy on white are to go
       std::vector<wpart_t> wparts;  ///< where they are
       int w = 0, h = 0;

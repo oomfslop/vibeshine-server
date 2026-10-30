@@ -31,6 +31,7 @@
 
   #include "platform/windows/app_window_layout.h"
   #include "platform/windows/desk_atlas.h"
+  #include "platform/windows/desk_hold.h"
   #include "platform/windows/misc.h"
   #include "platform/windows/utf_utils.h"
   #include "platform/windows/virtual_display.h"
@@ -947,7 +948,8 @@ namespace app_desk {
     std::lock_guard lock(g_mutex);
     auto &desk = g_desks[client_uuid];
     desk.options = options;
-    desk.options.unfocused_divisor = std::clamp(options.unfocused_divisor, 1, 8);
+    desk.options.unfocused_divisor = std::clamp(options.unfocused_divisor, 1, 16);
+    desk.options.background_qp = std::clamp(options.background_qp, 0, 20);
     // SudoVDA (or a Sunshine driver with requested resolutions) makes displays
     // of exactly the size asked for; otherwise the driver's catalog decides.
     const bool sudovda = VDISPLAY::sudovdaReady();
@@ -1047,10 +1049,18 @@ namespace app_desk {
       desk.atlas_window.reset();
       desk.atlas_window = std::make_shared<desk_atlas::atlas_t>(atlas_rect);
     }
+    desk_hold::set_background_qp(desk.options.background_qp);
     apply_host_tweaks();
     BOOST_LOG(info) << "Desk: open " << desk.info.display << ' ' << desk.info.rect[2] << 'x' << desk.info.rect[3] << '@' << fps << " at " << desk.info.dpi << " dpi"
                     << (custom ? " (exact mode)" : " (catalog mode)") << ", atlas " << desk.info.capture;
     return desk.info;
+  }
+
+  std::optional<options_t> options(const std::string &client_uuid) {
+    std::lock_guard lock(g_mutex);
+    auto it = g_desks.find(client_uuid);
+    if (it == g_desks.end()) return std::nullopt;
+    return it->second.options;
   }
 
   std::optional<desk_t> get(const std::string &client_uuid) {
@@ -1831,8 +1841,9 @@ namespace app_desk {
         const bool owned_by_focused = std::any_of(out.windows.begin(), out.windows.end(), [&](const window_t &o) {
           return o.focused && (o.handle == w.owner || w.handle == o.owner);
         });
-        const int divisor = focused || owned_by_focused || w.kind == "popup" ? 1 : options.unfocused_divisor;
-        sources.push_back({reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)), w.rect[2], w.rect[3], w.kind == "popup", priority, std::move(parts), w.settled, divisor});
+        const bool background = !(focused || owned_by_focused || w.kind == "popup");
+        const int divisor = background ? options.unfocused_divisor : 1;
+        sources.push_back({reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)), w.rect[2], w.rect[3], w.kind == "popup", priority, std::move(parts), w.settled, divisor, background});
       }
       const auto sync_start = std::chrono::steady_clock::now();
       unsigned seq = 0;

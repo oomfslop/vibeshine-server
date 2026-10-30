@@ -209,6 +209,16 @@ namespace nvenc {
 
     bool hdr_metadata_valid = false;
     SS_HDR_METADATA hdr_metadata {};
+
+    // Regions at other quality (nvenc_config::region_qp): the map, rebuilt
+    // when they change
+    struct {
+      region_qp_source source;
+      uint32_t unit = 0;  ///< block size of the map; 0: no map
+      uint64_t generation = 0;
+      std::vector<int8_t> map;
+      std::vector<std::array<int, 5>> rects;
+    } region_qp;
   };
 
 }  // namespace nvenc

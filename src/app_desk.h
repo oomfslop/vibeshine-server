@@ -34,12 +34,16 @@ namespace app_desk {
     int unfocused_divisor = 1;  ///< windows other than the focused one (and its popups, dialogs) at 1/n of the frame rate: 1, 2, 4, 8
     bool skip_covered = true;  ///< windows covered whole by others are not in the stream (the client keeps their last picture)
     int atlas_w = 0, atlas_h = 0;  ///< the atlas (what is streamed) at this size; 0: 3840x2160. Smaller saves bandwidth on slow links (fewer pixels to fill when windows change)
+    int background_qp = 0;  ///< background windows at lower quality: this much added to their quantizer (0-20)
+    bool efficient = false;  ///< encoder settings that spend fewer bits for the same picture (slower preset, a pre-pass, a quality ceiling) at a few ms more encode time
   };
 
   /** Make sure the client's desk exists with this size (host px), refresh rate
    *  and DPI; creates or retunes the display. Takes a few seconds the first time. */
   desk_t open(const std::string &client_uuid, int w, int h, int fps, int dpi, const options_t &options = {});
   std::optional<desk_t> get(const std::string &client_uuid);
+  /** The options the client's desk was opened with */
+  std::optional<options_t> options(const std::string &client_uuid);
   /** Where absolute pointer input for this client's desk session goes: the
    *  desk's origin relative to the virtual desktop's (the session captures
    *  the atlas, of the same size). */

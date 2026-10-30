@@ -571,6 +571,7 @@ namespace desk_atlas {
       item.source_offset = offset;
       item.settled = s.settled;
       item.divisor = s.divisor;
+      item.background = s.background;
       const bool fits = item.black && item.cell.cw > 0 && item.cell.cw >= static_cast<int>(std::ceil(s.w * item.scale)) &&
                         item.cell.ch >= static_cast<int>(std::ceil(s.h * item.scale)) && item.has_white == s.alpha &&
                         (!s.alpha || (item.w == s.w && item.h == s.h && item.wparts.size() == white_layout(item, item.scale).size()));
@@ -996,7 +997,7 @@ namespace desk_atlas {
       for (const auto &[hwnd, item] : items_) {
         if (!item.black || item.cell.cw <= 0) continue;
         auto add = [&, hwnd = hwnd](const cell_t &c) {
-          if (c.cw > 0 && c.ch > 0) regions.push_back({RECT {c.x, c.y, c.x + c.cw, c.y + c.ch}, item.divisor, hwnd, item.w, item.h});
+          if (c.cw > 0 && c.ch > 0) regions.push_back({RECT {c.x, c.y, c.x + c.cw, c.y + c.ch}, item.divisor, hwnd, item.w, item.h, item.background});
         };
         add(item.black_at);
         for (const auto &w : item.wparts) {

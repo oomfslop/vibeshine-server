@@ -493,6 +493,15 @@ namespace nvenc {
     enc_config.rcParams.enableAQ = config.adaptive_quantization;
     enc_config.rcParams.averageBitRate = client_config.bitrate * 1000;
 
+    // Regions at other quality (a desk's background windows): a QP delta
+    // per macroblock (H.264) or per 32x32 CTB (HEVC), along with rate control
+    region_qp = {};
+    if (config.region_qp && (client_config.videoFormat == 0 || client_config.videoFormat == 1)) {
+      enc_config.rcParams.qpMapMode = NV_ENC_QP_MAP_DELTA;
+      region_qp.source = config.region_qp;
+      region_qp.unit = client_config.videoFormat == 1 ? 32 : 16;
+    }
+
     if (get_encoder_cap(NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE)) {
       enc_config.rcParams.vbvBufferSize = client_config.bitrate * 1000 / client_config.framerate;
       if (config.vbv_percentage_increase > 0) {
@@ -628,6 +637,9 @@ namespace nvenc {
           // HEVC
           auto &format_config = enc_config.encodeCodecConfig.hevcConfig;
           set_h264_hevc_common_format_config(format_config);
+          if (region_qp.unit) {
+            format_config.maxCUSize = NV_ENC_HEVC_CUSIZE_32x32;  // the QP map's unit
+          }
           if (buffer_is_10bit()) {
             set_hevc_10bit_format(format_config);
           }
@@ -1030,6 +1042,31 @@ namespace nvenc {
       }
     }
 #endif
+
+    if (region_qp.unit) {
+      const uint64_t generation = region_qp.source(region_qp.rects);
+      const uint32_t unit = region_qp.unit;
+      const uint32_t cols = (encoder_params.width + unit - 1) / unit, rows = (encoder_params.height + unit - 1) / unit;
+      if (generation != region_qp.generation || region_qp.map.size() != static_cast<size_t>(cols) * rows) {
+        region_qp.generation = generation;
+        region_qp.map.assign(static_cast<size_t>(cols) * rows, 0);
+        // A block takes the delta of the region its center is in
+        for (const auto &[x, y, w, h, delta] : region_qp.rects) {
+          for (uint32_t r = 0; r < rows; ++r) {
+            const int cy = static_cast<int>(r * unit + unit / 2);
+            if (cy < y || cy >= y + h) continue;
+            for (uint32_t c = 0; c < cols; ++c) {
+              const int cx = static_cast<int>(c * unit + unit / 2);
+              if (cx >= x && cx < x + w) region_qp.map[static_cast<size_t>(r) * cols + c] = static_cast<int8_t>(std::clamp(delta, -51, 51));
+            }
+          }
+        }
+      }
+      if (generation != 0) {
+        pic_params.qpDeltaMap = region_qp.map.data();
+        pic_params.qpDeltaMapSize = static_cast<uint32_t>(region_qp.map.size());
+      }
+    }
 
     if (nvenc_failed(nvenc->nvEncEncodePicture(encoder, &pic_params))) {
       BOOST_LOG(error) << "NvEnc: NvEncEncodePicture() failed: " << last_nvenc_error_string;
