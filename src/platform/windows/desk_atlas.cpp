@@ -134,6 +134,13 @@ namespace desk_atlas {
             RECT pixel {client.right - 1, client.bottom - 1, client.right, client.bottom};
             InvalidateRect(hwnd, &pixel, FALSE);
             UpdateWindow(hwnd);
+            // After a layout change, a few frames more: what was just placed
+            // is refined in them (the encoder sharpens still pictures frame
+            // by frame), even when nothing else changes
+            if (wparam == refresh_timer && self->refresh_left_ > 0) {
+              --self->refresh_left_;
+              SetTimer(hwnd, refresh_timer, 40, nullptr);
+            }
           }
           return 0;
         }
@@ -790,7 +797,8 @@ namespace desk_atlas {
         bool packed = false;
         auto run = [&](bool soft_mode) {
           soft = soft_mode;
-          stage_count = soft_mode ? 3 : std::size(stages);
+          // (keeping places is worth only the windows behind giving way)
+          stage_count = soft_mode ? 2 : std::size(stages);
           for (HWND h : order) scales[h] = 1.0;
           loose.clear();
           packed = false;
@@ -1014,6 +1022,7 @@ namespace desk_atlas {
     }
     if (renumber) {
       set_marker(false);
+      refresh_left_ = 8;
       SetTimer(window_, refresh_timer, 40, nullptr);
     } else if (changing) {
       set_marker(false);

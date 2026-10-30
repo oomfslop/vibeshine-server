@@ -135,8 +135,25 @@ namespace desk_hold {
       sig = (sig ^ static_cast<std::uint64_t>(v)) * 1099511628211ull;
     };
     mix(g_background_qp);
-    for (const auto &r : g_spec.layouts.back().regions) {
+    // A cell just placed (a window moved across one behind it uncovers new
+    // parts, which go in new cells) is coded at the usual quality first:
+    // its content did not change, it only has to arrive sharp. Lower
+    // quality is for what changes in it later.
+    static std::map<key_t, clock::time_point> placed;
+    const auto now = clock::now();
+    const auto &regions = g_spec.layouts.back().regions;
+    std::erase_if(placed, [&](const auto &e) {
+      return std::none_of(regions.begin(), regions.end(), [&](const region_t &r) {
+        return key_of(r) == e.first;
+      });
+    });
+    for (const auto &r : regions) {
       if (!r.background) continue;
+      const auto since = placed.try_emplace(key_of(r), now).first->second;
+      if (now - since < std::chrono::milliseconds(1500)) {
+        mix(-1);  // (the map changes again when it stops being new)
+        continue;
+      }
       out.push_back({r.rect.left, r.rect.top, r.rect.right - r.rect.left, r.rect.bottom - r.rect.top, g_background_qp});
       for (int v : out.back()) mix(v);
     }

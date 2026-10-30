@@ -191,6 +191,7 @@ namespace desk_atlas {
     double last_area_ = 0;  ///< what the windows asked for at the last sync
     std::vector<retired_t> retired_;  ///< thumbnails left where they were, for a while
     bool tick_ = false;  ///< the refresh pixel's state
+    int refresh_left_ = 0;  ///< refresh frames still to come after a layout change
     std::uint16_t seq_ = 0;  ///< the layout number painted in the atlas
     std::uint64_t last_sig_ = 0;  ///< the slots at the last sync
     unsigned hard_repacks_ = 0;
