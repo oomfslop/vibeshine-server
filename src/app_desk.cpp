@@ -1428,14 +1428,18 @@ namespace app_desk {
         py = std::clamp<LONG>(py, work.top, std::max<LONG>(work.top, work.bottom - h));
         to_adopt.push_back({hwnd, {px - desk.left, py - desk.top}});
       }
-      // The foreground went from a desk window to one elsewhere
+      // The foreground went from a desk window to one elsewhere. Only while
+      // that desk window is still there: when it closes or is minimized,
+      // Windows hands the foreground to the next window in line by itself
+      // (the user did not go to it)
       HWND fg = GetForegroundWindow();
       RECT fg_frame {};
       {
         RECT x {};
         if (!fg || !app_window_layout::frame_rect(fg, fg_frame) || !IntersectRect(&x, &fg_frame, &desk)) fg_frame = {};
       }
-      if (fg && fg != fg_before && !IsRectEmpty(&fg_before_frame) && IsRectEmpty(&fg_frame)) {
+      const bool before_still_there = fg_before && IsWindow(fg_before) && IsWindowVisible(fg_before) && !IsIconic(fg_before);
+      if (fg && fg != fg_before && before_still_there && !IsRectEmpty(&fg_before_frame) && IsRectEmpty(&fg_frame)) {
         const bool app_window = std::any_of(ctx.windows.begin(), ctx.windows.end(), [&](const auto &e) {
           return e.first == fg;
         });
