@@ -4,41 +4,72 @@
  */
 #include "desk_hold.h"
 
+#include <dwmapi.h>
+
 #include <algorithm>
 #include <chrono>
+#include <deque>
+#include <map>
 #include <mutex>
+#include <tuple>
 
 namespace desk_hold {
 
   namespace {
+    using clock = std::chrono::steady_clock;
+
+    struct layout_t {
+      int seq = -1;
+      std::vector<region_t> regions;
+    };
+
     struct spec_t {
       RECT monitor {};
-      std::uint64_t generation = 0;
-      std::vector<region_t> regions;
+      std::deque<layout_t> layouts;  ///< the last few, newest last
       std::function<void(int)> request_frame;
       bool active = false;
     };
+
+    constexpr std::size_t layouts_kept = 8;
 
     std::mutex g_mutex;
     spec_t g_spec;
     stats_t g_stats;  ///< under g_mutex
 
-    // The capture's state: its pixels kept, and when each region took them
+    // A cell with one window's picture at one size
+    using key_t = std::tuple<HWND, LONG, LONG, LONG, LONG, int, int>;
+
+    key_t key_of(const region_t &r) {
+      return {r.window, r.rect.left, r.rect.top, r.rect.right, r.rect.bottom, r.w, r.h};
+    }
+
+    struct cell_t {
+      bool taken = false;  ///< its pixels are in the texture
+      clock::time_point refreshed;
+    };
+
+    // The capture's state: the pixels kept, per cell
     struct held_t {
-      ID3D11Device *device = nullptr;  ///< the texture's device (not owned: compared only)
+      ID3D11Device *device = nullptr;  ///< the textures' device (not owned: compared only)
       ID3D11Texture2D *texture = nullptr;
+      ID3D11Texture2D *marker = nullptr;  ///< staging: the layout number's row, read back
+      ID3D11Texture2D *black = nullptr;  ///< the number's rows, all black: a frame that carries no number
       D3D11_TEXTURE2D_DESC desc {};
-      std::uint64_t generation = ~0ull;
-      std::vector<std::chrono::steady_clock::time_point> refreshed;  ///< per region
+      std::map<key_t, cell_t> cells;
     };
 
     std::mutex g_held_mutex;  ///< one capture at a time uses it (backends can overlap while one is rebuilt)
     held_t g_held;
 
-    void release_texture() {
+    void release_textures() {
       if (g_held.texture) g_held.texture->Release();
+      if (g_held.marker) g_held.marker->Release();
+      if (g_held.black) g_held.black->Release();
       g_held.texture = nullptr;
+      g_held.marker = nullptr;
+      g_held.black = nullptr;
       g_held.device = nullptr;
+      g_held.cells.clear();
     }
 
     D3D11_BOX box_of(const RECT &r, const D3D11_TEXTURE2D_DESC &desc) {
@@ -51,13 +82,40 @@ namespace desk_hold {
         1,
       };
     }
+
+    bool readable(DXGI_FORMAT f) {
+      return f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_B8G8R8X8_UNORM;
+    }
+
+    /** The layout number `dst` carries, or -1 */
+    int read_seq(ID3D11DeviceContext *ctx, ID3D11Texture2D *dst) {
+      const auto &d = g_held.desc;
+      if (!g_held.marker || d.Height < static_cast<UINT>(marker_rows)) return -1;
+      const D3D11_BOX row {0, d.Height - marker_rows / 2, 0, static_cast<UINT>(marker_block * 16), d.Height - marker_rows / 2 + 1, 1};
+      ctx->CopySubresourceRegion(g_held.marker, 0, 0, 0, 0, dst, 0, &row);
+      D3D11_MAPPED_SUBRESOURCE m {};
+      if (FAILED(ctx->Map(g_held.marker, 0, D3D11_MAP_READ, 0, &m))) return -1;
+      const auto *px = static_cast<const std::uint8_t *>(m.pData);
+      std::uint16_t code = 0;
+      for (int i = 0; i < 16; ++i) {
+        // green: the same byte in BGRA and RGBA
+        if (px[(i * marker_block + marker_block / 2) * 4 + 1] > 128) code |= static_cast<std::uint16_t>(1u << i);
+      }
+      ctx->Unmap(g_held.marker, 0);
+      return marker_seq(code);
+    }
   }  // namespace
 
-  void set(const RECT &monitor, std::uint64_t generation, std::vector<region_t> regions, std::function<void(int)> request_frame) {
+  void set(const RECT &monitor, int seq, std::vector<region_t> regions, std::function<void(int)> request_frame) {
     std::lock_guard lock(g_mutex);
+    if (!EqualRect(&g_spec.monitor, &monitor)) g_spec.layouts.clear();
     g_spec.monitor = monitor;
-    g_spec.generation = generation;
-    g_spec.regions = std::move(regions);
+    auto it = std::find_if(g_spec.layouts.begin(), g_spec.layouts.end(), [&](const layout_t &l) {
+      return l.seq == seq;
+    });
+    if (it != g_spec.layouts.end()) g_spec.layouts.erase(it);
+    g_spec.layouts.push_back({seq, std::move(regions)});
+    while (g_spec.layouts.size() > layouts_kept) g_spec.layouts.pop_front();
     g_spec.request_frame = std::move(request_frame);
     g_spec.active = true;
   }
@@ -68,8 +126,7 @@ namespace desk_hold {
       g_spec = {};
     }
     std::lock_guard lock(g_held_mutex);
-    release_texture();
-    g_held.refreshed.clear();
+    release_textures();
   }
 
   void apply(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *dst, int x, int y, int w, int h, int fps) {
@@ -82,7 +139,6 @@ namespace desk_hold {
       g_stats.w = w;
       g_stats.h = h;
       g_stats.fps = fps;
-      g_stats.regions = static_cast<int>(g_spec.regions.size());
       if (!g_spec.active || g_spec.monitor.left != x || g_spec.monitor.top != y || g_spec.monitor.right - g_spec.monitor.left != w ||
           g_spec.monitor.bottom - g_spec.monitor.top != h) {
         return;
@@ -90,17 +146,14 @@ namespace desk_hold {
       spec = g_spec;
       ++g_stats.matched;
     }
-    if (!device || !ctx || !dst || fps <= 0) return;
+    if (!device || !ctx || !dst || fps <= 0 || spec.layouts.empty()) return;
     std::lock_guard held_lock(g_held_mutex);
-    bool any = false;
-    for (const auto &r : spec.regions) any = any || r.divisor > 1;
-    if (!any) return;
 
     D3D11_TEXTURE2D_DESC desc {};
     dst->GetDesc(&desc);
-    // A new capture device (the backend was rebuilt): a texture of its own
+    // A new capture device (the backend was rebuilt): textures of its own
     if (!g_held.texture || g_held.device != device || g_held.desc.Width != desc.Width || g_held.desc.Height != desc.Height || g_held.desc.Format != desc.Format) {
-      release_texture();
+      release_textures();
       D3D11_TEXTURE2D_DESC d = desc;
       d.Usage = D3D11_USAGE_DEFAULT;
       d.BindFlags = 0;
@@ -112,50 +165,135 @@ namespace desk_hold {
         g_held.texture = nullptr;
         return;
       }
+      if (readable(desc.Format)) {
+        D3D11_TEXTURE2D_DESC m = d;
+        m.Width = marker_block * 16;
+        m.Height = 1;
+        m.Usage = D3D11_USAGE_STAGING;
+        m.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(device->CreateTexture2D(&m, nullptr, &g_held.marker))) g_held.marker = nullptr;
+        // (zero is black in the 8-bit formats)
+        std::vector<std::uint8_t> zeros(static_cast<std::size_t>(marker_block) * 16 * marker_rows * 4);
+        D3D11_SUBRESOURCE_DATA init {zeros.data(), static_cast<UINT>(marker_block * 16 * 4), 0};
+        D3D11_TEXTURE2D_DESC k = d;
+        k.Width = marker_block * 16;
+        k.Height = marker_rows;
+        if (FAILED(device->CreateTexture2D(&k, &init, &g_held.black))) g_held.black = nullptr;
+      }
       g_held.desc = desc;
       g_held.device = device;
-      g_held.generation = ~0ull;
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    // Another layout: the cells hold other pictures now, all current at once
-    if (g_held.generation != spec.generation || g_held.refreshed.size() != spec.regions.size()) {
-      g_held.generation = spec.generation;
-      g_held.refreshed.assign(spec.regions.size(), now);
-      for (const auto &r : spec.regions) {
-        if (r.divisor <= 1) continue;
-        const auto b = box_of(r.rect, desc);
-        if (b.right > b.left && b.bottom > b.top) ctx->CopySubresourceRegion(g_held.texture, 0, b.left, b.top, 0, dst, 0, &b);
+    // The frame's own layout (a frame composed while the pictures change
+    // carries none, and is not drawn); a format the number cannot be read
+    // from: the newest
+    const int seq = g_held.marker ? read_seq(ctx, dst) : spec.layouts.back().seq;
+    const auto layout = std::find_if(spec.layouts.begin(), spec.layouts.end(), [&](const layout_t &l) {
+      return l.seq == seq;
+    });
+    {
+      std::lock_guard lock(g_mutex);
+      g_stats.seq = seq;
+      if (layout != spec.layouts.end()) {
+        ++g_stats.known;
+        g_stats.regions = static_cast<int>(layout->regions.size());
       }
-      return;
     }
+    if (layout == spec.layouts.end()) return;
 
+    // A window not in this frame's layout loses its pixels: shown again
+    // (a menu reusing its window), it starts over from what it shows then
+    std::erase_if(g_held.cells, [&](const auto &e) {
+      return std::none_of(layout->regions.begin(), layout->regions.end(), [&](const region_t &r) {
+        return r.window == std::get<0>(e.first);
+      });
+    });
+
+    // Each window as it is now (DWM drew this frame's thumbnails from that,
+    // or from a state before it): is it as the layout says?
+    std::map<HWND, bool> like;
+    auto as_laid_out = [&](const region_t &r) {
+      auto [it, fresh] = like.try_emplace(r.window, true);
+      if (fresh && r.window) {
+        RECT frame {};
+        const bool sized = SUCCEEDED(DwmGetWindowAttribute(r.window, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) || GetWindowRect(r.window, &frame);
+        DWORD cloaked = 0;
+        if (FAILED(DwmGetWindowAttribute(r.window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked)))) cloaked = 0;
+        it->second = sized && IsWindowVisible(r.window) && !IsIconic(r.window) && !cloaked && frame.right - frame.left == r.w && frame.bottom - frame.top == r.h;
+      }
+      return it->second;
+    };
+
+    // Per window, so its cells (picture, copy on white, pieces) always show
+    // the same moment: held all or none, refreshed all at once
+    struct window_t {
+      std::vector<std::pair<const region_t *, cell_t *>> cells;
+      bool taken = true;  ///< every cell has pixels
+      bool due = false;  ///< a cell is due for current pixels
+    };
+    std::map<HWND, window_t> windows;
+    const auto now = clock::now();
     const auto frame = std::chrono::duration<double>(1.0 / fps);
-    auto next_due = std::chrono::steady_clock::time_point::max();
-    for (std::size_t i = 0; i < spec.regions.size(); ++i) {
-      const auto &r = spec.regions[i];
-      if (r.divisor <= 1) continue;
+    auto interval_of = [&](const region_t &r) {
+      // Due a little early rather than a frame late (frames are not exactly periodic)
+      return std::chrono::duration_cast<clock::duration>(frame * (std::max(1, r.divisor) - 0.5));
+    };
+    for (const auto &r : layout->regions) {
       const auto b = box_of(r.rect, desc);
       if (b.right <= b.left || b.bottom <= b.top) continue;
-      // Due a little early rather than a frame late (frames are not exactly periodic)
-      const auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(frame * (r.divisor - 0.5));
-      if (now - g_held.refreshed[i] >= interval) {
-        ctx->CopySubresourceRegion(g_held.texture, 0, b.left, b.top, 0, dst, 0, &b);
-        g_held.refreshed[i] = now;
-        std::lock_guard lock(g_mutex);
-        ++g_stats.refreshed;
-      } else {
-        ctx->CopySubresourceRegion(dst, 0, b.left, b.top, 0, g_held.texture, 0, &b);
-        {
-          std::lock_guard lock(g_mutex);
-          ++g_stats.held;
+      auto &cell = g_held.cells[key_of(r)];
+      auto &w = windows[r.window];
+      w.cells.push_back({&r, &cell});
+      w.taken = w.taken && cell.taken;
+      w.due = w.due || r.divisor <= 1 || !cell.taken || now - cell.refreshed >= interval_of(r);
+    }
+
+    auto next_due = clock::time_point::max();
+    std::uint64_t held = 0, refreshed = 0, unlike = 0, unnumbered = 0;
+    for (auto &[hwnd, w] : windows) {
+      const bool ok = as_laid_out(*w.cells.front().first);
+      if (ok && w.due) {
+        for (auto &[r, cell] : w.cells) {
+          const auto b = box_of(r->rect, desc);
+          ctx->CopySubresourceRegion(g_held.texture, 0, b.left, b.top, 0, dst, 0, &b);
+          cell->taken = true;
+          cell->refreshed = now;
+          if (r->divisor > 1) ++refreshed;
         }
-        next_due = std::min(next_due, g_held.refreshed[i] + interval);
+        continue;
       }
+      if (!ok) {
+        ++unlike;
+        // The layout follows within a few ms; a frame then, in case nothing
+        // else changes
+        next_due = std::min(next_due, now + std::chrono::milliseconds(8));
+      }
+      // Its last pixels; without them for every cell, the frame is not
+      // drawn at all (it carries no layout number)
+      if (!w.taken) {
+        if (!ok && g_held.black && desc.Height >= static_cast<UINT>(marker_rows)) {
+          ctx->CopySubresourceRegion(dst, 0, 0, desc.Height - marker_rows, 0, g_held.black, 0, nullptr);
+          ++unnumbered;
+        }
+        continue;
+      }
+      for (auto &[r, cell] : w.cells) {
+        const auto b = box_of(r->rect, desc);
+        ctx->CopySubresourceRegion(dst, 0, b.left, b.top, 0, g_held.texture, 0, &b);
+        ++held;
+        if (ok) next_due = std::min(next_due, cell->refreshed + interval_of(*r));
+      }
+    }
+    {
+      std::lock_guard lock(g_mutex);
+      g_stats.held += held;
+      g_stats.refreshed += refreshed;
+      g_stats.unlike += unlike;
+      g_stats.unnumbered += unnumbered;
     }
     // Something was held back: a frame when it is due, in case nothing else
     // changes by then
-    if (next_due != std::chrono::steady_clock::time_point::max() && spec.request_frame) {
+    if (next_due != clock::time_point::max() && spec.request_frame) {
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(next_due - now).count();
       spec.request_frame(static_cast<int>(std::max<long long>(1, ms + 1)));
     }

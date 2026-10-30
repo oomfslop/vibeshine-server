@@ -564,6 +564,10 @@ const KeyCodeMap kKeyCodesMap[] = {
     return nullptr;
   }
 
+  void trackpad_update(client_input_t *input, const trackpad_input_t &trackpad) {
+    // Not supported: the feature flag is not advertised here
+  }
+
   /**
    * @brief Sends a touch event to the OS.
    * @param input The client-specific input context.

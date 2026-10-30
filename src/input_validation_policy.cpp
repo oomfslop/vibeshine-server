@@ -6,6 +6,8 @@
 
 extern "C" {
 #include <moonlight-common-c/src/Input.h>
+
+#include "trackpad_packet.h"
 }
 
 namespace input::validation {
@@ -64,6 +66,8 @@ namespace input::validation {
           return packet_size_bounds_t {sizeof(SS_CONTROLLER_MOTION_PACKET), sizeof(SS_CONTROLLER_MOTION_PACKET)};
         case SS_CONTROLLER_BATTERY_MAGIC:
           return packet_size_bounds_t {sizeof(SS_CONTROLLER_BATTERY_PACKET), sizeof(SS_CONTROLLER_BATTERY_PACKET)};
+        case SS_TRACKPAD_MAGIC:
+          return packet_size_bounds_t {sizeof(SS_TRACKPAD_PACKET), sizeof(SS_TRACKPAD_PACKET)};
         default:
           return std::nullopt;
       }

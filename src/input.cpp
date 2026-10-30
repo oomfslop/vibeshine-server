@@ -32,6 +32,7 @@ extern "C" {
 #include "mouse_input.h"
 #include "platform/common.h"
 #include "thread_pool.h"
+#include "trackpad_packet.h"
 #include "utility.h"
 
 // Win32 WHEEL_DELTA constant
@@ -1162,6 +1163,26 @@ namespace input {
    * @param input The input context pointer.
    * @param packet The touch packet.
    */
+  /**
+   * @brief Precision touchpad contacts: to the OS's own touchpad handling
+   *        (where the pointer is, like a physical touchpad).
+   */
+  void passthrough(std::shared_ptr<input_t> &input, PSS_TRACKPAD_PACKET packet) {
+    if (!config::input.mouse) {
+      return;
+    }
+    platf::trackpad_input_t trackpad {};
+    trackpad.count = std::min<std::uint8_t>(packet->contactCount, SS_TRACKPAD_MAX_CONTACTS);
+    trackpad.width = from_clamped_netfloat(packet->width, 1.0f, 1000.0f);
+    trackpad.height = from_clamped_netfloat(packet->height, 1.0f, 1000.0f);
+    for (std::uint8_t i = 0; i < trackpad.count; ++i) {
+      trackpad.contacts[i].id = util::endian::little(packet->contacts[i].contactId);
+      trackpad.contacts[i].x = from_clamped_netfloat(packet->contacts[i].x, 0.0f, 1.0f);
+      trackpad.contacts[i].y = from_clamped_netfloat(packet->contacts[i].y, 0.0f, 1.0f);
+    }
+    platf::trackpad_update(input->client_context.get(), trackpad);
+  }
+
   void passthrough(std::shared_ptr<input_t> &input, PSS_TOUCH_PACKET packet) {
     if (!config::input.mouse) {
       return;
@@ -1883,6 +1904,9 @@ namespace input {
         break;
       case SS_CONTROLLER_BATTERY_MAGIC:
         passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
+        break;
+      case SS_TRACKPAD_MAGIC:
+        passthrough(input, (PSS_TRACKPAD_PACKET) payload);
         break;
     }
 

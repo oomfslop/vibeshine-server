@@ -62,6 +62,10 @@ namespace app_desk {
   /** Move a host window onto the desk at desk-relative (x, y); its original
    *  place is remembered and restored by release/close. */
   bool adopt(const std::string &client_uuid, std::uint64_t hwnd, int x, int y, int w = 0, int h = 0);
+  /** Give a window on the desk this frame size, in step with its painting
+   *  (the next resize waits until it has drawn this one; only the newest
+   *  waiting one is applied). False: not on the client's desk. */
+  bool resize(const std::string &client_uuid, std::uint64_t hwnd, int w, int h);
   bool release(const std::string &client_uuid, std::uint64_t hwnd);
   /** Out of the way while the client drags it: just past the desk's right
    *  edge, beyond what any client window shows. Adopt puts it back. */

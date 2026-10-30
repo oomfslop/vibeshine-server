@@ -4098,6 +4098,10 @@ namespace nvhttp {
       write_json(response, {{"status", ok}}, ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_not_found);
       return;
     }
+    if (handle && op_name == "resize" && app_desk::resize(resolve_client_identity_from_request(request).uuid, handle, num("w"), num("h"))) {
+      write_json(response, {{"status", true}});
+      return;
+    }
     host_windows::op_e op;
     if (!handle || !host_windows::parse_op(op_name, op)) {
       write_json(response, {{"status", false}, {"error", "hwnd and a valid op are required"}}, SimpleWeb::StatusCode::client_error_bad_request);
@@ -4244,9 +4248,10 @@ namespace nvhttp {
     };
 #ifdef _WIN32
     {
-      // Diagnostics: the lower frame rate of background windows at work
+      // Diagnostics: cells kept at earlier pixels (windows not as laid out
+      // yet, background windows at a lower frame rate)
       const auto h = desk_hold::stats();
-      out["hold"] = {{"frames", h.frames}, {"matched", h.matched}, {"held", h.held}, {"refreshed", h.refreshed}, {"rect", {h.x, h.y, h.w, h.h}}, {"fps", h.fps}, {"regions", h.regions}};
+      out["hold"] = {{"frames", h.frames}, {"matched", h.matched}, {"known", h.known}, {"held", h.held}, {"refreshed", h.refreshed}, {"unlike", h.unlike}, {"unnumbered", h.unnumbered}, {"rect", {h.x, h.y, h.w, h.h}}, {"fps", h.fps}, {"regions", h.regions}, {"seq", h.seq}};
     }
 #endif
     for (const auto &w : layout.windows) {

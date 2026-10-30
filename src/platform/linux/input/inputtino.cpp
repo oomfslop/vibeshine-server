@@ -69,6 +69,10 @@ namespace platf {
     platf::keyboard::unicode(raw, utf8, size);
   }
 
+  void trackpad_update(client_input_t *input, const trackpad_input_t &trackpad) {
+    // Not supported: the feature flag is not advertised here
+  }
+
   void touch_update(client_input_t *input, const touch_port_t &touch_port, const touch_input_t &touch) {
     auto raw = (client_input_raw_t *) input;
     platf::touch::update(raw, touch_port, touch);

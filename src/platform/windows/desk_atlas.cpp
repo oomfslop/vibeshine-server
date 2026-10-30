@@ -31,16 +31,8 @@ namespace desk_atlas {
      *  shows. A pixel at the far end also changes some time after the slots
      *  did, so the client gets a frame after a change even when nothing else
      *  moves (the desktop sends frames only on change). */
-    constexpr int tick_rows = 8;
-    constexpr int marker_block = 16;
-
-    std::uint16_t marker_code(std::uint16_t seq) {
-      seq &= 0xfff;
-      int bits = 0;
-      for (int i = 0; i < 12; ++i) bits += (seq >> i) & 1;
-      // The check is the inverted bit count: blank (all black) never checks
-      return static_cast<std::uint16_t>(seq | ((~bits & 0xf) << 12));
-    }
+    constexpr int tick_rows = desk_hold::marker_rows;
+    constexpr int marker_block = desk_hold::marker_block;
 
     struct sync_request_t {
       const std::vector<source_t> *sources;
@@ -530,7 +522,7 @@ namespace desk_atlas {
     const int H = monitor_.bottom - monitor_.top;
     // In transition: a code that does not check (frames composed while the
     // pictures change are not drawn)
-    const std::uint16_t code = transition ? 0xffff : marker_code(seq_);
+    const std::uint16_t code = transition ? 0xffff : desk_hold::marker_code(seq_);
     for (int i = 0; i < 16; ++i) {
       if (!marker_[i]) continue;
       DWM_THUMBNAIL_PROPERTIES b {};
@@ -991,32 +983,39 @@ namespace desk_atlas {
         for (long long v : {p.x, p.y, p.w, p.h, p.ax, p.ay}) mix(v);
       }
     }
-    if (sig != last_sig_) {
+    const bool renumber = sig != last_sig_;
+    if (renumber) {
       last_sig_ = sig;
       seq_ = static_cast<std::uint16_t>((seq_ + 1) & 0xfff);
+    }
+    // Every cell, whose picture at which size, for the frames of this layout
+    // (set before any frame can carry its number); windows in the background
+    // at a lower frame rate
+    {
+      std::vector<desk_hold::region_t> regions;
+      for (const auto &[hwnd, item] : items_) {
+        if (!item.black || item.cell.cw <= 0) continue;
+        auto add = [&, hwnd = hwnd](const cell_t &c) {
+          if (c.cw > 0 && c.ch > 0) regions.push_back({RECT {c.x, c.y, c.x + c.cw, c.y + c.ch}, item.divisor, hwnd, item.w, item.h});
+        };
+        add(item.black_at);
+        for (const auto &w : item.wparts) {
+          if (w.thumb) add(w.cell);
+        }
+        for (const auto &p : item.pieces) {
+          if (p.thumb) add(p.cell);
+        }
+      }
+      HWND window = window_;
+      desk_hold::set(monitor_, seq_, std::move(regions), [window](int ms) {
+        PostMessageW(window, hold_message, static_cast<WPARAM>(ms), 0);
+      });
+    }
+    if (renumber) {
       set_marker(false);
       SetTimer(window_, refresh_timer, 40, nullptr);
     } else if (changing) {
       set_marker(false);
-    }
-    // (after the number changed, so a new layout's regions are taken current at once)
-    // Windows in the background at a lower frame rate: their cells
-    {
-      std::vector<desk_hold::region_t> regions;
-      std::uint64_t hsig = seq_;
-      for (const auto &[hwnd, item] : items_) {
-        hsig = (hsig ^ (static_cast<std::uint64_t>(item.w) << 20) ^ item.h) * 1099511628211ull;
-        if (item.divisor <= 1 || !item.black || item.cell.cw <= 0) continue;
-        regions.push_back({RECT {item.black_at.x, item.black_at.y, item.black_at.x + item.black_at.cw, item.black_at.y + item.black_at.ch}, item.divisor});
-        for (const auto &p : item.pieces) {
-          if (p.thumb && p.cell.cw > 0) regions.push_back({RECT {p.cell.x, p.cell.y, p.cell.x + p.cell.cw, p.cell.y + p.cell.ch}, item.divisor});
-        }
-      }
-      for (const auto &r : regions) hsig = (hsig ^ (static_cast<std::uint64_t>(r.rect.left) << 32 | static_cast<std::uint32_t>(r.rect.top)) ^ r.divisor) * 1099511628211ull;
-      HWND window = window_;
-      desk_hold::set(monitor_, hsig, std::move(regions), [window](int ms) {
-        PostMessageW(window, hold_message, static_cast<WPARAM>(ms), 0);
-      });
     }
     return out;
   }

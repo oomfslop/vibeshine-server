@@ -289,6 +289,7 @@ namespace platf {
 
     constexpr caps_t pen_touch = 0x01;  // Pen and touch events
     constexpr caps_t controller_touch = 0x02;  // Controller touch events
+    constexpr caps_t trackpad = 0x04;  // Precision touchpad contacts (Vibeshine)
   };  // namespace platform_caps
 
   struct gamepad_state_t {
@@ -354,6 +355,18 @@ namespace platf {
     float pressureOrDistance;  // Distance for hover and pressure for contact
     float contactAreaMajor;
     float contactAreaMinor;
+  };
+
+  /** Every finger on the client's touchpad (none: all lifted) */
+  struct trackpad_input_t {
+    struct contact_t {
+      std::uint32_t id;
+      float x, y;  ///< 0..1 across and down the touchpad
+    };
+
+    std::uint8_t count = 0;
+    contact_t contacts[5] {};
+    float width = 0, height = 0;  ///< the touchpad's size, in millimeters
   };
 
   struct pen_input_t {
@@ -942,6 +955,14 @@ namespace platf {
    * @param touch The touch event.
    */
   void touch_update(client_input_t *input, const touch_port_t &touch_port, const touch_input_t &touch);
+
+  /**
+   * @brief Send a frame of precision touchpad contacts to the OS: it pans,
+   *        zooms and coasts as with its own touchpad.
+   * @param input The client-specific input context.
+   * @param trackpad The contacts.
+   */
+  void trackpad_update(client_input_t *input, const trackpad_input_t &trackpad);
 
   /**
    * @brief Send a pen event to the OS.

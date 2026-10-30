@@ -497,6 +497,22 @@ namespace platf {
     usbip
   };
 
+  /** SYNTHETIC_DEVICE_CREATION_PARAMS (winuser.h of Windows 11 SDKs newer
+   *  than our headers): for CreateSyntheticPointerDevice2 */
+  struct synthetic_device_params_t {
+    POINTER_INPUT_TYPE pointerType;
+    ULONG maxCount;
+    POINTER_FEEDBACK_MODE feedbackMode;
+    HMONITOR hMonitor;
+    ULONG deviceWidth;  ///< himetric
+    ULONG deviceHeight;
+    DWORD options;
+  };
+
+  constexpr POINTER_INPUT_TYPE pt_touchpad = static_cast<POINTER_INPUT_TYPE>(5);  // PT_TOUCHPAD
+  constexpr DWORD sdco_physical_size = 0x1;  // SDCO_PHYSICAL_SIZE
+  constexpr DWORD sdco_touchpad_gesture_only = 0x2;  // SDCO_TOUCHPAD_GESTURE_ONLY
+
   struct input_raw_t {
     ~input_raw_t() {
       delete vigem;
@@ -514,6 +530,8 @@ namespace platf {
     decltype(CreateSyntheticPointerDevice) *fnCreateSyntheticPointerDevice;
     decltype(InjectSyntheticPointerInput) *fnInjectSyntheticPointerInput;
     decltype(DestroySyntheticPointerDevice) *fnDestroySyntheticPointerDevice;
+    // Precision touchpad devices (Windows 11 builds that have them)
+    HSYNTHETICPOINTERDEVICE(WINAPI *fnCreateSyntheticPointerDevice2)(const struct synthetic_device_params_t *);
   };
 
   /**
@@ -581,6 +599,7 @@ namespace platf {
     raw.fnCreateSyntheticPointerDevice = (decltype(CreateSyntheticPointerDevice) *) GetProcAddress(GetModuleHandleA("user32.dll"), "CreateSyntheticPointerDevice");
     raw.fnInjectSyntheticPointerInput = (decltype(InjectSyntheticPointerInput) *) GetProcAddress(GetModuleHandleA("user32.dll"), "InjectSyntheticPointerInput");
     raw.fnDestroySyntheticPointerDevice = (decltype(DestroySyntheticPointerDevice) *) GetProcAddress(GetModuleHandleA("user32.dll"), "DestroySyntheticPointerDevice");
+    raw.fnCreateSyntheticPointerDevice2 = (decltype(raw.fnCreateSyntheticPointerDevice2)) GetProcAddress(GetModuleHandleA("user32.dll"), "CreateSyntheticPointerDevice2");
 
     return result;
   }
@@ -816,6 +835,9 @@ namespace platf {
       if (touch) {
         global->fnDestroySyntheticPointerDevice(touch);
       }
+      if (trackpad) {
+        global->fnDestroySyntheticPointerDevice(trackpad);
+      }
     }
 
     input_raw_t *global;
@@ -833,6 +855,17 @@ namespace platf {
     POINTER_TYPE_INFO touchInfo[10] {};
     UINT32 activeTouchSlots {};
     std::shared_ptr<pointer_repeat_state_t> touchRepeatState {std::make_shared<pointer_repeat_state_t>()};
+
+    // A precision touchpad (gesture-only: it pans and zooms, the pointer
+    // stays the mouse's): its contacts by slot, the slot being the pointer id
+    HSYNTHETICPOINTERDEVICE trackpad {};
+    ULONG trackpadWidth {}, trackpadHeight {};  ///< himetric
+    struct trackpad_slot_t {
+      bool down = false;
+      std::uint32_t id = 0;
+      POINT at {};  ///< himetric
+    };
+    std::array<trackpad_slot_t, 5> trackpadSlots {};
   };
 
   /**
@@ -1078,6 +1111,86 @@ namespace platf {
 
   // These are edge-triggered pointer state flags that should always be cleared next frame
   constexpr auto EDGE_TRIGGERED_POINTER_FLAGS = POINTER_FLAG_DOWN | POINTER_FLAG_UP | POINTER_FLAG_CANCELED | POINTER_FLAG_UPDATE;
+
+  void trackpad_update(client_input_t *input, const trackpad_input_t &trackpad) {
+    auto raw = (client_input_raw_t *) input;
+    if (!raw->global->fnCreateSyntheticPointerDevice2 || !raw->global->fnInjectSyntheticPointerInput || !raw->global->fnDestroySyntheticPointerDevice) {
+      return;
+    }
+    auto &slots = raw->trackpadSlots;
+    const bool any_down = std::any_of(slots.begin(), slots.end(), [](const auto &s) {
+      return s.down;
+    });
+    const auto width = static_cast<ULONG>(std::lround(trackpad.width * 100.0f));
+    const auto height = static_cast<ULONG>(std::lround(trackpad.height * 100.0f));
+    // A device of the client's touchpad's size (another size: a new one,
+    // between gestures)
+    if (raw->trackpad && !any_down && (raw->trackpadWidth != width || raw->trackpadHeight != height)) {
+      raw->global->fnDestroySyntheticPointerDevice(raw->trackpad);
+      raw->trackpad = nullptr;
+    }
+    if (!raw->trackpad) {
+      if (trackpad.count == 0 || width == 0 || height == 0) {
+        return;
+      }
+      synthetic_device_params_t params {pt_touchpad, static_cast<ULONG>(slots.size()), POINTER_FEEDBACK_NONE, nullptr, width, height, sdco_physical_size | sdco_touchpad_gesture_only};
+      raw->trackpad = raw->global->fnCreateSyntheticPointerDevice2(&params);
+      if (!raw->trackpad) {
+        BOOST_LOG(warning) << "Failed to create a virtual precision touchpad: "sv << GetLastError();
+        return;
+      }
+      BOOST_LOG(info) << "Created a virtual precision touchpad of "sv << trackpad.width << " x "sv << trackpad.height << " mm"sv;
+      raw->trackpadWidth = width;
+      raw->trackpadHeight = height;
+    }
+
+    // Contacts to slots: the same finger keeps its slot
+    std::array<bool, 5> now {};
+    std::array<POINT, 5> at {};
+    for (std::uint8_t i = 0; i < trackpad.count && i < slots.size(); ++i) {
+      const auto &c = trackpad.contacts[i];
+      auto slot = std::find_if(slots.begin(), slots.end(), [&](const auto &s) {
+        return s.down && s.id == c.id;
+      });
+      if (slot == slots.end()) {
+        for (std::size_t k = 0; k < slots.size() && slot == slots.end(); ++k) {
+          if (!slots[k].down && !now[k]) slot = slots.begin() + k;
+        }
+      }
+      if (slot == slots.end()) continue;
+      const auto k = static_cast<std::size_t>(slot - slots.begin());
+      now[k] = true;
+      slot->id = c.id;
+      at[k] = {std::lround(c.x * raw->trackpadWidth), std::lround(c.y * raw->trackpadHeight)};
+    }
+
+    // One frame: the fingers down now, and those lifting (at their last place)
+    POINTER_TYPE_INFO frame[5] {};
+    UINT32 count = 0;
+    const DWORD time = GetTickCount();
+    for (std::size_t k = 0; k < slots.size(); ++k) {
+      if (!now[k] && !slots[k].down) continue;
+      auto &info = frame[count++];
+      info.type = pt_touchpad;
+      auto &p = info.touchInfo.pointerInfo;
+      p.pointerType = pt_touchpad;
+      p.pointerId = static_cast<UINT32>(k);
+      // (down, update and up follow from these, as with a physical touchpad)
+      p.pointerFlags = now[k] ? POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_CONFIDENCE : POINTER_FLAG_CONFIDENCE;
+      p.ptHimetricLocation = now[k] ? at[k] : slots[k].at;
+      p.dwTime = time;
+    }
+    if (count == 0) {
+      return;
+    }
+    if (!inject_synthetic_pointer_input(raw->global, raw->trackpad, frame, count)) {
+      BOOST_LOG(warning) << "Failed to inject virtual touchpad input: "sv << GetLastError();
+    }
+    for (std::size_t k = 0; k < slots.size(); ++k) {
+      slots[k].down = now[k];
+      if (now[k]) slots[k].at = at[k];
+    }
+  }
 
   /**
    * @brief Sends a touch event to the OS.
@@ -2133,6 +2246,11 @@ namespace platf {
     const bool composite_dualsense = config::input.gamepad == "usbip_ds5"sv || dualsense_usbip_gamepad::enabled();
     if (vhf_gamepad::supports_controller_touch(config::input.gamepad, composite_dualsense)) {
       caps |= platform_caps::controller_touch;
+    }
+
+    // Precision touchpad contacts where Windows can take them (Windows 11)
+    if (GetProcAddress(GetModuleHandleA("user32.dll"), "CreateSyntheticPointerDevice2") != nullptr) {
+      caps |= platform_caps::trackpad;
     }
 
     // We support pen and touch input on Win10 1809+

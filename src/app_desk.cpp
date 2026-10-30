@@ -58,6 +58,8 @@ namespace app_desk {
       std::set<HWND> seen;  ///< app windows anywhere on the host at the last look (new ones are adopted)
       bool seen_once = false;
       std::chrono::steady_clock::time_point seen_at {};
+      HWND foreground = nullptr;  ///< the foreground window at the last look
+      RECT foreground_frame {};  ///< its frame, when it was on the desk (else empty)
       bool open = false;  ///< a client is using it (false = idle, kept for a while)
       std::chrono::steady_clock::time_point idle_since {};
       unsigned idle_generation = 0;
@@ -227,7 +229,7 @@ namespace app_desk {
     /** Put the window's frame (DWM bounds, without the invisible resize
      *  borders) at x, y and, with w and h, give it that size in the same
      *  step: a resize from the left or top never shows the window shifted. */
-    void move_frame_to(HWND hwnd, int x, int y, int w = 0, int h = 0) {
+    void move_frame_to(HWND hwnd, int x, int y, int w = 0, int h = 0, bool async = true) {
       RECT frame {}, win {};
       int dx = 0, dy = 0, dw = 0, dh = 0;
       if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) && GetWindowRect(hwnd, &win)) {
@@ -238,8 +240,134 @@ namespace app_desk {
       }
       const bool sized = w > 0 && h > 0;
       SetWindowPos(hwnd, nullptr, x - dx, y - dy, sized ? w + dw : 0, sized ? h + dh : 0,
-                   (sized ? 0 : SWP_NOSIZE) | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                   (sized ? 0 : SWP_NOSIZE) | SWP_NOZORDER | SWP_NOACTIVATE | (async ? SWP_ASYNCWINDOWPOS : 0));
     }
+
+    /** Resizes in step with the app's painting. A window counts as painted
+     *  at a size once it has been redrawn at it: Win32 apps paint when asked
+     *  (RedrawWindow with RDW_UPDATENOW returns when they have), a window
+     *  without a redirection surface (WinUI, XAML, swap chains) renders on a
+     *  thread of its own over the next compositions. While a resize the
+     *  client asked for is being painted, the next one waits and only the
+     *  newest is applied after: a live resize goes at the app's own pace,
+     *  and every size the window passes through gets drawn whole (the client
+     *  shows a window's picture while it is painted at its size). */
+    namespace paint_sync {
+      struct state_t {
+        int w = 0, h = 0;  ///< its size at the last look
+        int pw = -1, ph = -1;  ///< the size it is known painted at
+        std::chrono::steady_clock::time_point changed;  ///< its size last changed
+        std::function<void()> pending;  ///< the newest resize asked for meanwhile
+        bool busy = false;  ///< a worker is on it
+        bool shown = false;  ///< a layout has said it is painted at its size
+        std::chrono::steady_clock::time_point retry_at;  ///< not answering: looked at again then
+      };
+
+      std::mutex g_paint_mutex;
+      std::map<HWND, state_t> g_paints;
+
+      void work(HWND hwnd);
+
+      /** Under g_paint_mutex: a worker for it, unless one runs */
+      void start(HWND hwnd, state_t &st) {
+        if (st.busy) return;
+        st.busy = true;
+        std::thread(work, hwnd).detach();
+      }
+
+      void work(HWND hwnd) {
+        for (;;) {
+          std::function<void()> apply;
+          {
+            std::lock_guard l(g_paint_mutex);
+            apply = std::move(g_paints[hwnd].pending);
+            g_paints[hwnd].pending = nullptr;
+          }
+          if (!IsWindow(hwnd)) break;
+          // A window that does not answer is not waited for (its stable comes
+          // from the timeout in stable() instead)
+          DWORD_PTR answer = 0;
+          if (IsHungAppWindow(hwnd) || !SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 200, &answer)) {
+            std::lock_guard l(g_paint_mutex);
+            auto &st = g_paints[hwnd];
+            st.busy = false;
+            st.retry_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            if (!st.pending) st.pending = std::move(apply);  // tried again then
+            return;
+          }
+          // Synchronous: returns once the window has taken its new size
+          if (apply) apply();
+          RECT painted {};
+          if (!app_window_layout::frame_rect(hwnd, painted)) break;
+          RedrawWindow(hwnd, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
+          const bool composed = GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_NOREDIRECTIONBITMAP;
+          for (int i = 0; i < (composed ? 3 : 1); ++i) DwmFlush();
+          {
+            std::lock_guard l(g_paint_mutex);
+            auto &st = g_paints[hwnd];
+            const int pw = painted.right - painted.left, ph = painted.bottom - painted.top;
+            RECT now {};
+            if (app_window_layout::frame_rect(hwnd, now) && now.right - now.left == pw && now.bottom - now.top == ph) {
+              st.pw = pw;
+              st.ph = ph;
+              st.shown = false;
+            }
+            if (!st.pending && st.pw == pw && st.ph == ph) {
+              st.busy = false;
+              return;
+            }
+          }
+          // Another resize waits: this size goes out first, in a layout and
+          // a composition (so the client gets each painted size)
+          for (int i = 0; i < 50; ++i) {
+            {
+              std::lock_guard l(g_paint_mutex);
+              if (g_paints[hwnd].shown) break;
+            }
+            Sleep(1);
+          }
+          DwmFlush();
+        }
+        std::lock_guard l(g_paint_mutex);
+        g_paints.erase(hwnd);
+      }
+
+      /** A resize the client asked for (`apply` sets the window's size,
+       *  synchronously): now, or after the one being painted */
+      void resize(HWND hwnd, std::function<void()> apply) {
+        std::lock_guard l(g_paint_mutex);
+        auto &st = g_paints[hwnd];
+        st.pending = std::move(apply);
+        start(hwnd, st);
+      }
+
+      /** Layout: painted at its size w x h? (a window that does not answer
+       *  counts as painted after a while) */
+      bool stable(HWND hwnd, int w, int h) {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard l(g_paint_mutex);
+        auto &st = g_paints[hwnd];
+        if (st.w != w || st.h != h) {
+          st.w = w;
+          st.h = h;
+          st.changed = now;
+        }
+        if (st.pw == w && st.ph == h) {
+          st.shown = true;
+          return true;
+        }
+        if (now >= st.retry_at) start(hwnd, st);  // resized by something else, or not answering before
+        return now - st.changed > std::chrono::milliseconds(400);
+      }
+
+      /** Layout: forget windows no longer on the desk */
+      void keep_only(const std::set<HWND> &present) {
+        std::lock_guard l(g_paint_mutex);
+        std::erase_if(g_paints, [&](const auto &e) {
+          return !e.second.busy && !present.contains(e.first);
+        });
+      }
+    }  // namespace paint_sync
 
     /** A window that crosses to a display of another DPI gets WM_DPICHANGED
      *  with a suggested, scaled frame; some apps (Explorer) take it, some
@@ -1033,10 +1161,21 @@ namespace app_desk {
         x = static_cast<int>(std::clamp<LONG>(x, -(fw - 8), std::max<LONG>(-(fw - 8), dw - 8)));
         y = static_cast<int>(std::clamp<LONG>(y, 0, std::max<LONG>(0, dh - 8)));
       }
-      move_frame_to(hwnd, rect.left + x, rect.top + y, w, h);
+      if (w > 0 && h > 0) {
+        // A resize from the left or top: in step with the app's painting
+        const LONG dx = rect.left + x, dy = rect.top + y;
+        paint_sync::resize(hwnd, [hwnd, dx, dy, w, h] {
+          move_frame_to(hwnd, dx, dy, w, h, false);
+        });
+      } else {
+        move_frame_to(hwnd, rect.left + x, rect.top + y);
+      }
       return true;
     }
     if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+    // Maximized elsewhere: maximized on the desk (moved as its normal self)
+    const bool zoomed = IsZoomed(hwnd);
+    if (zoomed) ShowWindow(hwnd, SW_RESTORE);
     RECT frame {};
     if (!app_window_layout::frame_rect(hwnd, frame)) return false;
     // A window first seen on the desk itself (it opened there, or is parked
@@ -1049,6 +1188,11 @@ namespace app_desk {
     x = static_cast<int>(std::max<LONG>(0, std::min<LONG>(x, dw - std::min(fw, dw))));
     y = static_cast<int>(std::max<LONG>(0, std::min<LONG>(y, dh - std::min(fh, dh))));
     move_frame_to(hwnd, rect.left + x, rect.top + y);
+    if (zoomed) {
+      // (queued after the move, which goes through the window's thread too)
+      ShowWindowAsync(hwnd, SW_MAXIMIZE);
+      return true;
+    }
     // Coming from a display of another DPI it is resized once it is here:
     // then it goes back inside what the client shows (the work area), made
     // smaller if it has outgrown it, as macOS keeps windows within the screen
@@ -1135,6 +1279,22 @@ namespace app_desk {
     return true;
   }
 
+  bool resize(const std::string &client_uuid, std::uint64_t handle, int w, int h) {
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    if (!IsWindow(hwnd) || w <= 0 || h <= 0) return false;
+    {
+      std::lock_guard lock(g_mutex);
+      auto it = g_desks.find(client_uuid);
+      if (it == g_desks.end() || !it->second.open || !it->second.adopted.contains(hwnd)) return false;
+    }
+    paint_sync::resize(hwnd, [hwnd, w, h] {
+      RECT frame {};
+      if (!app_window_layout::frame_rect(hwnd, frame)) return;
+      move_frame_to(hwnd, frame.left, frame.top, w, h, false);
+    });
+    return true;
+  }
+
   bool release(const std::string &client_uuid, std::uint64_t handle) {
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
     std::lock_guard lock(g_mutex);
@@ -1156,12 +1316,18 @@ namespace app_desk {
      *  lands where Windows puts it, usually on the host's own display: it
      *  comes to the desk, cascaded from that app's front window, so it shows
      *  on the client like the others. Only new windows of processes already
-     *  on the desk; looked for at most ten times a second. */
+     *  on the desk; looked for at most ten times a second.
+     *
+     *  Likewise a window already open elsewhere that takes the foreground
+     *  from a desk window (a file opened from the desk goes to an app's
+     *  existing window): the user is working with it now. */
     void adopt_new_windows(const std::string &client_uuid) {
       RECT desk {}, work {};
       std::set<DWORD> pids;
       std::set<HWND> seen;
       bool first = false;
+      HWND fg_before = nullptr;
+      RECT fg_before_frame {};
       std::map<DWORD, RECT> front_of;  // pid -> frame of its top-most window on the desk
       {
         std::lock_guard lock(g_mutex);
@@ -1181,6 +1347,8 @@ namespace app_desk {
         }
         seen = it->second.seen;
         first = !it->second.seen_once;
+        fg_before = it->second.foreground;
+        fg_before_frame = it->second.foreground_frame;
       }
       struct ctx_t {
         std::vector<std::pair<HWND, DWORD>> windows;
@@ -1223,15 +1391,39 @@ namespace app_desk {
         py = std::clamp<LONG>(py, work.top, std::max<LONG>(work.top, work.bottom - h));
         to_adopt.push_back({hwnd, {px - desk.left, py - desk.top}});
       }
+      // The foreground went from a desk window to one elsewhere
+      HWND fg = GetForegroundWindow();
+      RECT fg_frame {};
+      {
+        RECT x {};
+        if (!fg || !app_window_layout::frame_rect(fg, fg_frame) || !IntersectRect(&x, &fg_frame, &desk)) fg_frame = {};
+      }
+      if (fg && fg != fg_before && !IsRectEmpty(&fg_before_frame) && IsRectEmpty(&fg_frame)) {
+        const bool app_window = std::any_of(ctx.windows.begin(), ctx.windows.end(), [&](const auto &e) {
+          return e.first == fg;
+        });
+        RECT r {};
+        const bool queued = std::any_of(to_adopt.begin(), to_adopt.end(), [&](const auto &e) {
+          return e.first == fg;
+        });
+        if (app_window && !queued && app_window_layout::frame_rect(fg, r)) {
+          const LONG w = r.right - r.left, h = r.bottom - r.top;
+          const LONG px = std::clamp<LONG>(fg_before_frame.left + 48, work.left, std::max<LONG>(work.left, work.right - w));
+          const LONG py = std::clamp<LONG>(fg_before_frame.top + 48, work.top, std::max<LONG>(work.top, work.bottom - h));
+          to_adopt.push_back({fg, {px - desk.left, py - desk.top}});
+        }
+      }
       {
         std::lock_guard lock(g_mutex);
         auto it = g_desks.find(client_uuid);
         if (it == g_desks.end()) return;
         it->second.seen = std::move(now_seen);
         it->second.seen_once = true;
+        it->second.foreground = fg;
+        it->second.foreground_frame = fg_frame;
       }
       for (const auto &[hwnd, at] : to_adopt) {
-        BOOST_LOG(info) << "Desk: new window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec << " of an app on the desk; bringing it over";
+        BOOST_LOG(info) << "Desk: window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec << " is new to an app on the desk or took the foreground from it; bringing it over";
         adopt(client_uuid, reinterpret_cast<std::uintptr_t>(hwnd), at.x, at.y);
       }
     }
@@ -1528,73 +1720,16 @@ namespace app_desk {
       }
     }
     for (std::size_t i = 0; i < out.windows.size(); ++i) out.windows[i].z = static_cast<int>(i);
-    // Painted at their size? After a resize a window is repainted right away
-    // (Win32 apps paint synchronously on request; composition-based ones get
-    // four compositions), then counts as stable at that size.
+    // Painted at their size? (see paint_sync)
     {
-      struct paint_t {
-        int w = 0, h = 0;  ///< its size now
-        int pw = -1, ph = -1;  ///< the size it is known painted at
-        std::chrono::steady_clock::time_point changed;
-        bool busy = false;
-      };
-      static std::mutex paint_mutex;
-      static std::map<HWND, paint_t> paints;
-      const auto now = std::chrono::steady_clock::now();
-      std::lock_guard plock(paint_mutex);
       std::set<HWND> present;
       for (auto &w : out.windows) {
         if (w.kind == "popup" || w.state == "minimized") continue;
         const auto hwnd = reinterpret_cast<HWND>(w.handle);
         present.insert(hwnd);
-        auto &p = paints[hwnd];
-        if (p.w != w.rect[2] || p.h != w.rect[3]) {
-          p.w = w.rect[2];
-          p.h = w.rect[3];
-          p.changed = now;
-          if (!p.busy) {
-            p.busy = true;
-            std::thread([hwnd] {
-              for (;;) {
-                int tw, th;
-                {
-                  std::lock_guard l(paint_mutex);
-                  tw = paints[hwnd].w;
-                  th = paints[hwnd].h;
-                }
-                if (!IsWindow(hwnd)) break;
-                // A window that does not answer is not waited for (its
-                // stable comes from the timeout below instead)
-                DWORD_PTR answer = 0;
-                if (IsHungAppWindow(hwnd) || !SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 200, &answer)) {
-                  std::lock_guard l(paint_mutex);
-                  paints[hwnd].busy = false;
-                  return;
-                }
-                RedrawWindow(hwnd, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
-                // Composition-based apps (WinUI, XAML) render on their own
-                // thread a few compositions after they took the new size
-                for (int i = 0; i < 4; ++i) DwmFlush();
-                std::lock_guard l(paint_mutex);
-                auto &q = paints[hwnd];
-                if (q.w == tw && q.h == th) {
-                  q.pw = tw;
-                  q.ph = th;
-                  q.busy = false;
-                  return;
-                }
-              }
-              std::lock_guard l(paint_mutex);
-              paints.erase(hwnd);
-            }).detach();
-          }
-        }
-        // A window that does not answer counts as painted after a while
-        w.stable = (p.pw == p.w && p.ph == p.h) || now - p.changed > std::chrono::milliseconds(400);
+        w.stable = paint_sync::stable(hwnd, w.rect[2], w.rect[3]);
       }
-      std::erase_if(paints, [&](const auto &e) {
-        return !e.second.busy && !present.contains(e.first);
-      });
+      paint_sync::keep_only(present);
     }
     // Their pictures: a slot each in the atlas (the copy on white for popups,
     // whose transparency matters: menus with their shadows, tooltips)
@@ -1854,6 +1989,10 @@ namespace app_desk {
   }
 
   bool adopt(const std::string &, std::uint64_t, int, int, int, int) {
+    return false;
+  }
+
+  bool resize(const std::string &, std::uint64_t, int, int) {
     return false;
   }
 
