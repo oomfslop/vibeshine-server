@@ -4147,6 +4147,8 @@ namespace nvhttp {
       app_desk::options_t options;
       options.unfocused_divisor = num("unfocused", 1);
       options.skip_covered = num("covered", 0) == 0;
+      options.atlas_w = num("atlas_w", 0);
+      options.atlas_h = num("atlas_h", 0);
       const auto desk = app_desk::open(uuid, num("w", 0), num("h", 0), num("fps", 60), num("dpi", 96), options);
       if (!desk.valid) {
         write_json(response, {{"status", false}, {"error", "the desk display could not be created"}}, SimpleWeb::StatusCode::server_error_service_unavailable);

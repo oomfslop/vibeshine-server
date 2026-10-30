@@ -973,15 +973,21 @@ namespace app_desk {
       g_desks.erase(client_uuid);
       return {};
     }
-    // The atlas, what the session streams: 3840x2160 whatever the desk. That
-    // is what the client's hardware decoder keeps up with at 120 fps (measured
-    // on Apple silicon: 4096x2304 decodes in 12 ms instead of 8 and adds ~2 ms
-    // glass to glass; taller shapes like 3056x2704 drop to software decoding,
-    // ~80 ms). With a catalog the desk's mode, which is 3840x2160 here too.
+    // The atlas, what the session streams: 3840x2160 whatever the desk, or
+    // smaller where the client asks (a slow link, windows drawn at 1x). No
+    // larger: that is what the client's hardware decoder keeps up with at
+    // 120 fps (measured on Apple silicon: 4096x2304 decodes in 12 ms instead
+    // of 8 and adds ~2 ms glass to glass; taller shapes like 3056x2704 drop to
+    // software decoding, ~80 ms). With a catalog the desk's mode, which is
+    // 3840x2160 here too.
     int aw = w, ah = h, afps = fps;
     if (custom) {
       aw = 3840;
       ah = 2160;
+      if (options.atlas_w > 0 && options.atlas_h > 0) {
+        aw = std::clamp(options.atlas_w & ~1, 1280, 3840);
+        ah = std::clamp(options.atlas_h & ~1, 720, 2160);
+      }
     }
     const int want_aw = aw, want_ah = ah;
     RECT atlas_rect {};

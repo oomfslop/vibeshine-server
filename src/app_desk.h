@@ -33,6 +33,7 @@ namespace app_desk {
   struct options_t {
     int unfocused_divisor = 1;  ///< windows other than the focused one (and its popups, dialogs) at 1/n of the frame rate: 1, 2, 4, 8
     bool skip_covered = true;  ///< windows covered whole by others are not in the stream (the client keeps their last picture)
+    int atlas_w = 0, atlas_h = 0;  ///< the atlas (what is streamed) at this size; 0: 3840x2160. Smaller saves bandwidth on slow links (fewer pixels to fill when windows change)
   };
 
   /** Make sure the client's desk exists with this size (host px), refresh rate
