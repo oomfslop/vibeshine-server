@@ -4209,9 +4209,9 @@ namespace nvhttp {
         const auto desk = app_desk::get(uuid);
         const int fps = desk && desk->fps > 0 ? desk->fps : 60;
         // (frames; "delay" overrides it for experiments)
-        double frames = 2.5;
+        double frames = 0;  // frames carry their layout number now
         try {
-          frames = std::clamp(std::stod(get_arg(args, "delay", "2.5")), 0.0, 30.0);
+          frames = std::clamp(std::stod(get_arg(args, "delay", "0")), 0.0, 30.0);
         } catch (...) {
         }
         taken += static_cast<std::uint32_t>(90000 * frames / fps);
@@ -4229,6 +4229,7 @@ namespace nvhttp {
       {"ts", taken},
       {"cursor", layout.cursor},
       {"atlas_us", layout.atlas_us},
+      {"seq", layout.seq},
       {"hard_repacks", layout.hard_repacks},
       {"ghosts", layout.ghosts},
     };

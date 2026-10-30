@@ -95,6 +95,11 @@ namespace desk_atlas {
       return ghost_count_;
     }
 
+    /** The layout number the atlas shows (changes with the slots) */
+    unsigned seq() const {
+      return seq_;
+    }
+
   private:
     struct cell_t {
       int x = 0, y = 0, cw = 0, ch = 0;  ///< capacity rect (atlas client coordinates)
@@ -164,6 +169,7 @@ namespace desk_atlas {
     double last_area_ = 0;  ///< what the windows asked for at the last sync
     std::vector<retired_t> retired_;  ///< thumbnails left where they were, for a while
     bool tick_ = false;  ///< the refresh pixel's state
+    std::uint16_t seq_ = 0;  ///< the layout number painted in the atlas
     std::uint64_t last_sig_ = 0;  ///< the slots at the last sync
     unsigned hard_repacks_ = 0;
     std::size_t ghost_count_ = 0;

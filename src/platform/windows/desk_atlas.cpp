@@ -20,11 +20,22 @@ namespace desk_atlas {
     constexpr UINT_PTR topmost_timer = 1;
     constexpr UINT_PTR refresh_timer = 2;
 
-    /** Rows at the bottom no picture uses: a pixel there changes some time
-     *  after the slots did, so the client gets a frame its newest layout
-     *  surely covers (the desktop sends frames only on change, and a frame
-     *  drawn with the wrong layout would otherwise stay up) */
-    constexpr int tick_rows = 2;
+    /** Rows at the bottom no picture uses. They carry the frame's layout
+     *  number: 16 blocks of 16 px, black or white, a 12-bit sequence and a
+     *  4-bit check (its bit count), changed together with the slots right
+     *  after a composition, so every frame says exactly which layout it
+     *  shows. A pixel at the far end also changes some time after the slots
+     *  did, so the client gets a frame after a change even when nothing else
+     *  moves (the desktop sends frames only on change). */
+    constexpr int tick_rows = 8;
+    constexpr int marker_block = 16;
+
+    std::uint16_t marker_code(std::uint16_t seq) {
+      seq &= 0xfff;
+      int bits = 0;
+      for (int i = 0; i < 12; ++i) bits += (seq >> i) & 1;
+      return static_cast<std::uint16_t>(seq | ((bits & 0xf) << 12));
+    }
 
     struct sync_request_t {
       const std::vector<source_t> *sources;
@@ -124,7 +135,7 @@ namespace desk_atlas {
             self->tick_ = !self->tick_;
             RECT client {};
             GetClientRect(hwnd, &client);
-            RECT pixel {0, client.bottom - 1, 1, client.bottom};
+            RECT pixel {client.right - 1, client.bottom - 1, client.right, client.bottom};
             InvalidateRect(hwnd, &pixel, FALSE);
             UpdateWindow(hwnd);
           }
@@ -190,8 +201,13 @@ namespace desk_atlas {
     GetClientRect(window_, &client);
     FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
     for (const auto &r : white_) FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    const std::uint16_t code = marker_code(seq_);
+    for (int i = 0; i < 16; ++i) {
+      const RECT block {i * marker_block, client.bottom - tick_rows, (i + 1) * marker_block, client.bottom};
+      FillRect(dc, &block, static_cast<HBRUSH>(GetStockObject((code >> i) & 1 ? WHITE_BRUSH : BLACK_BRUSH)));
+    }
     if (tick_) {
-      const RECT pixel {0, client.bottom - 1, 1, client.bottom};
+      const RECT pixel {client.right - 1, client.bottom - 1, client.right, client.bottom};
       FillRect(dc, &pixel, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
     }
   }
@@ -754,6 +770,9 @@ namespace desk_atlas {
       }
       hard = !soft;
       if (hard) ++hard_repacks_;
+      // Right after a composition: the changes below (and the layout number
+      // painted with them) all land in the same next one
+      DwmFlush();
       // A picture that changed place gets a new thumbnail there; the old one
       // stays where it was for a while (hard: goes now)
       auto leave = [&](HWND hwnd, HTHUMBNAIL &thumb, const cell_t &at, bool white, bool whole) {
@@ -845,6 +864,12 @@ namespace desk_atlas {
     }
     if (sig != last_sig_) {
       last_sig_ = sig;
+      seq_ = static_cast<std::uint16_t>((seq_ + 1) & 0xfff);
+      RECT client {};
+      GetClientRect(window_, &client);
+      const RECT strip {0, client.bottom - tick_rows, 16 * marker_block, client.bottom};
+      InvalidateRect(window_, &strip, FALSE);
+      UpdateWindow(window_);
       SetTimer(window_, refresh_timer, 40, nullptr);
     }
     return out;

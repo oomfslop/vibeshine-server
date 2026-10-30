@@ -92,6 +92,7 @@ namespace app_desk {
     std::uint64_t etag = 0;
     int atlas_us = 0;  ///< what syncing the atlas took (diagnostics)
     bool moved = false;  ///< a picture changed place in the atlas
+    unsigned seq = 0;  ///< the layout number frames showing this layout carry
     unsigned hard_repacks = 0;  ///< diagnostics
     int ghosts = 0;
   };

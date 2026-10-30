@@ -1511,6 +1511,7 @@ namespace app_desk {
       const auto sync_start = std::chrono::steady_clock::now();
       const auto slots = atlas->sync(sources, &out.moved);
       out.hard_repacks = atlas->hard_repacks();
+      out.seq = atlas->seq();
       out.ghosts = static_cast<int>(atlas->ghosts());
       out.atlas_us = static_cast<int>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - sync_start).count());
       for (const auto &slot : slots) {
