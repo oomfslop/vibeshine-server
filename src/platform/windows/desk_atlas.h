@@ -123,6 +123,7 @@ namespace desk_atlas {
       cell_t black_at, white_at;  ///< where its thumbnails draw it
       double black_scale = 1.0;  ///< the scale its thumbnail draws it at
       cell_t full_at;  ///< where it was last drawn whole at 1:1 (its parts can go back there, pixel for pixel)
+      std::chrono::steady_clock::time_point resizing_until;  ///< being resized until then (more room)
       bool loose = false;  ///< its pieces only where room is left
     };
 

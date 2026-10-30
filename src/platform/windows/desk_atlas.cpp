@@ -38,9 +38,14 @@ namespace desk_atlas {
 
     /** Capacity for a window: a little room to grow in a live resize before
      *  it needs another slot (a step that outgrows its slot moves it). */
-    int capacity(int size, int limit, bool room) {
-      return std::min(limit, room ? (size + 64 + 15) / 16 * 16 : (size + 7) / 8 * 8);
+    int capacity(int size, int limit, bool room, int extra = 64) {
+      return std::min(limit, room ? (size + extra + 15) / 16 * 16 : (size + 7) / 8 * 8);
     }
+
+    /** A window whose size changed this recently is being resized: it gets a
+     *  lot of room, so its picture keeps its cell while it grows */
+    constexpr auto resize_time = std::chrono::milliseconds(1000);
+    constexpr int resize_room = 512;
 
     bool overlaps(int x, int y, int w, int h, int ox, int oy, int ow, int oh) {
       return x < ox + ow && ox < x + w && y < oy + oh && oy < y + h;
@@ -450,7 +455,9 @@ namespace desk_atlas {
                         item.cell.ch >= static_cast<int>(std::ceil(s.h * item.scale)) && item.has_white == s.alpha &&
                         (!s.alpha || (item.white_cell.cw >= static_cast<int>(std::ceil(s.w * item.scale * white_ratio)) + 2 * white_inset &&
                                       item.white_cell.ch >= static_cast<int>(std::ceil(s.h * item.scale * white_ratio)) + 2 * white_inset));
-      const bool shrunk_far = item.black && item.scale == 1.0 && item.cell.cw > capacity(s.w, W, true) * 2 && item.cell.ch > capacity(s.h, H, true) * 2;
+      if (item.black && (item.w != s.w || item.h != s.h)) item.resizing_until = now + resize_time;
+      const bool resizing = now < item.resizing_until;
+      const bool shrunk_far = !resizing && item.black && item.scale == 1.0 && item.cell.cw > capacity(s.w, W, true) * 2 && item.cell.ch > capacity(s.h, H, true) * 2;
       if (!fits || shrunk_far) to_place.push_back(s.hwnd);
       else if (moved_origin || item.w != s.w || item.h != s.h) {
         item.w = s.w;
@@ -546,7 +553,8 @@ namespace desk_atlas {
       auto place_item = [&](HWND hwnd, item_t &item, double scale, int pieces = 2) {
         // Windows get a little room to grow (live resizes); popups never resize
         const bool room = !item.has_white;
-        const int cw = capacity(static_cast<int>(std::ceil(item.w * scale)), W, room), ch = capacity(static_cast<int>(std::ceil(item.h * scale)), H, room);
+        const int extra = now < item.resizing_until ? resize_room : 64;
+        const int cw = capacity(static_cast<int>(std::ceil(item.w * scale)), W, room, extra), ch = capacity(static_cast<int>(std::ceil(item.h * scale)), H, room, extra);
         const int wcw = capacity(static_cast<int>(std::ceil(item.w * scale * white_ratio)) + 2 * white_inset, W, false), wch = capacity(static_cast<int>(std::ceil(item.h * scale * white_ratio)) + 2 * white_inset, H, false);
         std::vector<cell_t> trial = taken;
         cell_t cell, white;
