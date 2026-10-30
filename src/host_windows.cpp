@@ -230,6 +230,56 @@ namespace host_windows {
     return {};
   }
 
+  std::vector<std::string> list_all() {
+    std::vector<std::string> out;
+    const HWND foreground = GetForegroundWindow();
+    EnumWindows([](HWND hwnd, LPARAM param) -> BOOL {
+      auto &out = *reinterpret_cast<std::vector<std::string> *>(param);
+      wchar_t cls[128] {}, title[128] {};
+      GetClassNameW(hwnd, cls, 128);
+      GetWindowTextW(hwnd, title, 128);
+      DWORD pid = 0;
+      GetWindowThreadProcessId(hwnd, &pid);
+      RECT r {};
+      GetWindowRect(hwnd, &r);
+      DWORD cloaked = 0;
+      DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+      char line[1024];
+      snprintf(line, sizeof(line), "0x%llx vis=%d cloak=%lu owner=0x%llx style=0x%lx ex=0x%lx rect=%ld,%ld %ldx%ld pid=%lu", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(hwnd)), IsWindowVisible(hwnd) ? 1 : 0, cloaked,
+               static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(GetWindow(hwnd, GW_OWNER))), GetWindowLongW(hwnd, GWL_STYLE), GetWindowLongW(hwnd, GWL_EXSTYLE), r.left, r.top, r.right - r.left, r.bottom - r.top, pid);
+      out.push_back(std::string(line) + " cls=" + utf_utils::to_utf8(std::wstring(cls)) + " title=" + utf_utils::to_utf8(std::wstring(title)) + " exe=" + utf_utils::to_utf8(std::filesystem::path(process_image(pid)).filename().wstring()));
+      return TRUE;
+    },
+                reinterpret_cast<LPARAM>(&out));
+    char fg[64];
+    snprintf(fg, sizeof(fg), "fg=0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(foreground)));
+    std::string fg_line = fg;
+    if (foreground) {
+      // Windows in other z-order bands (system UI) are not enumerated: the
+      // foreground one is shown here regardless
+      wchar_t cls[128] {}, title[128] {};
+      GetClassNameW(foreground, cls, 128);
+      GetWindowTextW(foreground, title, 128);
+      DWORD pid = 0;
+      GetWindowThreadProcessId(foreground, &pid);
+      RECT r {};
+      GetWindowRect(foreground, &r);
+      DWORD band = 0;
+      using get_band_t = BOOL(WINAPI *)(HWND, DWORD *);
+      if (auto get_band = reinterpret_cast<get_band_t>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetWindowBand"))) get_band(foreground, &band);
+      char line[512];
+      snprintf(line, sizeof(line), " band=%lu vis=%d rect=%ld,%ld %ldx%ld pid=%lu owner=0x%llx", band, IsWindowVisible(foreground) ? 1 : 0, r.left, r.top, r.right - r.left, r.bottom - r.top, pid, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(GetWindow(foreground, GW_OWNER))));
+      fg_line += std::string(line) + " cls=" + utf_utils::to_utf8(std::wstring(cls)) + " title=" + utf_utils::to_utf8(std::wstring(title)) + " exe=" + utf_utils::to_utf8(std::filesystem::path(process_image(pid)).filename().wstring());
+    }
+    // Which enumerations see it
+    bool by_find = false, by_walk = false;
+    for (HWND h = FindWindowExW(nullptr, nullptr, nullptr, nullptr); h; h = FindWindowExW(nullptr, h, nullptr, nullptr)) by_find = by_find || h == foreground;
+    for (HWND h = GetTopWindow(nullptr); h; h = GetWindow(h, GW_HWNDNEXT)) by_walk = by_walk || h == foreground;
+    fg_line += std::string(" find=") + (by_find ? "1" : "0") + " walk=" + (by_walk ? "1" : "0");
+    out.insert(out.begin(), fg_line);
+    return out;
+  }
+
   std::vector<window_info_t> list() {
     std::vector<window_info_t> out;
     const HWND foreground = GetForegroundWindow();
@@ -502,6 +552,10 @@ namespace host_windows {
   }
 
   std::vector<window_info_t> list() {
+    return {};
+  }
+
+  std::vector<std::string> list_all() {
     return {};
   }
 

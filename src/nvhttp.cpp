@@ -4008,6 +4008,12 @@ namespace nvhttp {
     print_req<SunshineHTTPS>(request);
     if (!windows_request_allowed(response, request, "list")) return;
     nlohmann::json out;
+    auto args = request->parse_query_string();
+    if (get_arg(args, "all", "0") == "1") {
+      out["all"] = host_windows::list_all();
+      write_json(response, out);
+      return;
+    }
     out["windows"] = nlohmann::json::array();
     for (const auto &w : host_windows::list()) {
       char handle[32];

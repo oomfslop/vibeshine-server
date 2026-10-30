@@ -49,6 +49,8 @@ namespace host_windows {
   /** Raw window rect (GetWindowRect, includes invisible resize borders): what WGC captures. */
   bool window_rect(std::uint64_t handle, int out[4]);
   std::vector<window_info_t> list();
+  /** Diagnostics: every top-level window, unfiltered, as JSON-ready lines */
+  std::vector<std::string> list_all();
   /** PNG bytes of the window's icon (large), empty when unavailable. */
   std::string icon_png(std::uint64_t handle);
   /** Stable cache key of the window's icon ("" when none): equal keys mean equal pictures. */

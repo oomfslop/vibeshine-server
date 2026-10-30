@@ -1293,7 +1293,7 @@ namespace app_desk {
       std::vector<raw_t> top_first;
     } ctx {desk, {}};
     const DWORD self = GetCurrentProcessId();
-    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+    constexpr auto visit = [](HWND hwnd, LPARAM lp) -> BOOL {
       auto *c = reinterpret_cast<ctx_t *>(lp);
       if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || app_window_layout::is_cloaked(hwnd)) return TRUE;
       RECT r {};
@@ -1316,8 +1316,28 @@ namespace app_desk {
       raw.tid = GetWindowThreadProcessId(hwnd, &raw.pid);
       c->top_first.push_back(raw);
       return TRUE;
-    },
-                reinterpret_cast<LPARAM>(&ctx));
+    };
+    EnumWindows(visit, reinterpret_cast<LPARAM>(&ctx));
+    // System UI in z-order bands of its own (the "Open with" dialog, ...) is
+    // not enumerated by EnumWindows; FindWindowEx walks those too. They stack
+    // above the desktop's windows.
+    {
+      std::set<HWND> seen;
+      for (const auto &r : ctx.top_first) seen.insert(r.hwnd);
+      ctx_t extra {ctx.desk, {}};
+      for (HWND h = FindWindowExW(nullptr, nullptr, nullptr, nullptr); h; h = FindWindowExW(nullptr, h, nullptr, nullptr)) {
+        if (!seen.contains(h)) visit(h, reinterpret_cast<LPARAM>(&extra));
+      }
+      // Only windows outside the desktop band: the rest EnumWindows saw (or
+      // left out on purpose)
+      std::erase_if(extra.top_first, [](const raw_t &r) {
+        using get_band_t = BOOL(WINAPI *)(HWND, DWORD *);
+        static const auto get_band = reinterpret_cast<get_band_t>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetWindowBand"));
+        DWORD band = 1;
+        return !get_band || !get_band(r.hwnd, &band) || band <= 1;
+      });
+      ctx.top_first.insert(ctx.top_first.begin(), extra.top_first.begin(), extra.top_first.end());
+    }
     const HWND foreground = GetForegroundWindow();
     const bool rounded = app_window_layout::rounded_corners_os();
     // Bottom-most first
