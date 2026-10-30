@@ -5221,6 +5221,14 @@ namespace video {
 
     // set max frame time based on client-requested target framerate.
     double minimum_fps_target = (config::video.minimum_fps_target > 0.0) ? config::video.minimum_fps_target : config.framerate;
+    // An app-window desk that is quiet when idle (a slow link): nothing is
+    // repeated faster than a frame a second while the windows stand still
+    // (each repeat costs whole packets, error correction included)
+    if (!config.desk_client.empty()) {
+      if (const auto options = app_desk::options(config.desk_client); options && options->quiet_idle) {
+        minimum_fps_target = 2.0;
+      }
+    }
     std::chrono::duration<double, std::milli> max_frametime {1000.0 / minimum_fps_target};
     // One frame period at the negotiated encoding framerate. Native AMF uses it to bound how
     // long the encode loop waits for PreAnalysis to release its retained tail frame.

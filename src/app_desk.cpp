@@ -783,12 +783,32 @@ namespace app_desk {
     // brings the host to the state wanted when it runs, so the order the
     // workers run in does not matter (an open and a quick close end restored).
     std::atomic<bool> g_tweak_wanted {false};
+    std::atomic<bool> g_quiet_wanted {false};  ///< a desk that is "quiet when idle" is open
+
+    /** The host's text cursor, still while a quiet desk is open: a blinking
+     *  one is a change on the screen twice a second, a frame each to send */
+    UINT g_caret_blink = 0;  ///< the user's blink time while it is held still (0: not held)
+
+    void reconcile_caret() {
+      const bool quiet = g_tweak_wanted && g_quiet_wanted;
+      if (quiet && g_caret_blink == 0) {
+        g_caret_blink = GetCaretBlinkTime();
+        if (g_caret_blink == 0) g_caret_blink = 530;
+        SetCaretBlinkTime(INFINITE);
+        BOOST_LOG(info) << "Desk: the host's text cursor stops blinking while windows are streamed (was " << g_caret_blink << " ms)";
+      } else if (!quiet && g_caret_blink != 0) {
+        SetCaretBlinkTime(g_caret_blink);
+        g_caret_blink = 0;
+        BOOST_LOG(info) << "Desk: the host's text cursor blinks again";
+      }
+    }
 
     void reconcile_host_tweaks() {
       std::thread([] {
         std::lock_guard lock(g_tweak_mutex);
         if (g_tweak_wanted) apply_host_tweaks_now();
         else restore_host_tweaks_now();
+        reconcile_caret();
       }).detach();
     }
 
@@ -1050,6 +1070,7 @@ namespace app_desk {
       desk.atlas_window = std::make_shared<desk_atlas::atlas_t>(atlas_rect);
     }
     desk_hold::set_background_qp(desk.options.background_qp);
+    g_quiet_wanted = desk.options.quiet_idle;
     apply_host_tweaks();
     BOOST_LOG(info) << "Desk: open " << desk.info.display << ' ' << desk.info.rect[2] << 'x' << desk.info.rect[3] << '@' << fps << " at " << desk.info.dpi << " dpi"
                     << (custom ? " (exact mode)" : " (catalog mode)") << ", atlas " << desk.info.capture;

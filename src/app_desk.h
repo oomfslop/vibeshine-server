@@ -36,6 +36,7 @@ namespace app_desk {
     int atlas_w = 0, atlas_h = 0;  ///< the atlas (what is streamed) at this size; 0: 3840x2160. Smaller saves bandwidth on slow links (fewer pixels to fill when windows change)
     int background_qp = 0;  ///< background windows at lower quality: this much added to their quantizer (0-20)
     bool efficient = false;  ///< encoder settings that spend fewer bits for the same picture (slower preset, a pre-pass, a quality ceiling) at a few ms more encode time
+    bool quiet_idle = false;  ///< while nothing changes, a frame a second (not the minimum frame rate's repeats), and no blinking text cursor on the host
   };
 
   /** Make sure the client's desk exists with this size (host px), refresh rate
