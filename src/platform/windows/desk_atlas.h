@@ -63,6 +63,10 @@ namespace desk_atlas {
     int w = 0, h = 0;  ///< its size there (the frame size times scale)
     int ax = -1, ay = -1;  ///< the copy on white, or -1
     double white_scale = 1.0;  ///< its size relative to the copy on black
+    /** The copy on white as edges only (the inside of a popup is opaque):
+     *  their width, then where the top, bottom, left and right edge start in
+     *  the atlas; empty: a whole copy at ax, ay */
+    std::vector<int> strips;
     double scale = 1.0;  ///< below 1 only when the atlas is too small for everything
     std::vector<piece_t> pieces;  ///< with a scale below 1: the visible parts, 1:1
   };
@@ -114,10 +118,18 @@ namespace desk_atlas {
       RECT part {};
       cell_t cell;
     };
+    /** A part of the copy on white */
+    struct wpart_t {
+      RECT part {};  ///< in the picture (host px); the whole copy: the picture
+      cell_t cell;  ///< where it is drawn
+      HTHUMBNAIL thumb = nullptr, bg = nullptr;  ///< the copy, and white under it
+    };
     struct item_t {
-      HTHUMBNAIL black = nullptr, white = nullptr;
-      cell_t cell, white_cell;
+      HTHUMBNAIL black = nullptr;
+      cell_t cell;
       bool has_white = false;
+      std::vector<std::pair<RECT, cell_t>> wplan;  ///< where the parts of its copy on white are to go
+      std::vector<wpart_t> wparts;  ///< where they are
       int w = 0, h = 0;
       double scale = 1.0;
       RECT source_offset {};  ///< frame origin inside the window rect
@@ -125,7 +137,7 @@ namespace desk_atlas {
       std::vector<RECT> want;  ///< the visible parts, for pieces when drawn smaller
       std::vector<plan_t> plan;  ///< where its pieces are to go
       std::vector<piece_item_t> pieces;  ///< where they are
-      cell_t black_at, white_at;  ///< where its thumbnails draw it
+      cell_t black_at;  ///< where its thumbnail draws it
       double black_scale = 1.0;  ///< the scale its thumbnail draws it at
       cell_t full_at;  ///< where it was last drawn whole at 1:1 (its parts can go back there, pixel for pixel)
       std::chrono::steady_clock::time_point resizing_until;  ///< being resized until then (more room)
@@ -155,7 +167,10 @@ namespace desk_atlas {
     static RECT margined(const RECT &part, const item_t &item);
     void release(item_t &item);
     void paint(HDC dc);
-    bool update_thumbnail(HTHUMBNAIL thumb, const cell_t &cell, const item_t &item, double ratio = 1.0);
+    bool update_thumbnail(HTHUMBNAIL thumb, const cell_t &cell, const item_t &item);
+    bool show_wpart(HWND hwnd, item_t &item, wpart_t &p, bool fresh);
+    void set_marker();
+    std::vector<std::pair<RECT, cell_t>> white_layout(const item_t &item, double scale) const;
 
     RECT monitor_ {};
     HWND window_ = nullptr;
@@ -164,7 +179,8 @@ namespace desk_atlas {
     std::condition_variable ready_;
     bool started_ = false;
     std::map<HWND, item_t> items_;
-    std::vector<RECT> white_;  ///< backings to paint (client coordinates)
+    HWND white_src_ = nullptr;  ///< a white window: its thumbnails are the backings and the layout number
+    HTHUMBNAIL marker_[16] {};
     unsigned ticks_ = 0;
     double last_area_ = 0;  ///< what the windows asked for at the last sync
     std::vector<retired_t> retired_;  ///< thumbnails left where they were, for a while

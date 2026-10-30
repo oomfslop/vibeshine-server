@@ -64,13 +64,12 @@ namespace desk_atlas {
 
     constexpr int piece_margin = 8;
 
-    /** The copy on white at the picture's size: alpha comes from the two
-     *  copies pixel by pixel, so any other size smears every detail (and
-     *  DWM drops the alpha of scaled thumbnails) */
-    constexpr double white_ratio = 1.0;
-    /** ...inset in its white cell, so filtering at its edges reads white
-     *  backing, not whatever is next to the cell */
-    constexpr int white_inset = 0;
+    /** The copy on white is at the picture's size (alpha comes from the two
+     *  copies pixel by pixel). A popup's inside is opaque: only its edges
+     *  (shadow, rounded corners) need it, strips this wide, each with a
+     *  margin of real pixels */
+    constexpr int strip_width = 64, strip_margin = 4;
+    constexpr int white_src_size = 64;
 
     bool same_rects(const std::vector<RECT> &a, const std::vector<RECT> &b) {
       return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const RECT &x, const RECT &y) {
@@ -154,6 +153,12 @@ namespace desk_atlas {
           self->items_.clear();
           for (auto &r : self->retired_) DwmUnregisterThumbnail(r.thumb);
           self->retired_.clear();
+          for (auto &m : self->marker_) {
+            if (m) DwmUnregisterThumbnail(m);
+            m = nullptr;
+          }
+          if (self->white_src_) DestroyWindow(self->white_src_);
+          self->white_src_ = nullptr;
         }
         DestroyWindow(hwnd);
         return 0;
@@ -176,7 +181,24 @@ namespace desk_atlas {
     window_ = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, L"", WS_POPUP, monitor_.left, monitor_.top,
                               monitor_.right - monitor_.left, monitor_.bottom - monitor_.top, nullptr, nullptr, wc.hInstance, this);
     if (window_) {
+      // The white window, under the atlas (covered, its thumbnails still draw)
+      WNDCLASSW wcw {};
+      wcw.lpfnWndProc = DefWindowProcW;
+      wcw.hInstance = wc.hInstance;
+      wcw.lpszClassName = L"VibeshineDeskWhite";
+      wcw.hbrBackground = static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH));
+      RegisterClassW(&wcw);
+      white_src_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wcw.lpszClassName, L"", WS_POPUP, monitor_.left, monitor_.top, white_src_size, white_src_size, nullptr, nullptr, wc.hInstance, nullptr);
+      if (white_src_) {
+        ShowWindow(white_src_, SW_SHOWNOACTIVATE);
+        UpdateWindow(white_src_);
+        for (auto &m : marker_) {
+          if (FAILED(DwmRegisterThumbnail(window_, white_src_, &m))) m = nullptr;
+        }
+      }
       ShowWindow(window_, SW_SHOWNOACTIVATE);
+      SetWindowPos(window_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+      set_marker();
       SetTimer(window_, topmost_timer, 250, nullptr);
       BOOST_LOG(info) << "Desk atlas: window on " << monitor_.left << ',' << monitor_.top << ' ' << monitor_.right - monitor_.left << 'x'
                       << monitor_.bottom - monitor_.top;
@@ -200,12 +222,6 @@ namespace desk_atlas {
     RECT client;
     GetClientRect(window_, &client);
     FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-    for (const auto &r : white_) FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
-    const std::uint16_t code = marker_code(seq_);
-    for (int i = 0; i < 16; ++i) {
-      const RECT block {i * marker_block, client.bottom - tick_rows, (i + 1) * marker_block, client.bottom};
-      FillRect(dc, &block, static_cast<HBRUSH>(GetStockObject((code >> i) & 1 ? WHITE_BRUSH : BLACK_BRUSH)));
-    }
     if (tick_) {
       const RECT pixel {client.right - 1, client.bottom - 1, client.right, client.bottom};
       FillRect(dc, &pixel, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
@@ -214,8 +230,12 @@ namespace desk_atlas {
 
   void atlas_t::release(item_t &item) {
     retire(item.black, item.black_at, false);
-    retire(item.white, item.white_at, true);
-    item.black = item.white = nullptr;
+    item.black = nullptr;
+    for (auto &w : item.wparts) {
+      retire(w.thumb, w.cell, false);
+      retire(w.bg, w.cell, false);
+    }
+    item.wparts.clear();
     for (auto &p : item.pieces) retire(p.thumb, p.cell, false);
     item.pieces.clear();
   }
@@ -429,19 +449,83 @@ namespace desk_atlas {
     return true;
   }
 
-  bool atlas_t::update_thumbnail(HTHUMBNAIL thumb, const cell_t &cell, const item_t &item, double ratio) {
+  bool atlas_t::update_thumbnail(HTHUMBNAIL thumb, const cell_t &cell, const item_t &item) {
     DWM_THUMBNAIL_PROPERTIES p {};
     p.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
-    const int inset = ratio < 1.0 ? white_inset : 0;
-    p.rcDestination = {cell.x + inset, cell.y + inset, cell.x + cell.cw - inset, cell.y + cell.ch - inset};
+    p.rcDestination = {cell.x, cell.y, cell.x + cell.cw, cell.y + cell.ch};
     // The capacity as source, from the frame's origin: 1:1 (or the slot's
     // scale), the window anchored top-left, its growth room left empty
-    const int sw = static_cast<int>(std::lround((cell.cw - 2 * inset) / (item.scale * ratio))), sh = static_cast<int>(std::lround((cell.ch - 2 * inset) / (item.scale * ratio)));
+    const int sw = static_cast<int>(std::lround(cell.cw / item.scale)), sh = static_cast<int>(std::lround(cell.ch / item.scale));
     p.rcSource = {item.source_offset.left, item.source_offset.top, item.source_offset.left + sw, item.source_offset.top + sh};
     p.opacity = 255;
     p.fVisible = TRUE;
     p.fSourceClientAreaOnly = FALSE;
     return SUCCEEDED(DwmUpdateThumbnailProperties(thumb, &p));
+  }
+
+  /** The parts of the copy on white at this scale, with the cell size each
+   *  needs (cell x, y unset): the edges of a popup at full size, else whole */
+  std::vector<std::pair<RECT, atlas_t::cell_t>> atlas_t::white_layout(const item_t &item, double scale) const {
+    const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top - tick_rows;
+    const int w = item.w, h = item.h, b = strip_width;
+    std::vector<std::pair<RECT, cell_t>> out;
+    if (scale == 1.0 && w >= 3 * b && h >= 3 * b) {
+      for (const RECT &r : {RECT {0, 0, w, b}, RECT {0, h - b, w, h}, RECT {0, b, b, h - b}, RECT {w - b, b, w, h - b}}) {
+        const int ew = std::min<LONG>(w, r.right + strip_margin) - std::max<LONG>(0, r.left - strip_margin);
+        const int eh = std::min<LONG>(h, r.bottom + strip_margin) - std::max<LONG>(0, r.top - strip_margin);
+        out.push_back({r, cell_t {0, 0, capacity(ew, W, false), capacity(eh, H, false)}});
+      }
+    } else {
+      out.push_back({RECT {0, 0, w, h}, cell_t {0, 0, capacity(static_cast<int>(std::ceil(w * scale)), W, false), capacity(static_cast<int>(std::ceil(h * scale)), H, false)}});
+    }
+    return out;
+  }
+
+  /** A part of the copy on white: white under it (registered first, so drawn
+   *  first), the window's pixels of that part over it */
+  bool atlas_t::show_wpart(HWND hwnd, item_t &item, wpart_t &p, bool fresh) {
+    if (fresh) {
+      if (!white_src_ || FAILED(DwmRegisterThumbnail(window_, white_src_, &p.bg))) p.bg = nullptr;
+      if (FAILED(DwmRegisterThumbnail(window_, hwnd, &p.thumb))) p.thumb = nullptr;
+    }
+    if (p.bg) {
+      DWM_THUMBNAIL_PROPERTIES b {};
+      b.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY;
+      b.rcDestination = {p.cell.x, p.cell.y, p.cell.x + p.cell.cw, p.cell.y + p.cell.ch};
+      b.rcSource = {0, 0, white_src_size, white_src_size};
+      b.opacity = 255;
+      b.fVisible = TRUE;
+      DwmUpdateThumbnailProperties(p.bg, &b);
+    }
+    if (!p.thumb) return false;
+    const bool whole = p.part.left == 0 && p.part.top == 0 && p.part.right == item.w && p.part.bottom == item.h;
+    if (whole) return update_thumbnail(p.thumb, p.cell, item);
+    const RECT e {std::max<LONG>(0, p.part.left - strip_margin), std::max<LONG>(0, p.part.top - strip_margin), std::min<LONG>(item.w, p.part.right + strip_margin), std::min<LONG>(item.h, p.part.bottom + strip_margin)};
+    DWM_THUMBNAIL_PROPERTIES t {};
+    t.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
+    t.rcDestination = {p.cell.x, p.cell.y, p.cell.x + (e.right - e.left), p.cell.y + (e.bottom - e.top)};
+    t.rcSource = {item.source_offset.left + e.left, item.source_offset.top + e.top, item.source_offset.left + e.right, item.source_offset.top + e.bottom};
+    t.opacity = 255;
+    t.fVisible = TRUE;
+    t.fSourceClientAreaOnly = FALSE;
+    return SUCCEEDED(DwmUpdateThumbnailProperties(p.thumb, &t));
+  }
+
+  /** The layout number as white blocks: thumbnails, so it changes in the
+   *  same composition as the pictures */
+  void atlas_t::set_marker() {
+    const int H = monitor_.bottom - monitor_.top;
+    const std::uint16_t code = marker_code(seq_);
+    for (int i = 0; i < 16; ++i) {
+      if (!marker_[i]) continue;
+      DWM_THUMBNAIL_PROPERTIES b {};
+      b.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_RECTSOURCE | DWM_TNP_VISIBLE | DWM_TNP_OPACITY;
+      b.rcDestination = {i * marker_block, H - tick_rows, (i + 1) * marker_block, H};
+      b.rcSource = {0, 0, white_src_size, white_src_size};
+      b.opacity = 255;
+      b.fVisible = (code >> i) & 1 ? TRUE : FALSE;
+      DwmUpdateThumbnailProperties(marker_[i], &b);
+    }
   }
 
   std::vector<slot_t> atlas_t::apply(const std::vector<source_t> &sources, bool &moved) {
@@ -469,8 +553,7 @@ namespace desk_atlas {
       item.source_offset = offset;
       const bool fits = item.black && item.cell.cw > 0 && item.cell.cw >= static_cast<int>(std::ceil(s.w * item.scale)) &&
                         item.cell.ch >= static_cast<int>(std::ceil(s.h * item.scale)) && item.has_white == s.alpha &&
-                        (!s.alpha || (item.white_cell.cw >= static_cast<int>(std::ceil(s.w * item.scale * white_ratio)) + 2 * white_inset &&
-                                      item.white_cell.ch >= static_cast<int>(std::ceil(s.h * item.scale * white_ratio)) + 2 * white_inset));
+                        (!s.alpha || (item.w == s.w && item.h == s.h && item.wparts.size() == white_layout(item, item.scale).size()));
       if (item.black && (item.w != s.w || item.h != s.h)) item.resizing_until = now + resize_time;
       const bool resizing = now < item.resizing_until;
       const bool shrunk_far = !resizing && item.black && item.scale == 1.0 && item.cell.cw > capacity(s.w, W, true) * 2 && item.cell.ch > capacity(s.h, H, true) * 2;
@@ -480,7 +563,7 @@ namespace desk_atlas {
         item.h = s.h;
         if (moved_origin) {
           update_thumbnail(item.black, item.black_at, item);
-          if (item.white) update_thumbnail(item.white, item.white_at, item, white_ratio);
+          for (auto &w : item.wparts) show_wpart(s.hwnd, item, w, false);
         }
       }
       item.w = s.w;
@@ -555,7 +638,7 @@ namespace desk_atlas {
         if (!soft) return cells;
         for (const auto &[hwnd, item] : items_) {
           if (item.black) cells.push_back(item.black_at);
-          if (item.white) cells.push_back(item.white_at);
+          for (const auto &w : item.wparts) cells.push_back(w.cell);
           for (const auto &p : item.pieces) cells.push_back(p.cell);
         }
         return cells;
@@ -571,24 +654,35 @@ namespace desk_atlas {
         const bool room = !item.has_white;
         const int extra = now < item.resizing_until ? resize_room : 64;
         const int cw = capacity(static_cast<int>(std::ceil(item.w * scale)), W, room, extra), ch = capacity(static_cast<int>(std::ceil(item.h * scale)), H, room, extra);
-        const int wcw = capacity(static_cast<int>(std::ceil(item.w * scale * white_ratio)) + 2 * white_inset, W, false), wch = capacity(static_cast<int>(std::ceil(item.h * scale * white_ratio)) + 2 * white_inset, H, false);
+        auto wl = item.has_white ? white_layout(item, scale) : std::vector<std::pair<RECT, cell_t>> {};
         std::vector<cell_t> trial = taken;
-        cell_t cell, white;
+        cell_t cell;
         // Where it is drawn now, if that is still the size it needs
-        const bool same = item.black && item.black_at.cw == cw && item.black_at.ch == ch && item.black_scale == scale &&
-                          (!item.has_white || (item.white && item.white_at.cw == wcw && item.white_at.ch == wch));
+        bool same_white = wl.size() == item.wparts.size();
+        for (std::size_t k = 0; same_white && k < wl.size(); ++k) {
+          const auto &w = item.wparts[k];
+          same_white = w.thumb && EqualRect(&w.part, &wl[k].first) && w.cell.cw == wl[k].second.cw && w.cell.ch == wl[k].second.ch;
+        }
+        const bool same = item.black && item.black_at.cw == cw && item.black_at.ch == ch && item.black_scale == scale && same_white;
         // Whole again where it was whole, over its own parts there
         const bool back = !same && scale == 1.0 && !item.has_white && item.full_at.cw == cw && item.full_at.ch == ch &&
                           fits_over(trial, item.full_at, same_pixels(hwnd, item, item.full_at.x, item.full_at.y));
-        if (same && (soft || (take(trial, item.black_at) && (!item.has_white || take(trial, item.white_at))))) {
+        bool kept = same && soft;
+        if (same && !soft) {
+          kept = take(trial, item.black_at);
+          for (const auto &w : item.wparts) kept = kept && take(trial, w.cell);
+        }
+        if (kept) {
           cell = item.black_at;
-          white = item.white_at;
+          for (std::size_t k = 0; k < wl.size(); ++k) wl[k].second = item.wparts[k].cell;
         } else if (back) {
           cell = item.full_at;
           trial.push_back(cell);
         } else {
           if (!place(trial, cw, ch, cell)) return false;
-          if (item.has_white && !place(trial, wcw, wch, white)) return false;
+          for (auto &[part, c] : wl) {
+            if (!place(trial, c.cw, c.ch, c)) return false;
+          }
         }
         item.scale = scale;
         if (pieces == 0) {
@@ -598,7 +692,7 @@ namespace desk_atlas {
         }
         taken = std::move(trial);
         item.cell = cell;
-        item.white_cell = item.has_white ? white : cell_t {};
+        item.wplan = std::move(wl);
         item.scale = scale;
         return true;
       };
@@ -761,7 +855,7 @@ namespace desk_atlas {
             auto &item = items_[hwnd];
             if (!place_item(hwnd, item, scales[hwnd], 1)) {
               item.cell = {};
-              item.white_cell = {};
+              item.wplan.clear();
               item.plan.clear();
             }
           }
@@ -788,17 +882,35 @@ namespace desk_atlas {
           return a.x == b.x && a.y == b.y && a.cw == b.cw && a.ch == b.ch;
         };
         if (item.cell.cw <= 0 || !same(item.black_at, item.cell) || item.black_scale != item.scale) leave(hwnd, item.black, item.black_at, false, item.black_scale == 1.0 && !item.has_white);
-        if (item.cell.cw <= 0 || !item.has_white || !same(item.white_at, item.white_cell)) leave(hwnd, item.white, item.white_at, true, false);
+        // The copy on white: parts kept where they are, the rest anew
+        std::vector<wpart_t> next;
+        std::vector<bool> kept(item.wparts.size(), false);
+        for (const auto &[part, c] : item.cell.cw > 0 ? item.wplan : std::vector<std::pair<RECT, cell_t>> {}) {
+          std::size_t k = 0;
+          while (k < item.wparts.size() && (kept[k] || !item.wparts[k].thumb || !EqualRect(&item.wparts[k].part, &part) || !same(item.wparts[k].cell, c))) ++k;
+          if (k < item.wparts.size()) {
+            kept[k] = true;
+            next.push_back(item.wparts[k]);
+            continue;
+          }
+          wpart_t w;
+          w.part = part;
+          w.cell = c;
+          show_wpart(hwnd, item, w, true);
+          next.push_back(w);
+        }
+        for (std::size_t k = 0; k < item.wparts.size(); ++k) {
+          if (kept[k]) continue;
+          leave(hwnd, item.wparts[k].thumb, item.wparts[k].cell, false, false);
+          leave(hwnd, item.wparts[k].bg, item.wparts[k].cell, false, false);
+        }
+        item.wparts = std::move(next);
         if (item.cell.cw <= 0) continue;
         if (!item.black && SUCCEEDED(DwmRegisterThumbnail(window_, hwnd, &item.black))) {
           item.black_at = item.cell;
           item.black_scale = item.scale;
           if (item.scale == 1.0 && !item.has_white) item.full_at = item.cell;
           update_thumbnail(item.black, item.cell, item);
-        }
-        if (item.has_white && !item.white && SUCCEEDED(DwmRegisterThumbnail(window_, hwnd, &item.white))) {
-          item.white_at = item.white_cell;
-          update_thumbnail(item.white, item.white_cell, item, white_ratio);
         }
       }
     }
@@ -807,25 +919,6 @@ namespace desk_atlas {
     // Dropped at once, nothing is left where pictures were: the new places
     // hold from the next composition on, as precisely as that can be dated
     if (hard) moved = false;
-
-    // The white backings first in the frame order: painted now, synchronously
-    std::vector<RECT> white;
-    for (const auto &[hwnd, item] : items_) {
-      if (item.white && item.white_at.cw > 0) {
-        white.push_back({item.white_at.x, item.white_at.y, item.white_at.x + item.white_at.cw, item.white_at.y + item.white_at.ch});
-      }
-    }
-    for (const auto &r : retired_) {
-      if (r.white) white.push_back({r.cell.x, r.cell.y, r.cell.x + r.cell.cw, r.cell.y + r.cell.ch});
-    }
-    const bool repaint = white.size() != white_.size() || !std::equal(white.begin(), white.end(), white_.begin(), [](const RECT &a, const RECT &b) {
-                           return EqualRect(&a, &b);
-                         });
-    if (repaint) {
-      white_ = std::move(white);
-      InvalidateRect(window_, nullptr, FALSE);
-      UpdateWindow(window_);
-    }
 
     ghost_count_ = retired_.size();
     std::vector<slot_t> out;
@@ -838,10 +931,18 @@ namespace desk_atlas {
       s.w = static_cast<int>(std::lround(item.w * item.scale));
       s.h = static_cast<int>(std::lround(item.h * item.scale));
       s.scale = item.scale;
-      if (item.white) {
-        s.ax = item.white_cell.x + white_inset;
-        s.ay = item.white_cell.y + white_inset;
-        s.white_scale = white_ratio;
+      if (item.wparts.size() == 1) {
+        s.ax = item.wparts[0].cell.x;
+        s.ay = item.wparts[0].cell.y;
+      } else if (item.wparts.size() == 4) {
+        // Where each edge's own top-left is (inside its margin)
+        s.strips.push_back(strip_width);
+        for (const auto &w : item.wparts) {
+          s.strips.push_back(w.cell.x + (w.part.left - std::max<LONG>(0, w.part.left - strip_margin)));
+          s.strips.push_back(w.cell.y + (w.part.top - std::max<LONG>(0, w.part.top - strip_margin)));
+        }
+        s.ax = s.strips[1];
+        s.ay = s.strips[2];
       }
       for (const auto &p : item.pieces) {
         if (!p.thumb || p.cell.cw <= 0) continue;
@@ -858,6 +959,7 @@ namespace desk_atlas {
     for (const auto &s : out) {
       mix(reinterpret_cast<std::uintptr_t>(s.hwnd));
       for (long long v : {s.x, s.y, s.w, s.h, s.ax, s.ay}) mix(v);
+      for (int v : s.strips) mix(v);
       for (const auto &p : s.pieces) {
         for (long long v : {p.x, p.y, p.w, p.h, p.ax, p.ay}) mix(v);
       }
@@ -865,11 +967,7 @@ namespace desk_atlas {
     if (sig != last_sig_) {
       last_sig_ = sig;
       seq_ = static_cast<std::uint16_t>((seq_ + 1) & 0xfff);
-      RECT client {};
-      GetClientRect(window_, &client);
-      const RECT strip {0, client.bottom - tick_rows, 16 * marker_block, client.bottom};
-      InvalidateRect(window_, &strip, FALSE);
-      UpdateWindow(window_);
+      set_marker();
       SetTimer(window_, refresh_timer, 40, nullptr);
     }
     return out;

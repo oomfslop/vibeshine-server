@@ -82,6 +82,7 @@ namespace app_desk {
     int slot[4] {0, 0, 0, 0};  ///< where its picture is in the captured atlas: x, y, w, h (0 size = none)
     int alpha_slot[2] {-1, -1};  ///< the same picture on white (x, y), for exact alpha; -1 = opaque
     double alpha_scale = 1.0;  ///< that copy's size relative to the picture
+    std::vector<int> alpha_strips;  ///< or as edges: width, then the atlas origin of top, bottom, left, right
     double scale = 1.0;  ///< the picture's scale in the atlas (below 1 only when it is full)
     std::vector<std::array<int, 6>> pieces;  ///< with a scale below 1: the parts the user sees 1:1 (x, y, w, h in the frame; x, y in the atlas)
   };

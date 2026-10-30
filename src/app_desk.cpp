@@ -1421,6 +1421,23 @@ namespace app_desk {
       win.icon_key = host_windows::icon_key(win.handle);
       out.windows.insert(out.windows.begin(), std::move(win));
     }
+    // A popup that has just appeared may not have drawn itself yet: DWM then
+    // shows a placeholder (a gradient with the app's icon) in its thumbnail.
+    // It comes over once it has had a few frames to draw.
+    {
+      static std::map<std::uintptr_t, std::chrono::steady_clock::time_point> first_seen;
+      const auto now = std::chrono::steady_clock::now();
+      std::set<std::uintptr_t> present;
+      for (const auto &w : out.windows) present.insert(w.handle);
+      std::erase_if(first_seen, [&](const auto &e) {
+        return !present.contains(e.first);
+      });
+      std::erase_if(out.windows, [&](const window_t &w) {
+        if (w.kind != "popup") return false;
+        const auto it = first_seen.try_emplace(w.handle, now).first;
+        return now - it->second < std::chrono::milliseconds(40);
+      });
+    }
     for (std::size_t i = 0; i < out.windows.size(); ++i) out.windows[i].z = static_cast<int>(i);
     // Their pictures: a slot each in the atlas (the copy on white for popups,
     // whose transparency matters: menus with their shadows, tooltips)
@@ -1524,6 +1541,7 @@ namespace app_desk {
           w.alpha_slot[0] = slot.ax;
           w.alpha_slot[1] = slot.ay;
           w.alpha_scale = slot.white_scale;
+          w.alpha_strips = slot.strips;
           w.scale = slot.scale;
           w.pieces.clear();
           for (const auto &p : slot.pieces) w.pieces.push_back({p.x, p.y, p.w, p.h, p.ax, p.ay});
@@ -1595,6 +1613,7 @@ namespace app_desk {
       for (int v : w.rect) mix(static_cast<std::uint32_t>(v));
       for (int v : w.slot) mix(static_cast<std::uint32_t>(v));
       for (int v : w.alpha_slot) mix(static_cast<std::uint32_t>(v));
+      for (int v : w.alpha_strips) mix(static_cast<std::uint32_t>(v));
       for (const auto &p : w.pieces) {
         for (int v : p) mix(static_cast<std::uint32_t>(v));
       }

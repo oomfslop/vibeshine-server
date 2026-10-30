@@ -4254,6 +4254,7 @@ namespace nvhttp {
         {"slot", {w.slot[0], w.slot[1], w.slot[2], w.slot[3]}},
         {"alpha_slot", {w.alpha_slot[0], w.alpha_slot[1]}},
         {"alpha_scale", w.alpha_scale},
+        {"alpha_strips", w.alpha_strips},
         {"scale", w.scale},
         {"pieces", w.pieces},
       });
