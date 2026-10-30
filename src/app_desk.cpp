@@ -1437,6 +1437,10 @@ namespace app_desk {
         const auto it = first_seen.try_emplace(w.handle, now).first;
         return now - it->second < std::chrono::milliseconds(40);
       });
+      for (auto &w : out.windows) {
+        const auto it = first_seen.find(w.handle);
+        w.settled = it == first_seen.end() || now - it->second >= std::chrono::milliseconds(300);
+      }
     }
     for (std::size_t i = 0; i < out.windows.size(); ++i) out.windows[i].z = static_cast<int>(i);
     // Their pictures: a slot each in the atlas (the copy on white for popups,
@@ -1523,7 +1527,7 @@ namespace app_desk {
         // drawn smaller
         const long long area = std::min<long long>(INT_MAX / 4, visible_area(i));
         const int priority = static_cast<int>(area + (w.kind == "popup" ? INT_MAX / 2 : focused ? INT_MAX / 4 : 0));
-        sources.push_back({reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)), w.rect[2], w.rect[3], w.kind == "popup", priority, w.kind == "popup" ? std::vector<RECT> {} : visible_parts(i)});
+        sources.push_back({reinterpret_cast<HWND>(static_cast<std::uintptr_t>(w.handle)), w.rect[2], w.rect[3], w.kind == "popup", priority, w.kind == "popup" ? std::vector<RECT> {} : visible_parts(i), w.settled});
       }
       const auto sync_start = std::chrono::steady_clock::now();
       const auto slots = atlas->sync(sources, &out.moved);

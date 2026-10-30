@@ -50,6 +50,7 @@ namespace desk_atlas {
     bool alpha = false;  ///< also draw it on white, for exact transparency
     int priority = 0;  ///< higher keeps full size first when the atlas is full
     std::vector<RECT> visible;  ///< the parts the user sees (frame coordinates), sharp even when the rest goes smaller
+    bool settled = true;  ///< a popup done with its opening animation (its inside is opaque by now)
   };
 
   struct piece_t {
@@ -128,6 +129,7 @@ namespace desk_atlas {
       HTHUMBNAIL black = nullptr;
       cell_t cell;
       bool has_white = false;
+      bool settled = true;
       std::vector<std::pair<RECT, cell_t>> wplan;  ///< where the parts of its copy on white are to go
       std::vector<wpart_t> wparts;  ///< where they are
       int w = 0, h = 0;
@@ -169,7 +171,7 @@ namespace desk_atlas {
     void paint(HDC dc);
     bool update_thumbnail(HTHUMBNAIL thumb, const cell_t &cell, const item_t &item);
     bool show_wpart(HWND hwnd, item_t &item, wpart_t &p, bool fresh);
-    void set_marker();
+    void set_marker(bool transition);
     std::vector<std::pair<RECT, cell_t>> white_layout(const item_t &item, double scale) const;
 
     RECT monitor_ {};

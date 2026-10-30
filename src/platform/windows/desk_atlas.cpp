@@ -198,7 +198,7 @@ namespace desk_atlas {
       }
       ShowWindow(window_, SW_SHOWNOACTIVATE);
       SetWindowPos(window_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-      set_marker();
+      set_marker(false);
       SetTimer(window_, topmost_timer, 250, nullptr);
       BOOST_LOG(info) << "Desk atlas: window on " << monitor_.left << ',' << monitor_.top << ' ' << monitor_.right - monitor_.left << 'x'
                       << monitor_.bottom - monitor_.top;
@@ -469,7 +469,8 @@ namespace desk_atlas {
     const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top - tick_rows;
     const int w = item.w, h = item.h, b = strip_width;
     std::vector<std::pair<RECT, cell_t>> out;
-    if (scale == 1.0 && w >= 3 * b && h >= 3 * b) {
+    // Opening, a popup slides in: its inside is not drawn yet, so a whole copy
+    if (item.settled && scale == 1.0 && w >= 3 * b && h >= 3 * b) {
       for (const RECT &r : {RECT {0, 0, w, b}, RECT {0, h - b, w, h}, RECT {0, b, b, h - b}, RECT {w - b, b, w, h - b}}) {
         const int ew = std::min<LONG>(w, r.right + strip_margin) - std::max<LONG>(0, r.left - strip_margin);
         const int eh = std::min<LONG>(h, r.bottom + strip_margin) - std::max<LONG>(0, r.top - strip_margin);
@@ -513,9 +514,11 @@ namespace desk_atlas {
 
   /** The layout number as white blocks: thumbnails, so it changes in the
    *  same composition as the pictures */
-  void atlas_t::set_marker() {
+  void atlas_t::set_marker(bool transition) {
     const int H = monitor_.bottom - monitor_.top;
-    const std::uint16_t code = marker_code(seq_);
+    // In transition: a code that does not check (frames composed while the
+    // pictures change are not drawn)
+    const std::uint16_t code = transition ? 0xffff : marker_code(seq_);
     for (int i = 0; i < 16; ++i) {
       if (!marker_[i]) continue;
       DWM_THUMBNAIL_PROPERTIES b {};
@@ -539,6 +542,17 @@ namespace desk_atlas {
                            return true;
                          }) > 0;
     for (auto &[hwnd, item] : items_) item.used = false;
+    // Before the first change the pictures see: right after a composition,
+    // the layout number becomes invalid; after the last, the new number. DWM
+    // applies changes in order, so a frame never carries a number with only
+    // some of its changes.
+    bool changing = false;
+    auto begin_change = [&] {
+      if (changing) return;
+      changing = true;
+      DwmFlush();
+      set_marker(true);
+    };
     std::vector<HWND> to_place, pieces_dirty;
     bool hard = false;  ///< pictures that change place leave no thumbnail behind
     for (const auto &s : sources) {
@@ -551,6 +565,7 @@ namespace desk_atlas {
       const RECT offset {fr.left - wr.left, fr.top - wr.top, 0, 0};
       const bool moved_origin = offset.left != item.source_offset.left || offset.top != item.source_offset.top;
       item.source_offset = offset;
+      item.settled = s.settled;
       const bool fits = item.black && item.cell.cw > 0 && item.cell.cw >= static_cast<int>(std::ceil(s.w * item.scale)) &&
                         item.cell.ch >= static_cast<int>(std::ceil(s.h * item.scale)) && item.has_white == s.alpha &&
                         (!s.alpha || (item.w == s.w && item.h == s.h && item.wparts.size() == white_layout(item, item.scale).size()));
@@ -562,6 +577,7 @@ namespace desk_atlas {
         item.w = s.w;
         item.h = s.h;
         if (moved_origin) {
+          begin_change();
           update_thumbnail(item.black, item.black_at, item);
           for (auto &w : item.wparts) show_wpart(s.hwnd, item, w, false);
         }
@@ -864,9 +880,7 @@ namespace desk_atlas {
       }
       hard = !soft;
       if (hard) ++hard_repacks_;
-      // Right after a composition: the changes below (and the layout number
-      // painted with them) all land in the same next one
-      DwmFlush();
+      begin_change();
       // A picture that changed place gets a new thumbnail there; the old one
       // stays where it was for a while (hard: goes now)
       auto leave = [&](HWND hwnd, HTHUMBNAIL &thumb, const cell_t &at, bool white, bool whole) {
@@ -967,8 +981,10 @@ namespace desk_atlas {
     if (sig != last_sig_) {
       last_sig_ = sig;
       seq_ = static_cast<std::uint16_t>((seq_ + 1) & 0xfff);
-      set_marker();
+      set_marker(false);
       SetTimer(window_, refresh_timer, 40, nullptr);
+    } else if (changing) {
+      set_marker(false);
     }
     return out;
   }
