@@ -18,6 +18,13 @@ namespace desk_atlas {
   namespace {
     constexpr UINT sync_message = WM_APP + 7;
     constexpr UINT_PTR topmost_timer = 1;
+    constexpr UINT_PTR refresh_timer = 2;
+
+    /** Rows at the bottom no picture uses: a pixel there changes some time
+     *  after the slots did, so the client gets a frame its newest layout
+     *  surely covers (the desktop sends frames only on change, and a frame
+     *  drawn with the wrong layout would otherwise stay up) */
+    constexpr int tick_rows = 2;
 
     struct sync_request_t {
       const std::vector<source_t> *sources;
@@ -41,12 +48,13 @@ namespace desk_atlas {
 
     constexpr int piece_margin = 8;
 
-    /** The copy on white only carries alpha (soft at the edges anyway, the
-     *  inside opaque): half size, a quarter of the room */
-    constexpr double white_ratio = 0.5;
+    /** The copy on white at the picture's size: alpha comes from the two
+     *  copies pixel by pixel, so any other size smears every detail (and
+     *  DWM drops the alpha of scaled thumbnails) */
+    constexpr double white_ratio = 1.0;
     /** ...inset in its white cell, so filtering at its edges reads white
      *  backing, not whatever is next to the cell */
-    constexpr int white_inset = 2;
+    constexpr int white_inset = 0;
 
     bool same_rects(const std::vector<RECT> &a, const std::vector<RECT> &b) {
       return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const RECT &x, const RECT &y) {
@@ -105,6 +113,18 @@ namespace desk_atlas {
       case WM_ERASEBKGND:
         return 1;
       case WM_TIMER:
+        if (wparam == refresh_timer) {
+          KillTimer(hwnd, refresh_timer);
+          if (self) {
+            self->tick_ = !self->tick_;
+            RECT client {};
+            GetClientRect(hwnd, &client);
+            RECT pixel {0, client.bottom - 1, 1, client.bottom};
+            InvalidateRect(hwnd, &pixel, FALSE);
+            UpdateWindow(hwnd);
+          }
+          return 0;
+        }
         if (wparam == topmost_timer) {
           // Nothing may cover the atlas: its display is the picture
           SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
@@ -165,6 +185,10 @@ namespace desk_atlas {
     GetClientRect(window_, &client);
     FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
     for (const auto &r : white_) FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    if (tick_) {
+      const RECT pixel {0, client.bottom - 1, 1, client.bottom};
+      FillRect(dc, &pixel, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+    }
   }
 
   void atlas_t::release(item_t &item) {
@@ -196,7 +220,7 @@ namespace desk_atlas {
 
   /** The cell is inside the atlas and overlaps only cells in `own` */
   bool atlas_t::fits_over(const std::vector<cell_t> &taken, const cell_t &cell, const std::vector<cell_t> &own) const {
-    const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top;
+    const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top - tick_rows;
     if (cell.cw <= 0 || cell.x < 0 || cell.y < 0 || cell.x + cell.cw > W || cell.y + cell.ch > H) return false;
     for (const auto &t : taken) {
       if (!overlaps(cell.x, cell.y, cell.cw, cell.ch, t.x, t.y, t.cw, t.ch)) continue;
@@ -210,7 +234,7 @@ namespace desk_atlas {
 
   /** This very cell, if nothing taken overlaps it */
   bool atlas_t::take(std::vector<cell_t> &taken, const cell_t &cell) const {
-    const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top;
+    const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top - tick_rows;
     if (cell.cw <= 0 || cell.x < 0 || cell.y < 0 || cell.x + cell.cw > W || cell.y + cell.ch > H) return false;
     for (const auto &t : taken) {
       if (overlaps(cell.x, cell.y, cell.cw, cell.ch, t.x, t.y, t.cw, t.ch)) return false;
@@ -338,7 +362,7 @@ namespace desk_atlas {
    *  taken cell, as maximal free rectangles; the cell goes where it leaves
    *  the least on its shorter side. */
   bool atlas_t::place(std::vector<cell_t> &taken, int cw, int ch, cell_t &out) const {
-    const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top;
+    const int W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top - tick_rows;
     if (cw > W || ch > H) return false;
     std::vector<cell_t> free {{0, 0, W, H}};
     for (const auto &t : taken) {
@@ -607,22 +631,26 @@ namespace desk_atlas {
           }
           return true;
         };
-        // Popups and the focused window are the last to give anything up;
-        // a focused window that hangs off the screen or is partly covered
-        // costs less as its visible parts (just as sharp) than whole
-        auto top = [&](HWND h) {
-          const auto &it = items_[h];
-          if (it.has_white) return true;
-          if (priority(h) < INT_MAX / 4) return false;
-          long long shown = 0;
-          for (const auto &r : it.want) shown += static_cast<long long>(r.right - r.left) * (r.bottom - r.top);
-          return shown * 100 >= static_cast<long long>(it.w) * it.h * 85;
+        // Who gives way, in this order: other windows (smaller stand-ins,
+        // then their tiles best effort), the focused window (to stand-in and
+        // tiles: as sharp where seen), popups (what the user reads right
+        // now), last the focused window's tiles
+        auto tier = [&](HWND h) {
+          return items_[h].has_white ? 2 : priority(h) >= INT_MAX / 4 ? 1 : 0;
         };
-        // Soft first, all the way down to the smallest stand-ins (the visible
-        // parts stay sharp either way); only if even that does not fit, hard
+        struct stage_t {
+          int tier;
+          bool loosen;
+        };
+        static const stage_t stages[] = {{0, false}, {0, true}, {1, false}, {2, false}, {1, true}};
+        // Keeping everything where it is is worth smaller windows behind, not
+        // a smaller popup or a blurrier focused window: those first try a
+        // repack that moves pictures
+        std::size_t stage_count = std::size(stages);
         bool packed = false;
         auto run = [&](bool soft_mode) {
           soft = soft_mode;
+          stage_count = soft_mode ? 3 : std::size(stages);
           for (HWND h : order) scales[h] = 1.0;
           loose.clear();
           packed = false;
@@ -634,7 +662,7 @@ namespace desk_atlas {
               // its pieces come shows nearly sharp
               const long long sharp = loose_area;
               for (auto h = by_priority.rbegin(); h != by_priority.rend(); ++h) {
-                if (scales[*h] >= 1.0 || items_[*h].has_white || loose.contains(*h)) continue;
+                if (scales[*h] >= 1.0 || loose.contains(*h)) continue;
                 const double was = scales[*h];
                 for (double step : steps) {
                   if (step <= was + 1e-9) break;
@@ -651,30 +679,38 @@ namespace desk_atlas {
             // scale: the loss spreads over the least visible windows instead
             // of one window going very blurry
             HWND pick = nullptr;
-            double least = 0;
-            for (int pass = 0; pass < 2 && !pick; ++pass) {
+            bool loosened = false;
+            for (std::size_t si = 0; si < stage_count; ++si) {
+              const auto &stage = stages[si];
+              double least = 0;
               for (HWND h : by_priority) {
-                if (scales[h] <= steps[std::size(steps) - 1] || top(h) != (pass == 1)) continue;
+                if (tier(h) != stage.tier) continue;
+                if (stage.loosen) {
+                  // As small as it goes: its pieces where room is left
+                  if (!loose.contains(h) && scales[h] < 1.0 && !items_[h].want.empty()) {
+                    pick = h;
+                    break;
+                  }
+                  continue;
+                }
+                if (scales[h] <= steps[std::size(steps) - 1]) continue;
+                // The one showing the fewest pixels at its current scale
                 const double shown = static_cast<double>(priority(h)) * scales[h];
                 if (!pick || shown < least) {
                   pick = h;
                   least = shown;
                 }
               }
-              if (pick || pass == 1) break;
-              // Every other window is as small as it goes: the least visible
-              // one's pieces go where room is left
-              for (HWND h : by_priority) {
-                if (!top(h) && !loose.contains(h) && scales[h] < 1.0 && !items_[h].want.empty()) {
-                  loose.insert(h);
-                  pick = h;
-                  break;
-                }
+              if (pick) {
+                loosened = stage.loosen;
+                break;
               }
-              if (pick) break;
             }
             if (!pick) break;
-            if (loose.contains(pick) && !top(pick) && scales[pick] <= steps[std::size(steps) - 1]) continue;
+            if (loosened) {
+              loose.insert(pick);
+              continue;
+            }
             // A window's visible parts stay 1:1 (pieces), so the rest of it
             // goes straight to a small stand-in; popups have no pieces
             if (!items_[pick].has_white) {
@@ -786,6 +822,22 @@ namespace desk_atlas {
         s.pieces.push_back({p.part.left, p.part.top, p.part.right - p.part.left, p.part.bottom - p.part.top, p.cell.x + (p.part.left - part.left), p.cell.y + (p.part.top - part.top)});
       }
       out.push_back(s);
+    }
+    // Any change: one more frame a little later (see tick_rows)
+    std::uint64_t sig = 1469598103934665603ull;
+    auto mix = [&sig](long long v) {
+      sig = (sig ^ static_cast<std::uint64_t>(v)) * 1099511628211ull;
+    };
+    for (const auto &s : out) {
+      mix(reinterpret_cast<std::uintptr_t>(s.hwnd));
+      for (long long v : {s.x, s.y, s.w, s.h, s.ax, s.ay}) mix(v);
+      for (const auto &p : s.pieces) {
+        for (long long v : {p.x, p.y, p.w, p.h, p.ax, p.ay}) mix(v);
+      }
+    }
+    if (sig != last_sig_) {
+      last_sig_ = sig;
+      SetTimer(window_, refresh_timer, 40, nullptr);
     }
     return out;
   }

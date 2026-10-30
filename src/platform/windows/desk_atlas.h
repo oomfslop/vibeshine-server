@@ -162,6 +162,8 @@ namespace desk_atlas {
     unsigned ticks_ = 0;
     double last_area_ = 0;  ///< what the windows asked for at the last sync
     std::vector<retired_t> retired_;  ///< thumbnails left where they were, for a while
+    bool tick_ = false;  ///< the refresh pixel's state
+    std::uint64_t last_sig_ = 0;  ///< the slots at the last sync
     unsigned hard_repacks_ = 0;
     std::size_t ghost_count_ = 0;
   };
