@@ -64,6 +64,7 @@ extern "C" {
 #include "session_history.h"
 #include "stream.h"
 #include "app_desk.h"
+#include "keyboard_language.h"
 #include "stream_broadcast_runtime.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -3556,6 +3557,7 @@ namespace stream {
 
       // Release input before any potentially hung capture joins.
       input::reset(session.input);
+      keyboard_language::clear();
       if (session.hide_cursor) {
         session.hide_cursor = false;
         video::add_cursor_hide_request(-1);

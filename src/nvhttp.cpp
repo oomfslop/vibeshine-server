@@ -94,6 +94,7 @@
 #include "rtsp.h"
 #include "app_desk.h"
 #include "app_launcher.h"
+#include "keyboard_language.h"
 #include "host_windows.h"
 #include "rtsp_pending_policy.h"
 #include "stream.h"
@@ -4053,6 +4054,22 @@ namespace nvhttp {
     write_json(response, out, ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_bad_request);
   }
 
+  void post_keyboard_language(resp_https_t response, req_https_t request) {
+    print_req<SunshineHTTPS>(request);
+    if (resolve_client_identity_from_request(request).uuid.empty()) {
+      response->write(SimpleWeb::StatusCode::client_error_unauthorized);
+      response->close_connection_after_response = true;
+      return;
+    }
+    const auto args = request->parse_query_string();
+    std::string error;
+    const bool ok = keyboard_language::set(get_arg(args, "lang", ""), error);
+    nlohmann::json out = {{"status", ok}};
+    if (!ok) out["error"] = error;
+    // (a language the host has no layout for is no failure of the request)
+    write_json(response, out);
+  }
+
   void get_host_windows(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
     if (!windows_request_allowed(response, request, "list")) return;
@@ -7007,6 +7024,9 @@ launch_session->exact_target_hold.reset();
     };
     https_server.resource["^/actions/launchable-icons$"]["GET"] = [run_discovery_nvhttp](auto response, auto request) {
       run_discovery_nvhttp([response, request] { get_launchable_icons(response, request); });
+    };
+    https_server.resource["^/actions/keyboard-language$"]["POST"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
+      run_on_blocking_pool(layout_route_pool, [response, request] { post_keyboard_language(response, request); });
     };
     https_server.resource["^/actions/launch$"]["POST"] = [&layout_route_pool, run_on_blocking_pool](auto response, auto request) {
       run_on_blocking_pool(layout_route_pool, [response, request] { post_launch(response, request); });
