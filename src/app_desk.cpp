@@ -1539,6 +1539,95 @@ namespace app_desk {
     return {g_shift_x.load(), g_shift_y.load()};
   }
 
+  namespace {
+    /** How an app lets its window be sized: the smallest frame, and the
+     *  steps it snaps sizes to while the user drags an edge (terminals snap
+     *  to character cells), so the client's window resizes the same way. */
+    struct sizing_t {
+      int min[2] {0, 0};
+      int step[2] {1, 1};
+      int base[2] {0, 0};  ///< a frame size on the step grid
+    };
+
+    std::uint64_t gcd(std::uint64_t a, std::uint64_t b) {
+      while (b) {
+        a %= b;
+        std::swap(a, b);
+      }
+      return a;
+    }
+
+    /** Asked of the app itself (both messages are marshalled to other
+     *  processes): WM_GETMINMAXINFO, and WM_SIZING with a few sizes past the
+     *  current one, the step being what all the snapped sizes have in common.
+     *  Kept for a few seconds per window and size (a font change alters the
+     *  step but not the size). */
+    sizing_t sizing_of(HWND hwnd, const RECT &frame) {
+      struct cached_t {
+        int w, h;
+        UINT dpi;
+        std::chrono::steady_clock::time_point at;
+        sizing_t sizing;
+      };
+      static std::mutex mutex;
+      static std::map<HWND, cached_t> cache;
+      std::lock_guard lock(mutex);
+      RECT win {};
+      if (!GetWindowRect(hwnd, &win)) return {};
+      const int w = win.right - win.left, h = win.bottom - win.top;
+      const UINT dpi = GetDpiForWindow(hwnd);
+      const auto now = std::chrono::steady_clock::now();
+      if (auto it = cache.find(hwnd); it != cache.end() && it->second.w == w && it->second.h == h && it->second.dpi == dpi && now - it->second.at < std::chrono::seconds(5)) {
+        return it->second.sizing;
+      }
+      std::erase_if(cache, [](const auto &e) {
+        return !IsWindow(e.first);
+      });
+      sizing_t out;
+      // (the frame is the window without its invisible resize borders)
+      const int border_w = w - (frame.right - frame.left), border_h = h - (frame.bottom - frame.top);
+      constexpr UINT flags = SMTO_ABORTIFHUNG | SMTO_BLOCK;
+      DWORD_PTR result = 0;
+      MINMAXINFO mmi {};
+      mmi.ptMinTrackSize = {GetSystemMetricsForDpi(SM_CXMINTRACK, dpi), GetSystemMetricsForDpi(SM_CYMINTRACK, dpi)};
+      mmi.ptMaxTrackSize = {GetSystemMetricsForDpi(SM_CXMAXTRACK, dpi), GetSystemMetricsForDpi(SM_CYMAXTRACK, dpi)};
+      if (SendMessageTimeoutW(hwnd, WM_GETMINMAXINFO, 0, reinterpret_cast<LPARAM>(&mmi), flags, 50, &result)) {
+        out.min[0] = std::max(0, static_cast<int>(mmi.ptMinTrackSize.x) - border_w);
+        out.min[1] = std::max(0, static_cast<int>(mmi.ptMinTrackSize.y) - border_h);
+      }
+      if (GetWindowLongW(hwnd, GWL_STYLE) & WS_THICKFRAME) {
+        // The snapped sizes are on the app's grid, which the current size
+        // need not be (a terminal sized by other means): the step is what
+        // their differences have in common, the grid goes through the first
+        std::uint64_t step[2] {0, 0};
+        int first[2] {0, 0};
+        bool answered = true;
+        for (int d : {37, 50, 63, 100, 200}) {
+          RECT r {win.left, win.top, win.right + d, win.bottom + d};
+          if (!SendMessageTimeoutW(hwnd, WM_SIZING, WMSZ_BOTTOMRIGHT, reinterpret_cast<LPARAM>(&r), flags, 50, &result)) {
+            answered = false;
+            break;
+          }
+          const int got[2] {static_cast<int>(r.right - r.left), static_cast<int>(r.bottom - r.top)};
+          for (int i : {0, 1}) {
+            if (d == 37) first[i] = got[i];
+            else step[i] = gcd(step[i], static_cast<std::uint64_t>(std::abs(got[i] - first[i])));
+          }
+        }
+        if (answered) {
+          for (int i : {0, 1}) {
+            if (step[i] > 1 && step[i] <= 64) {
+              out.step[i] = static_cast<int>(step[i]);
+              out.base[i] = first[i] - (i == 0 ? border_w : border_h);
+            }
+          }
+        }
+      }
+      cache[hwnd] = {w, h, dpi, now, out};
+      return out;
+    }
+  }  // namespace
+
   layout_t layout(const std::string &client_uuid) {
     adopt_new_windows(client_uuid);
     layout_t out;
@@ -1683,6 +1772,15 @@ namespace app_desk {
       if (rounded && !IsZoomed(w.hwnd)) {
         const UINT dpi = GetDpiForWindow(w.hwnd);
         win.radius = static_cast<int>(8 * (dpi ? dpi : 96) / 96);
+      }
+      if (captioned && !IsZoomed(w.hwnd) && !IsHungAppWindow(w.hwnd)) {
+        const auto sizing = sizing_of(w.hwnd, w.rect);
+        win.min_size[0] = sizing.min[0];
+        win.min_size[1] = sizing.min[1];
+        win.resize_step[0] = sizing.step[0];
+        win.resize_step[1] = sizing.step[1];
+        win.resize_base[0] = sizing.base[0];
+        win.resize_base[1] = sizing.base[1];
       }
       win.z = static_cast<int>(out.windows.size());
       win.icon_key = host_windows::icon_key(win.handle);

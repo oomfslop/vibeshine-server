@@ -92,6 +92,9 @@ namespace app_desk {
     bool focused = false;
     int caption = 0;  ///< caption height in px (0 = unknown / custom)
     int radius = 0;  ///< corner radius the OS applies (Windows 11: 8 DIP)
+    int min_size[2] {0, 0};  ///< the smallest frame the app allows (0 = unknown)
+    int resize_step[2] {1, 1};  ///< steps the app snaps its frame's size to (terminals: character cells)
+    int resize_base[2] {0, 0};  ///< a frame size on that grid (the current one need not be)
     int z = 0;  ///< stacking order, 0 = bottom-most
     std::string icon_key;
     int slot[4] {0, 0, 0, 0};  ///< where its picture is in the captured atlas: x, y, w, h (0 size = none)
