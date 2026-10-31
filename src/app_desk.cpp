@@ -2333,6 +2333,10 @@ namespace app_desk {
     return std::nullopt;
   }
 
+  std::optional<options_t> options(const std::string &) {
+    return std::nullopt;
+  }
+
   void close(const std::string &) {}
 
   std::optional<std::pair<int, int>> input_origin(const std::string &) {
