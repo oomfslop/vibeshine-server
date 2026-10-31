@@ -63,8 +63,8 @@ namespace platf::dxgi {
 
   namespace {
     /** The encoder settings for a session: an app-window desk's own options
-     *  over the host's (Data saver: fewer bits for the same picture, and
-     *  background windows at lower quality) */
+     *  over the host's (Sloplight's Efficient preset: fewer bits for the same
+     *  picture, and background windows at lower quality) */
     nvenc::nvenc_config desk_encoder_config(const ::video::config_t &client_config) {
       auto nv = config::video.nv;
       if (client_config.desk_client.empty()) return nv;
