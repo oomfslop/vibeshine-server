@@ -290,6 +290,7 @@ namespace platf {
     constexpr caps_t pen_touch = 0x01;  // Pen and touch events
     constexpr caps_t controller_touch = 0x02;  // Controller touch events
     constexpr caps_t trackpad = 0x04;  // Precision touchpad contacts (Vibeshine)
+    constexpr caps_t client_key_repeat = 0x08;  // Key repeats paced by the client (Vibeshine)
   };  // namespace platform_caps
 
   struct gamepad_state_t {

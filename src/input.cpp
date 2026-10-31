@@ -961,6 +961,10 @@ namespace input {
     return true;
   }
 
+  // Key flags of clients that pace key repeats themselves (platform_caps::client_key_repeat)
+  constexpr uint8_t KEY_FLAG_REPEAT = 0x02;  ///< this key down repeats a held key
+  constexpr uint8_t KEY_FLAG_CLIENT_REPEATS = 0x04;  ///< the client sends this key's repeats
+
   void passthrough(std::shared_ptr<input_t> &input, PNV_KEYBOARD_PACKET packet) {
     const bool release = util::endian::little(packet->header.magic) == KEY_UP_EVENT_MAGIC;
     const uint16_t key_code = packet->keyCode & 0x00FF;
@@ -968,6 +972,18 @@ namespace input {
       return;
     }
     auto it = input->keys.find(key_code);
+    if (!release && (packet->flags & KEY_FLAG_REPEAT)) {
+      // The client's repeat of a key it holds: pressed again (Windows marks
+      // a down of a key that is down as a repeat), as the timer would
+      if (config::input.keyboard && it != input->keys.end()) {
+        auto held = it->second;
+        const auto &host = host_keys.at(host_keycode(held.host_key));
+        held.host_key = host.key;
+        held.flags = host.flags;
+        send_key_and_modifiers(held, input->shortcutFlags);
+      }
+      return;
+    }
     if (release) {
       if (it == input->keys.end()) {
         return;
@@ -1009,7 +1025,7 @@ namespace input {
     // were synthetic at key-down, not real modifiers since released by the client.
     held_key_t held {
       static_cast<uint16_t>(map_keycode(key_code)),
-      static_cast<uint8_t>(packet->flags),
+      static_cast<uint8_t>(packet->flags & ~(KEY_FLAG_REPEAT | KEY_FLAG_CLIENT_REPEATS)),
       synthetic_modifiers,
     };
     input->keys.emplace(key_code, held);
@@ -1023,7 +1039,7 @@ namespace input {
     task_pool.cancel(input->key_press_repeat_id);
     input->key_press_repeat_id = nullptr;
     input->repeating_key = key_code;
-    if (config::input.key_repeat_delay.count() > 0) {
+    if (config::input.key_repeat_delay.count() > 0 && !(packet->flags & KEY_FLAG_CLIENT_REPEATS)) {
       input->key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_delay, input, key_code).task_id;
     }
   }
