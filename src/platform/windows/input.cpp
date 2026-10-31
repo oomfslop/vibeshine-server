@@ -10,6 +10,7 @@
 
 // standard includes
 #include <array>
+#include <cstdio>
 #include <atomic>
 #include <cmath>
 #include <mutex>
@@ -710,6 +711,23 @@ namespace platf {
     }
 
     send_input(i);
+
+    // Trace: where each press lands (a click that never reached its
+    // target, a menu item that did nothing)
+    if (!release) {
+      POINT at {};
+      GetCursorPos(&at);
+      const HWND under = WindowFromPoint(at);
+      const HWND root = under ? GetAncestor(under, GA_ROOT) : nullptr;
+      wchar_t cls[64] {}, root_cls[64] {};
+      if (under) GetClassNameW(under, cls, 64);
+      if (root) GetClassNameW(root, root_cls, 64);
+      char text[256];
+      std::snprintf(text, sizeof(text), "Input trace: button %d down at %ld,%ld on 0x%llx <%ls> in 0x%llx <%ls>, foreground 0x%llx", button, at.x, at.y,
+                    (unsigned long long) reinterpret_cast<std::uintptr_t>(under), cls, (unsigned long long) reinterpret_cast<std::uintptr_t>(root), root_cls,
+                    (unsigned long long) reinterpret_cast<std::uintptr_t>(GetForegroundWindow()));
+      BOOST_LOG(info) << text;
+    }
   }
 
   void scroll(input_t &input, int distance) {

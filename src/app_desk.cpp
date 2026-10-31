@@ -19,6 +19,7 @@
   #include <climits>
   #include <atomic>
   #include <chrono>
+  #include <cstdio>
   #include <condition_variable>
   #include <memory>
   #include <cstring>
@@ -61,6 +62,7 @@ namespace app_desk {
       std::chrono::steady_clock::time_point seen_at {};
       HWND foreground = nullptr;  ///< the foreground window at the last look
       RECT foreground_frame {};  ///< its frame, when it was on the desk (else empty)
+      bool foreground_popup = false;  ///< it was a menu or popup, not a window of its own
       bool open = false;  ///< a client is using it (false = idle, kept for a while)
       std::chrono::steady_clock::time_point idle_since {};
       unsigned idle_generation = 0;
@@ -231,6 +233,32 @@ namespace app_desk {
      *  borders) at x, y and, with w and h, give it that size in the same
      *  step: a resize from the left or top never shows the window shifted. */
     void move_frame_to(HWND hwnd, int x, int y, int w = 0, int h = 0, bool async = true) {
+      if (IsIconic(hwnd)) {
+        // Minimized: where it comes back when restored is what moves (moving
+        // the minimized window itself leaves that on a desk display that may
+        // be gone by then: restored off every screen). The placement is in
+        // workspace coordinates (the primary display's work area) and of the
+        // whole window, about the invisible borders larger than the frame.
+        WINDOWPLACEMENT placement {};
+        placement.length = sizeof(placement);
+        if (!GetWindowPlacement(hwnd, &placement)) return;
+        MONITORINFO mi {};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+        const bool tool = GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW;
+        const LONG ox = tool ? 0 : mi.rcWork.left - mi.rcMonitor.left, oy = tool ? 0 : mi.rcWork.top - mi.rcMonitor.top;
+        const LONG border = static_cast<LONG>(7 * GetDpiForWindow(hwnd) / 96);
+        RECT &r = placement.rcNormalPosition;
+        const LONG pw = w > 0 && h > 0 ? w + 2 * border : r.right - r.left, ph = w > 0 && h > 0 ? h + border : r.bottom - r.top;
+        r.left = x - border - ox;
+        r.top = y - oy;
+        r.right = r.left + pw;
+        r.bottom = r.top + ph;
+        placement.showCmd = SW_SHOWMINNOACTIVE;
+        placement.flags = 0;
+        SetWindowPlacement(hwnd, &placement);
+        return;
+      }
       RECT frame {}, win {};
       int dx = 0, dy = 0, dw = 0, dh = 0;
       if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) && GetWindowRect(hwnd, &win)) {
@@ -420,6 +448,21 @@ namespace app_desk {
     /** Where a window goes when the desk lets go of it: where it was before
      *  it came to the desk, or, for one that never was anywhere else (it
      *  opened on the desk), the same place on the primary display. */
+    /** A window leaves the desk for (x, y) on another display: at the size
+     *  its DPI there gives it. Maximized on the desk, it is moved as its
+     *  normal self and maximized where it lands (moved as it is, it stays
+     *  "maximized" at a size that fills nothing, and comes back on the desk
+     *  when restored). */
+    void send_home(HWND hwnd, int x, int y) {
+      const bool zoomed = IsZoomed(hwnd);
+      if (zoomed) ShowWindow(hwnd, SW_RESTORE);
+      RECT frame {};
+      if (!IsIconic(hwnd) && app_window_layout::frame_rect(hwnd, frame)) settle_dpi_change(hwnd, GetDpiForWindow(hwnd), frame);
+      move_frame_to(hwnd, x, y);
+      // (queued after the move, which goes through the window's thread too)
+      if (zoomed) ShowWindowAsync(hwnd, SW_MAXIMIZE);
+    }
+
     POINT home_for(const RECT &frame, const RECT &desk) {
       RECT x {};
       if (!IntersectRect(&x, &frame, &desk)) return {frame.left, frame.top};
@@ -431,6 +474,32 @@ namespace app_desk {
       const LONG px = work.left + std::clamp<LONG>(frame.left - desk.left, 0, std::max<LONG>(0, (work.right - work.left) - w));
       const LONG py = work.top + std::clamp<LONG>(frame.top - desk.top, 0, std::max<LONG>(0, (work.bottom - work.top) - h));
       return {px, py};
+    }
+
+    /** Minimized windows that come back on the desk when restored */
+    std::vector<HWND> minimized_on(const RECT &desk) {
+      struct ctx_t {
+        RECT desk;
+        POINT offset;
+        std::vector<HWND> out;
+      } ctx {desk, {}, {}};
+      MONITORINFO mi {};
+      mi.cbSize = sizeof(mi);
+      GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+      ctx.offset = {mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top};
+      EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto *c = reinterpret_cast<ctx_t *>(lp);
+        if (!IsWindowVisible(hwnd) || !IsIconic(hwnd)) return TRUE;
+        WINDOWPLACEMENT placement {};
+        placement.length = sizeof(placement);
+        if (!GetWindowPlacement(hwnd, &placement)) return TRUE;
+        RECT r = placement.rcNormalPosition, x {};
+        if (!(GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) OffsetRect(&r, c->offset.x, c->offset.y);
+        if (IntersectRect(&x, &r, &c->desk)) c->out.push_back(hwnd);
+        return TRUE;
+      },
+                  reinterpret_cast<LPARAM>(&ctx));
+      return ctx.out;
     }
 
     /** Visible top-level windows on the desk (the desk's own taskbar aside). */
@@ -960,6 +1029,7 @@ namespace app_desk {
   }  // namespace
 
   desk_t open(const std::string &client_uuid, int w, int h, int fps, int dpi, const options_t &options) {
+    rescue_stranded_windows();
     w = std::max(640, w & ~1);
     h = std::max(480, h & ~1);
     const int shown_w = w, shown_h = h;  // the client's screen; the mode may be larger
@@ -1143,10 +1213,7 @@ namespace app_desk {
     auto it = g_desks.find(client_uuid);
     if (it == g_desks.end()) return;
     for (const auto &[hwnd, origin] : it->second.adopted) {
-      if (!IsWindow(hwnd)) continue;
-      RECT frame {};
-      if (app_window_layout::frame_rect(hwnd, frame)) settle_dpi_change(hwnd, GetDpiForWindow(hwnd), frame);
-      move_frame_to(hwnd, origin.x, origin.y);
+      if (IsWindow(hwnd)) send_home(hwnd, origin.x, origin.y);
     }
     // Everything else still on the desk (dialogs and windows that opened
     // there) goes to the primary display: nothing stays on a display nobody sees
@@ -1157,9 +1224,19 @@ namespace app_desk {
         RECT frame {};
         if (!app_window_layout::frame_rect(hwnd, frame)) continue;
         const POINT home = home_for(frame, desk);
-        settle_dpi_change(hwnd, GetDpiForWindow(hwnd), frame);
-        move_frame_to(hwnd, home.x, home.y);
+        send_home(hwnd, home.x, home.y);
         BOOST_LOG(info) << "Desk: moved 0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec << " to the primary display";
+      }
+      // Minimized ones too, or they come back off every screen once the desk is gone
+      for (HWND hwnd : minimized_on(desk)) {
+        if (it->second.adopted.contains(hwnd)) continue;
+        WINDOWPLACEMENT placement {};
+        placement.length = sizeof(placement);
+        if (!GetWindowPlacement(hwnd, &placement)) continue;
+        const RECT &r = placement.rcNormalPosition;
+        const POINT home = home_for({desk.left + 1, desk.top + 1, desk.left + 1 + (r.right - r.left), desk.top + 1 + (r.bottom - r.top)}, desk);
+        move_frame_to(hwnd, home.x + 64, home.y + 64);
+        BOOST_LOG(info) << "Desk: minimized " << describe_window(reinterpret_cast<std::uintptr_t>(hwnd)) << " comes back on the primary display now";
       }
     }
     it->second.adopted.clear();
@@ -1176,6 +1253,90 @@ namespace app_desk {
   bool any_open() {
     std::lock_guard lock(g_mutex);
     return !g_desks.empty();
+  }
+
+  std::string describe_window(std::uint64_t handle) {
+    auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
+    char head[32];
+    std::snprintf(head, sizeof(head), "0x%llx", static_cast<unsigned long long>(handle));
+    if (!hwnd || !IsWindow(hwnd)) return std::string(head) + " (gone)";
+    wchar_t cls[96] {};
+    GetClassNameW(hwnd, cls, 96);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    std::string out = std::string(head) + " [" + window_title(hwnd) + "] <" + utf_utils::to_utf8(cls) + "> of " + process_name(pid);
+    if (!IsWindowVisible(hwnd)) out += " (hidden)";
+    if (IsIconic(hwnd)) out += " (minimized)";
+    return out;
+  }
+
+  std::uint64_t foreground_window() {
+    return reinterpret_cast<std::uintptr_t>(GetForegroundWindow());
+  }
+
+  void rescue_stranded_windows() {
+    // Where desks go: below or right of every display there is (a window
+    // parked at -32000, or hidden at negative places on purpose, stays)
+    struct ctx_t {
+      RECT screens {};
+      std::vector<HWND> out;
+    } ctx;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR, HDC, LPRECT r, LPARAM lp) -> BOOL {
+      auto *c = reinterpret_cast<ctx_t *>(lp);
+      UnionRect(&c->screens, &c->screens, r);
+      return TRUE;
+    },
+                        reinterpret_cast<LPARAM>(&ctx));
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+      auto *c = reinterpret_cast<ctx_t *>(lp);
+      if (!IsWindowVisible(hwnd) || app_window_layout::is_cloaked(hwnd)) return TRUE;
+      if (GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+      DWORD pid = 0;
+      GetWindowThreadProcessId(hwnd, &pid);
+      if (pid == GetCurrentProcessId()) return TRUE;
+      RECT r {};
+      if (IsIconic(hwnd)) {
+        // Minimized: where it would come back (workspace coordinates)
+        WINDOWPLACEMENT placement {};
+        placement.length = sizeof(placement);
+        if (!GetWindowPlacement(hwnd, &placement)) return TRUE;
+        MONITORINFO mi {};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+        r = placement.rcNormalPosition;
+        OffsetRect(&r, mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top);
+      } else if (!app_window_layout::frame_rect(hwnd, r)) {
+        return TRUE;
+      }
+      if (r.right - r.left < 100 || r.bottom - r.top < 50) return TRUE;
+      if (MonitorFromRect(&r, MONITOR_DEFAULTTONULL)) return TRUE;
+      if (r.top >= c->screens.bottom - 8 || r.left >= c->screens.right - 8) c->out.push_back(hwnd);
+      return TRUE;
+    },
+                reinterpret_cast<LPARAM>(&ctx));
+    if (ctx.out.empty()) return;
+    MONITORINFO mi {};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+    const RECT &work = mi.rcWork;
+    LONG step = 0;
+    for (HWND hwnd : ctx.out) {
+      RECT r {};
+      if (IsIconic(hwnd)) {
+        WINDOWPLACEMENT placement {};
+        placement.length = sizeof(placement);
+        if (!GetWindowPlacement(hwnd, &placement)) continue;
+        r = placement.rcNormalPosition;
+      } else if (!app_window_layout::frame_rect(hwnd, r)) {
+        continue;
+      }
+      const LONG w = r.right - r.left, h = r.bottom - r.top;
+      const LONG x = work.left + std::min<LONG>(64 + step, std::max<LONG>(0, (work.right - work.left) - w));
+      const LONG y = work.top + std::min<LONG>(64 + step, std::max<LONG>(0, (work.bottom - work.top) - h));
+      send_home(hwnd, x, y);
+      step += 48;
+      BOOST_LOG(info) << "Desk: " << describe_window(reinterpret_cast<std::uintptr_t>(hwnd)) << " was left off every display (where a desk was); moved to the primary display";
+    }
   }
 
   bool adopt(const std::string &client_uuid, std::uint64_t handle, int x, int y, int w, int h) {
@@ -1209,6 +1370,7 @@ namespace app_desk {
       }
       return true;
     }
+    BOOST_LOG(info) << "Desk trace: adopting " << describe_window(handle) << " at " << x << ',' << y;
     if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
     // Maximized elsewhere: maximized on the desk (moved as its normal self)
     const bool zoomed = IsZoomed(hwnd);
@@ -1333,17 +1495,14 @@ namespace app_desk {
   }
 
   bool release(const std::string &client_uuid, std::uint64_t handle) {
+    BOOST_LOG(info) << "Desk trace: releasing " << describe_window(handle);
     auto hwnd = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(handle));
     std::lock_guard lock(g_mutex);
     auto it = g_desks.find(client_uuid);
     if (it == g_desks.end()) return false;
     auto a = it->second.adopted.find(hwnd);
     if (a == it->second.adopted.end()) return false;
-    if (IsWindow(hwnd)) {
-      RECT frame {};
-      if (app_window_layout::frame_rect(hwnd, frame)) settle_dpi_change(hwnd, GetDpiForWindow(hwnd), frame);
-      move_frame_to(hwnd, a->second.x, a->second.y);
-    }
+    if (IsWindow(hwnd)) send_home(hwnd, a->second.x, a->second.y);
     it->second.adopted.erase(a);
     return true;
   }
@@ -1365,6 +1524,7 @@ namespace app_desk {
       bool first = false;
       HWND fg_before = nullptr;
       RECT fg_before_frame {};
+      bool fg_before_popup = false;
       std::map<DWORD, RECT> front_of;  // pid -> frame of its top-most window on the desk
       {
         std::lock_guard lock(g_mutex);
@@ -1386,12 +1546,17 @@ namespace app_desk {
         first = !it->second.seen_once;
         fg_before = it->second.foreground;
         fg_before_frame = it->second.foreground_frame;
+        fg_before_popup = it->second.foreground_popup;
       }
       struct ctx_t {
         std::vector<std::pair<HWND, DWORD>> windows;
       } ctx;
       EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
-        if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || app_window_layout::is_cloaked(hwnd) || GetWindow(hwnd, GW_OWNER)) return TRUE;
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || app_window_layout::is_cloaked(hwnd)) return TRUE;
+        // Owned by a window of the user's: its dialog, it goes with that one.
+        // An owner nobody sees (the shell's Properties sheets have one) makes
+        // it a window of its own
+        if (HWND owner = GetWindow(hwnd, GW_OWNER); owner && IsWindowVisible(owner)) return TRUE;
         if (GetWindowLongW(hwnd, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return TRUE;
         if (GetWindowTextLengthW(hwnd) == 0) return TRUE;
         DWORD pid = 0;
@@ -1413,9 +1578,16 @@ namespace app_desk {
         // An elevation prompt (UAC not on the secure desktop) is the client's
         // business wherever it opens: it comes over, in the middle
         const bool prompt = _stricmp(process_name(pid).c_str(), "consent.exe") == 0;
-        if (seen.contains(hwnd) || (!prompt && (first || !pids.contains(pid)))) continue;
+        if (seen.contains(hwnd) || first) continue;
         RECT r {}, x {};
-        if (!app_window_layout::frame_rect(hwnd, r) || IntersectRect(&x, &r, &desk)) continue;
+        const bool framed = app_window_layout::frame_rect(hwnd, r);
+        const bool on_desk = framed && IntersectRect(&x, &r, &desk);
+        // Every window that appears while windows are streamed, and what
+        // becomes of it here (one that never shows on the client is in this list)
+        BOOST_LOG(info) << "Desk: new window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec << " [" << window_title(hwnd) << "] of "
+                        << process_name(pid) << (on_desk ? " on the desk" : !framed ? " (no frame)" : (prompt || pids.contains(pid)) ? " elsewhere, its app is on the desk" : " elsewhere: no app of it on the desk, left there");
+        if (!prompt && !pids.contains(pid)) continue;
+        if (!framed || on_desk) continue;
         const LONG w = r.right - r.left, h = r.bottom - r.top;
         if (prompt) {
           to_adopt.push_back({hwnd, {std::max<LONG>(0, (work.right - work.left - w) / 2) + work.left - desk.left, std::max<LONG>(0, (work.bottom - work.top - h) / 2) + work.top - desk.top}});
@@ -1438,7 +1610,9 @@ namespace app_desk {
         RECT x {};
         if (!fg || !app_window_layout::frame_rect(fg, fg_frame) || !IntersectRect(&x, &fg_frame, &desk)) fg_frame = {};
       }
-      const bool before_still_there = fg_before && IsWindow(fg_before) && IsWindowVisible(fg_before) && !IsIconic(fg_before);
+      // (a menu the user picked something from closes as the foreground
+      // moves: that move is the user's doing)
+      const bool before_still_there = fg_before && (fg_before_popup || (IsWindow(fg_before) && IsWindowVisible(fg_before) && !IsIconic(fg_before)));
       if (fg && fg != fg_before && before_still_there && !IsRectEmpty(&fg_before_frame) && IsRectEmpty(&fg_frame)) {
         const bool app_window = std::any_of(ctx.windows.begin(), ctx.windows.end(), [&](const auto &e) {
           return e.first == fg;
@@ -1454,6 +1628,15 @@ namespace app_desk {
           to_adopt.push_back({fg, {px - desk.left, py - desk.top}});
         }
       }
+      if (fg != fg_before) {
+        BOOST_LOG(info) << "Desk trace: foreground " << describe_window(reinterpret_cast<std::uintptr_t>(fg)) << (IsRectEmpty(&fg_frame) ? " (elsewhere)" : " (on the desk)")
+                        << " <- " << describe_window(reinterpret_cast<std::uintptr_t>(fg_before));
+      }
+      if (!first) {
+        for (HWND gone : seen) {
+          if (!now_seen.contains(gone)) BOOST_LOG(info) << "Desk trace: window " << describe_window(reinterpret_cast<std::uintptr_t>(gone)) << " left the list";
+        }
+      }
       {
         std::lock_guard lock(g_mutex);
         auto it = g_desks.find(client_uuid);
@@ -1462,6 +1645,16 @@ namespace app_desk {
         it->second.seen_once = true;
         it->second.foreground = fg;
         it->second.foreground_frame = fg_frame;
+        // (as the layout tells windows from popups: a caption, or an
+        // unowned activatable one of window size, like frameless apps)
+        it->second.foreground_popup = false;
+        if (fg) {
+          const LONG style = GetWindowLongW(fg, GWL_STYLE), ex = GetWindowLongW(fg, GWL_EXSTYLE);
+          RECT r {};
+          GetWindowRect(fg, &r);
+          const bool frameless_window = !GetWindow(fg, GW_OWNER) && !(ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) && r.right - r.left >= 200 && r.bottom - r.top >= 150;
+          it->second.foreground_popup = (style & WS_CAPTION) != WS_CAPTION && !frameless_window;
+        }
       }
       for (const auto &[hwnd, at] : to_adopt) {
         BOOST_LOG(info) << "Desk: window 0x" << std::hex << reinterpret_cast<std::uintptr_t>(hwnd) << std::dec << " is new to an app on the desk or took the foreground from it; bringing it over";
@@ -1547,6 +1740,8 @@ namespace app_desk {
       int min[2] {0, 0};
       int step[2] {1, 1};
       int base[2] {0, 0};  ///< a frame size on the step grid
+      int max[2] {0, 0};  ///< the largest frame (0: no limit)
+      bool resizable = true;  ///< has a sizing border at all
     };
 
     std::uint64_t gcd(std::uint64_t a, std::uint64_t b) {
@@ -1594,7 +1789,12 @@ namespace app_desk {
       if (SendMessageTimeoutW(hwnd, WM_GETMINMAXINFO, 0, reinterpret_cast<LPARAM>(&mmi), flags, 50, &result)) {
         out.min[0] = std::max(0, static_cast<int>(mmi.ptMinTrackSize.x) - border_w);
         out.min[1] = std::max(0, static_cast<int>(mmi.ptMinTrackSize.y) - border_h);
+        // (the default is the size of the whole virtual screen: no limit)
+        const POINT fallback {GetSystemMetricsForDpi(SM_CXMAXTRACK, dpi), GetSystemMetricsForDpi(SM_CYMAXTRACK, dpi)};
+        if (mmi.ptMaxTrackSize.x > 0 && mmi.ptMaxTrackSize.x < fallback.x) out.max[0] = std::max(out.min[0], static_cast<int>(mmi.ptMaxTrackSize.x) - border_w);
+        if (mmi.ptMaxTrackSize.y > 0 && mmi.ptMaxTrackSize.y < fallback.y) out.max[1] = std::max(out.min[1], static_cast<int>(mmi.ptMaxTrackSize.y) - border_h);
       }
+      out.resizable = (GetWindowLongW(hwnd, GWL_STYLE) & WS_THICKFRAME) != 0;
       if (GetWindowLongW(hwnd, GWL_STYLE) & WS_THICKFRAME) {
         // The snapped sizes are on the app's grid, which the current size
         // need not be (a terminal sized by other means): the step is what
@@ -1781,6 +1981,9 @@ namespace app_desk {
         win.resize_step[1] = sizing.step[1];
         win.resize_base[0] = sizing.base[0];
         win.resize_base[1] = sizing.base[1];
+        win.max_size[0] = sizing.max[0];
+        win.max_size[1] = sizing.max[1];
+        win.resizable = sizing.resizable;
       }
       win.z = static_cast<int>(out.windows.size());
       win.icon_key = host_windows::icon_key(win.handle);
@@ -2069,6 +2272,34 @@ namespace app_desk {
       for (unsigned char c : w.state) mix(c);
       for (unsigned char c : w.title) mix(c);
       for (unsigned char c : w.kind) mix(c);
+      for (int v : w.min_size) mix(static_cast<std::uint32_t>(v));
+      for (int v : w.max_size) mix(static_cast<std::uint32_t>(v));
+      for (int v : w.resize_step) mix(static_cast<std::uint32_t>(v));
+      for (int v : w.resize_base) mix(static_cast<std::uint32_t>(v));
+      mix(w.resizable);
+    }
+    {
+      // What comes and goes on the client: every window shown or dropped,
+      // and which one has the focus
+      static std::mutex trace_mutex;
+      static std::map<std::string, std::pair<std::map<std::uint64_t, std::string>, std::uint64_t>> shown;
+      std::lock_guard lock(trace_mutex);
+      auto &[before, focused_before] = shown[client_uuid];
+      std::map<std::uint64_t, std::string> now;
+      std::uint64_t focused = 0;
+      for (const auto &w : out.windows) {
+        now[w.handle] = w.kind + (w.state == "minimized" ? ", minimized" : "") + " [" + w.title + "] of " + w.process;
+        if (w.focused) focused = w.handle;
+      }
+      for (const auto &[handle, what] : now) {
+        if (!before.contains(handle)) BOOST_LOG(info) << "Desk trace: layout + 0x" << std::hex << handle << std::dec << ' ' << what;
+      }
+      for (const auto &[handle, what] : before) {
+        if (!now.contains(handle)) BOOST_LOG(info) << "Desk trace: layout - 0x" << std::hex << handle << std::dec << ' ' << what;
+      }
+      if (focused != focused_before) BOOST_LOG(info) << "Desk trace: layout focus 0x" << std::hex << focused << std::dec << (focused ? "" : " (none of the desk's)");
+      before = std::move(now);
+      focused_before = focused;
     }
     out.cursor = cursor_shape();
     // A window holding the pointer: the confinement inside the foreground
@@ -2134,6 +2365,17 @@ namespace app_desk {
 
   bool resize(const std::string &, std::uint64_t, int, int) {
     return false;
+  }
+
+  std::string describe_window(std::uint64_t handle) {
+    return std::to_string(handle);
+  }
+
+  std::uint64_t foreground_window() {
+    return 0;
+  }
+
+  void rescue_stranded_windows() {
   }
 
   bool release(const std::string &, std::uint64_t) {

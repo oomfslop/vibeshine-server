@@ -448,10 +448,26 @@ namespace host_windows {
         if (!IsWindowEnabled(hwnd)) {
           if (HWND popup = GetLastActivePopup(hwnd); popup && popup != hwnd && IsWindowEnabled(popup)) focus = popup;
         }
+        const HWND before = GetForegroundWindow();
+        // The window, or a menu or popup of it, has the focus already: done.
+        // (Activating again would close that menu: the fallback below taps a key.)
+        if (before && (before == focus || GetAncestor(before, GA_ROOTOWNER) == focus || GetWindow(before, GW_OWNER) == focus)) {
+          BOOST_LOG(info) << "Desk trace: activate 0x" << std::hex << reinterpret_cast<std::uintptr_t>(focus) << std::dec << ": has the focus already (or a popup of it)";
+          return true;
+        }
+        GUITHREADINFO gui {};
+        gui.cbSize = sizeof(gui);
+        if (before && GetWindowThreadProcessId(before, nullptr) == GetWindowThreadProcessId(focus, nullptr) && GetGUIThreadInfo(GetWindowThreadProcessId(before, nullptr), &gui) &&
+            (gui.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE))) {
+          BOOST_LOG(info) << "Desk trace: activate 0x" << std::hex << reinterpret_cast<std::uintptr_t>(focus) << std::dec << ": left alone, its thread has a menu open";
+          return true;
+        }
         AllowSetForegroundWindow(ASFW_ANY);
+        const char *how = "directly";
         bool ok = SetForegroundWindow(focus) != 0;
         BringWindowToTop(focus);
         if (!ok || GetForegroundWindow() != focus) {
+          how = "after a key tap (closes open menus)";
           // The foreground lock: only the process with the last input may
           // set the foreground. A synthetic tap of an unassigned key makes
           // that us. (Not Alt: it puts the focused app in menu mode and
@@ -466,9 +482,12 @@ namespace host_windows {
           BringWindowToTop(focus);
         }
         if (!ok || GetForegroundWindow() != focus) {
+          how = "by SwitchToThisWindow";
           SwitchToThisWindow(focus, FALSE);  // TRUE plays the Alt-Tab switch (peek)
           ok = GetForegroundWindow() == focus;
         }
+        BOOST_LOG(info) << "Desk trace: activate 0x" << std::hex << reinterpret_cast<std::uintptr_t>(focus) << " (asked 0x" << reinterpret_cast<std::uintptr_t>(hwnd)
+                        << ", foreground was 0x" << reinterpret_cast<std::uintptr_t>(before) << std::dec << "): " << (ok ? "focused " : "FAILED ") << how;
         if (!ok) {
           BOOST_LOG(info) << "App windows: could not focus 0x" << std::hex << reinterpret_cast<std::uintptr_t>(focus) << std::dec
                           << " (foreground is 0x" << std::hex << reinterpret_cast<std::uintptr_t>(GetForegroundWindow()) << std::dec << ')';

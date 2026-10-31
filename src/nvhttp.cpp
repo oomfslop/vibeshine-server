@@ -4154,6 +4154,13 @@ namespace nvhttp {
       }
     };
     const auto op_name = get_arg(args, "op", "");
+    {
+      // Moves and resizes come many a second (drags): those at debug level
+      std::ostringstream trace;
+      trace << "Desk trace: client asks " << op_name << " of " << app_desk::describe_window(handle) << " (" << num("x") << ',' << num("y") << ' ' << num("w") << 'x' << num("h") << ')';
+      if (op_name == "adopt" || op_name == "resize") BOOST_LOG(debug) << trace.str();
+      else BOOST_LOG(info) << trace.str();
+    }
     if (handle && (op_name == "adopt" || op_name == "release" || op_name == "park")) {
       // Desk ops: move the window onto / off the client's desk.
       const auto uuid = resolve_client_identity_from_request(request).uuid;
@@ -4239,6 +4246,8 @@ namespace nvhttp {
       while (std::getline(list, item, ',')) {
         if (auto h = parse_window_handle(item)) top_first.push_back(h);
       }
+      BOOST_LOG(info) << "Desk trace: client order " << get_arg(args, "hwnds", "") << (get_arg(args, "focus", "0") == "1" ? " +focus" : "")
+                      << " (foreground " << app_desk::describe_window(app_desk::foreground_window()) << ')';
       const bool ok = app_desk::order(uuid, top_first, get_arg(args, "focus", "0") == "1");
       write_json(response, {{"status", ok}}, ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::client_error_not_found);
       return;
@@ -4341,6 +4350,8 @@ namespace nvhttp {
         {"caption", w.caption},
         {"radius", w.radius},
         {"min", {w.min_size[0], w.min_size[1]}},
+        {"max", {w.max_size[0], w.max_size[1]}},
+        {"resizable", w.resizable},
         {"step", {w.resize_step[0], w.resize_step[1]}},
         {"step_base", {w.resize_base[0], w.resize_base[1]}},
         {"z", w.z},

@@ -59,6 +59,16 @@ namespace app_desk {
    *  generic end-of-stream display cleanup). */
   bool any_open();
 
+  /** For traces: "0x1234 [title] <class> of process.exe" */
+  std::string describe_window(std::uint64_t hwnd);
+  /** Windows left where a desk was (the service stopped while windows were
+   *  streamed, a crash): back onto the primary display. At startup and when
+   *  a desk opens. */
+  void rescue_stranded_windows();
+
+  /** The host's foreground window (0: none) */
+  std::uint64_t foreground_window();
+
   /** A desk stream of this client started / ended. When the last one ends
    *  and none starts again within a short grace period (reconnects), the desk
    *  is closed: windows never stay stranded on a display nobody sees. */
@@ -93,6 +103,8 @@ namespace app_desk {
     int caption = 0;  ///< caption height in px (0 = unknown / custom)
     int radius = 0;  ///< corner radius the OS applies (Windows 11: 8 DIP)
     int min_size[2] {0, 0};  ///< the smallest frame the app allows (0 = unknown)
+    int max_size[2] {0, 0};  ///< the largest frame the app allows (0 = no limit)
+    bool resizable = true;  ///< false: the user can't size it (fixed dialogs)
     int resize_step[2] {1, 1};  ///< steps the app snaps its frame's size to (terminals: character cells)
     int resize_base[2] {0, 0};  ///< a frame size on that grid (the current one need not be)
     int z = 0;  ///< stacking order, 0 = bottom-most

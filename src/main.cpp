@@ -28,6 +28,7 @@
 #include "logging.h"
 #include "main.h"
 #include "nvhttp.h"
+#include "app_desk.h"
 #include "pairing_recovery.h"
 #include "process.h"
 #include "pyrowave_host.h"
@@ -1034,6 +1035,10 @@ int main(int argc, char *argv[]) {
     return lifetime::desired_exit_code;
   }
 
+  // Windows a previous run left on a desk display that is gone now
+  std::thread([] {
+    app_desk::rescue_stranded_windows();
+  }).detach();
   std::thread httpThread {nvhttp::start};
   std::thread rtspThread {rtsp_stream::start};
 
