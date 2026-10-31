@@ -6180,10 +6180,13 @@ namespace video {
     hdr_info = std::make_unique<hdr_info_raw_t>(false);
     if (colorspace_is_hdr(colorspace)) {
       SS_HDR_METADATA metadata {};
+#ifdef SUNSHINE_ENABLE_NV_TRUEHDR
       if (config.rtx_hdr_active) {
         metadata = synthesize_rtx_hdr_metadata(config.rtx_hdr_peak_nits);
         hdr_info = std::make_unique<hdr_info_raw_t>(true, metadata);
-      } else if (display_is_hdr && disp.get_hdr_metadata(metadata)) {
+      } else
+#endif
+      if (display_is_hdr && disp.get_hdr_metadata(metadata)) {
         hdr_info = std::make_unique<hdr_info_raw_t>(true, metadata);
       } else {
         BOOST_LOG(error) << "Couldn't get display hdr metadata when colorspace selection indicates it should have one";
