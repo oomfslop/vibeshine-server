@@ -4277,7 +4277,8 @@ namespace nvhttp {
     int wait_ms = 0;
     std::uint64_t etag = 0;
     try {
-      wait_ms = std::clamp(std::stoi(get_arg(args, "wait", "0")), 0, 1000);
+      // (long waits: a client standing by with an empty desk)
+      wait_ms = std::clamp(std::stoi(get_arg(args, "wait", "0")), 0, 30000);
       etag = std::stoull(get_arg(args, "etag", "0"));
     } catch (...) {
     }
@@ -4304,7 +4305,8 @@ namespace nvhttp {
         taken += static_cast<std::uint32_t>(90000 * frames / fps);
       }
       if (!layout.valid || layout.etag != etag || std::chrono::steady_clock::now() >= deadline) break;
-      std::this_thread::sleep_for(std::chrono::milliseconds(4));
+      // An empty desk changes when a window is adopted: looked at less often
+      std::this_thread::sleep_for(std::chrono::milliseconds(layout.windows.empty() ? 40 : 4));
     }
     if (!layout.valid) {
       write_json(response, {{"gone", true}}, SimpleWeb::StatusCode::client_error_not_found);

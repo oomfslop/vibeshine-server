@@ -55,6 +55,10 @@ namespace app_desk {
   /** Put every adopted window back and let the display go idle (it is removed
    *  after ten minutes without a desk). */
   void close(const std::string &client_uuid);
+  /** The client's desk is open with no windows on it (as of the last
+   *  layout): a session standing by for the first window. Its stream sends
+   *  nothing while nothing changes. */
+  bool standing_by(const std::string &client_uuid);
   /** True while any client's desk display exists (used to keep it out of the
    *  generic end-of-stream display cleanup). */
   bool any_open();

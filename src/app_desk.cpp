@@ -64,6 +64,7 @@ namespace app_desk {
       RECT foreground_frame {};  ///< its frame, when it was on the desk (else empty)
       bool foreground_popup = false;  ///< it was a menu or popup, not a window of its own
       bool open = false;  ///< a client is using it (false = idle, kept for a while)
+      bool empty = true;  ///< no windows on it at the last layout
       std::chrono::steady_clock::time_point idle_since {};
       unsigned idle_generation = 0;
       options_t options;
@@ -2317,7 +2318,17 @@ namespace app_desk {
     mix(out.seq);
     for (unsigned char c : out.cursor) mix(c);
     out.etag = h ? h : 1;
+    {
+      std::lock_guard lock(g_mutex);
+      if (auto it = g_desks.find(client_uuid); it != g_desks.end()) it->second.empty = out.windows.empty();
+    }
     return out;
+  }
+
+  bool standing_by(const std::string &client_uuid) {
+    std::lock_guard lock(g_mutex);
+    auto it = g_desks.find(client_uuid);
+    return it != g_desks.end() && it->second.open && it->second.empty;
   }
 
 }  // namespace app_desk
@@ -2388,6 +2399,10 @@ namespace app_desk {
 
   layout_t layout(const std::string &) {
     return {};
+  }
+
+  bool standing_by(const std::string &) {
+    return false;
   }
 }  // namespace app_desk
 

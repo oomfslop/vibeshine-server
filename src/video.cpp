@@ -5479,6 +5479,11 @@ namespace video {
         } else {
           ++loop_stats.pop_timeouts;
           placeholder_input = bootstrap_state.current_input_placeholder;
+          // A desk with no windows (the client standing by for one): nothing
+          // to show, so nothing is repeated until something changes
+          if (!config.desk_client.empty() && bootstrap_state.real_frame_seen && app_desk::standing_by(config.desk_client)) {
+            continue;
+          }
         }
       }
 
